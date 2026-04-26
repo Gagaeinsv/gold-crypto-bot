@@ -259,6 +259,12 @@ def db_init() -> None:
                 pnl_pct      REAL,
                 message_id   INTEGER DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS deep_analysis_log (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id    INTEGER NOT NULL,
+                pair       TEXT    NOT NULL,
+                used_at    TEXT    DEFAULT (datetime('now'))
+            );
         """)
 
 
@@ -308,6 +314,29 @@ def db_access(cid: int) -> dict:
         return {"allowed": False, "plan": "expired", "days_left": 0, "reason": "trial_ended"}
 
     return {"allowed": False, "plan": plan, "days_left": 0, "reason": "no_subscription"}
+
+
+DEEP_ANALYSIS_DAILY_LIMIT = 3  # per user per day
+
+def db_deepanalysis_count_today(cid: int) -> int:
+    """Return how many deep analyses this user has used today (UTC)."""
+    today = datetime.utcnow().date().isoformat()
+    with db_connect() as c:
+        row = c.execute(
+            "SELECT COUNT(*) FROM deep_analysis_log "
+            "WHERE chat_id=? AND date(used_at)=?",
+            (cid, today),
+        ).fetchone()
+    return row[0] if row else 0
+
+
+def db_deepanalysis_log(cid: int, pair: str) -> None:
+    """Record one deep analysis use."""
+    with db_connect() as c:
+        c.execute(
+            "INSERT INTO deep_analysis_log(chat_id, pair) VALUES(?,?)",
+            (cid, pair),
+        )
 
 
 def db_apply_payment(cid: int, stars: int, plan_key: str, months: int, charge_id: str) -> date:
@@ -2237,69 +2266,83 @@ def _build_deep_prompt(pair: str, price: float, tf_data: dict,
 
     econ_text = ""
     if econ.get("has_danger"):
-        econ_text = f"\n⚠️ HIGH-IMPACT USD EVENTS TODAY: {', '.join(econ['events'])}"
+        econ_text = f"\n⚠️ HIGH-IMPACT EVENTS TODAY: {', '.join(econ['events'])}"
 
-    depth = "detailed and actionable"
+    return f"""You are a senior proprietary trader and technical analyst with 15+ years experience in {cfg['name']}.
+You have access to real multi-timeframe data. Your task is to produce an IMMEDIATELY ACTIONABLE trading report.
 
-    return f"""You are a professional XAU/USD (Gold) trader and market analyst with 15+ years experience.
-Your analysis must be {depth}.
-
-═══ CURRENT MARKET DATA ═══
-Pair: {cfg['name']}
-Current Price: {fmt_price(price, pair)} USD
+═══ LIVE MARKET DATA ═══
+Asset: {cfg['name']}
+Current Price: {fmt_price(price, pair)}
 {econ_text}
 
-═══ MULTI-TIMEFRAME TECHNICAL ANALYSIS ═══
+═══ MULTI-TIMEFRAME TECHNICALS ═══
 {tf_text}
 
-═══ MACRO & NEWS CONTEXT ═══
+═══ MACRO & NEWS ═══
 {macro}
 
-═══ YOUR TASK ═══
-Provide a COMPREHENSIVE trading analysis for XAU/USD covering:
+═══ REQUIRED OUTPUT FORMAT ═══
+Respond ONLY in this exact structure. Use the actual numbers from the data above.
 
-1. **OVERALL BIAS** — Bullish/Bearish/Neutral with confidence % and reasoning
+1. MARKET BIAS
+   Direction: [BULLISH / BEARISH / NEUTRAL]
+   Confidence: [X]%
+   Reason: (2-3 sentences using the TF data above)
 
-2. **MULTI-TIMEFRAME ALIGNMENT**
-   - 5m: short-term momentum
-   - 15m: intraday trend
-   - 1h: swing direction
-   - 4h: dominant trend
-   - Are timeframes aligned or conflicting?
+2. TIMEFRAME ALIGNMENT
+   5m : [trend] | RSI=[value] | MACD=[value]
+   15m: [trend] | RSI=[value] | MACD=[value]
+   1h : [trend] | RSI=[value] | MACD=[value]
+   4h : [trend] | RSI=[value] | MACD=[value]
+   Alignment: [ALIGNED / MIXED / CONFLICTING] — reason
 
-3. **KEY LEVELS** (be specific with prices)
-   - 3 major resistance levels with explanation
-   - 3 major support levels with explanation
-   - Most important level to watch RIGHT NOW
+3. KEY PRICE LEVELS
+   Resistance 1: [exact price] — reason
+   Resistance 2: [exact price] — reason
+   Resistance 3: [exact price] — reason
+   Support 1:    [exact price] — reason
+   Support 2:    [exact price] — reason
+   Support 3:    [exact price] — reason
+   🔑 Most critical level RIGHT NOW: [price] because [reason]
 
-4. **TRADE SETUPS** (give 2-3 concrete setups)
-   For each setup:
-   - Direction: BUY or SELL
-   - Entry: exact price or zone
-   - Stop Loss: exact price and reasoning
-   - Take Profit 1 (conservative): exact price
-   - Take Profit 2 (extended): exact price
-   - Risk/Reward ratio
-   - Timeframe: when to expect the move
-   - Trigger: what needs to happen for entry
+4. TRADE SETUP A (primary)
+   Direction : BUY / SELL
+   Entry zone: [exact price or range, e.g. 3285–3290]
+   Stop Loss : [exact price] (reason: [why this level])
+   TP1       : [exact price] (+[R] R)
+   TP2       : [exact price] (+[R] R)
+   R:R ratio : [X:1]
+   Trigger   : [what must happen to enter — e.g. "break and close above 3295 on 15m"]
+   Timeframe : [expected duration]
 
-5. **MACRO IMPACT**
-   - How do current news/events affect gold?
-   - DXY correlation — dollar strengthening or weakening?
-   - Risk sentiment — risk-on or risk-off?
-   - What to watch in next 24-48 hours
+5. TRADE SETUP B (alternative / counter-trend)
+   Direction : BUY / SELL
+   Entry zone: [exact price or range]
+   Stop Loss : [exact price]
+   TP1       : [exact price]
+   TP2       : [exact price]
+   R:R ratio : [X:1]
+   Trigger   : [entry condition]
+   Timeframe : [expected duration]
 
-6. **INVALIDATION**
-   - What price level would invalidate the bullish scenario?
-   - What price level would invalidate the bearish scenario?
+6. MACRO CONTEXT
+   News impact : [how top news affects this asset right now]
+   DXY / macro : [dollar / risk sentiment effect]
+   Watch next 24h: [key event or level to monitor]
 
-7. **FINAL RECOMMENDATION**
-   - Best setup right now with score /100
-   - Optimal entry timing
-   - Position sizing suggestion (% of capital)
+7. INVALIDATION
+   Bullish scenario fails if: [exact price level]
+   Bearish scenario fails if: [exact price level]
 
-Format your response with clear sections and specific prices throughout.
-Be direct and actionable — this is for live trading decisions."""
+8. FINAL VERDICT
+   Best setup: [A or B]
+   Score     : [X]/100
+   Action NOW: [ENTER / WAIT FOR TRIGGER / AVOID]
+   Entry timing: [immediate / on pullback to X / on breakout above X]
+   Risk per trade: [suggested % of capital, e.g. 1–2%]
+
+Be precise. Use exact prices from the data. No vague statements."""
 
 
 def _gemini_deep_analysis(pair: str, price: float) -> str:
@@ -2342,31 +2385,84 @@ def _gemini_deep_analysis(pair: str, price: float) -> str:
 async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Usage:
-      /deepanalysis          — Gemini Flash (free)
-      /deepanalysis BTCUSD   — different pair
+      /deepanalysis          — shows pair selection (uses user's current pair by default)
+      /deepanalysis BTCUSD   — analyse specific pair directly
+    Available to all subscribed users. Limit: 3 per day (admin unlimited).
     """
-    if update.effective_chat.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Admin only.")
+    cid = update.effective_chat.id
+    acc = db_access(cid)
+
+    if not acc["allowed"] and cid != ADMIN_ID:
+        await update.message.reply_text(
+            "⛔ Subscribe to use Deep Analysis.\n\nTap /start → 💳 Subscription",
+        )
         return
 
     if not GEMINI_KEY:
         await update.message.reply_text(
-            "❌ GEMINI\\_KEY not set in .env\n\n"
-            "Get your key at: aistudio.google.com",
+            "❌ GEMINI\\_KEY not set in .env\n\nGet your key at: aistudio.google.com",
             parse_mode="Markdown",
         )
         return
 
-    args = context.args or []
-    pair = "XAUUSD"
+    # Check daily limit (admin is unlimited)
+    if cid != ADMIN_ID:
+        used = db_deepanalysis_count_today(cid)
+        limit = DEEP_ANALYSIS_DAILY_LIMIT
+        if used >= limit:
+            await update.message.reply_text(
+                f"⏳ *Daily limit reached* ({limit}/day)\n\n"
+                f"You've used all {limit} deep analyses for today.\n"
+                f"Resets at midnight UTC.",
+                parse_mode="Markdown",
+            )
+            return
 
+    args = context.args or []
+
+    # If pair provided as argument — run directly
+    direct_pair = None
     for arg in args:
         if arg.upper() in PAIRS:
-            pair = arg.upper()
+            direct_pair = arg.upper()
+            break
 
-    cfg = PAIRS[pair]
+    if direct_pair:
+        await _run_deepanalysis(update, context, cid, acc, direct_pair)
+        return
+
+    # Otherwise show pair selection keyboard
+    plan = acc["plan"]
+    rows = []
+    for pid, cfg in PAIRS.items():
+        if plan in cfg["plans"] or cid == ADMIN_ID:
+            rows.append([InlineKeyboardButton(
+                f"{cfg['emoji']} {cfg['name']}",
+                callback_data=f"deepanalysis_{pid}",
+            )])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="deepanalysis_cancel")])
+
+    used = db_deepanalysis_count_today(cid) if cid != ADMIN_ID else 0
+    remaining = f"  ({DEEP_ANALYSIS_DAILY_LIMIT - used} left today)" if cid != ADMIN_ID else ""
 
     await update.message.reply_text(
+        f"🧠 *Deep Analysis{remaining}*\n\nChoose a pair to analyse:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair: str) -> None:
+    """Execute deep analysis for the given pair and user."""
+    cfg = PAIRS[pair]
+
+    async def reply(text, **kwargs):
+        if hasattr(update_or_query, "message") and update_or_query.message:
+            await update_or_query.message.reply_text(text, **kwargs)
+        else:
+            await context.bot.send_message(cid, text, **kwargs)
+
+    await reply(
         f"🧠 *Deep Analysis* — {cfg['emoji']} {cfg['name']}\n\n"
         f"Model: `{GEMINI_FLASH}`\n"
         f"⏳ Gathering data from 4 timeframes + macro news…\n\n"
@@ -2376,7 +2472,7 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     price = get_price(pair)
     if not price:
-        await update.message.reply_text("❌ Could not get current price.")
+        await reply("❌ Could not get current price.")
         return
 
     try:
@@ -2386,15 +2482,20 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             timeout=120,
         )
     except asyncio.TimeoutError:
-        await update.message.reply_text(
-            "⏱ Analysis timed out (120s). Please try again.",
-            parse_mode="Markdown",
-        )
+        await reply("⏱ Analysis timed out (120s). Please try again.", parse_mode="Markdown")
         return
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)[:200]}")
+        await reply(f"❌ Error: {str(e)[:200]}")
         log.error("Deep analysis error: %s", e)
         return
+
+    # Log usage (admin unlimited)
+    if cid != ADMIN_ID:
+        db_deepanalysis_log(cid, pair)
+        used = db_deepanalysis_count_today(cid)
+        remaining_note = f"\n_Deep analyses today: {used}/{DEEP_ANALYSIS_DAILY_LIMIT}_"
+    else:
+        remaining_note = ""
 
     # Split long messages (Telegram limit 4096 chars)
     header = (
@@ -2403,12 +2504,11 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"Model: `{GEMINI_FLASH}`\n"
         f"{'─' * 30}\n\n"
     )
-    full_text = header + result
+    full_text = header + result + remaining_note
 
     chunk_size = 3800
     chunks = []
     while len(full_text) > chunk_size:
-        # Split at paragraph boundary
         split_at = full_text.rfind("\n\n", 0, chunk_size)
         if split_at == -1:
             split_at = chunk_size
@@ -2419,15 +2519,14 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     for i, chunk in enumerate(chunks):
         try:
-            await update.message.reply_text(chunk, parse_mode="Markdown")
+            await reply(chunk, parse_mode="Markdown")
         except Exception:
-            # If markdown fails send as plain text
             plain = re.sub(r"[*_`#]", "", chunk)
-            await update.message.reply_text(plain)
+            await reply(plain)
         if i < len(chunks) - 1:
             await asyncio.sleep(0.5)
 
-    log.info("Deep analysis: %s model=%s price=%s", pair, GEMINI_FLASH, price)
+    log.info("Deep analysis: cid=%s %s model=%s price=%s", cid, pair, GEMINI_FLASH, price)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2647,6 +2746,19 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     acc  = db_access(cid)
     plan = acc["plan"]
     await q.answer()
+
+    # Deep analysis pair selection
+    if q.data == "deepanalysis_cancel":
+        await q.message.delete()
+        return
+
+    if q.data.startswith("deepanalysis_"):
+        pair = q.data[len("deepanalysis_"):]
+        if pair not in PAIRS:
+            return
+        await q.message.delete()
+        await _run_deepanalysis(update, context, cid, acc, pair)
+        return
 
     if q.data == "choose_pair":
         await safe_edit(q, "🔀 *Select pair*\n\n🔒 BTC & ETH — Pro only",
