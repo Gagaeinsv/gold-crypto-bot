@@ -48,7 +48,10 @@ TOKEN           = os.getenv("GAMING_BOT_TOKEN", "")
 CHANNEL_ID      = os.getenv("GAMING_CHANNEL_ID", "@your_gaming_channel")
 RAWG_KEY        = os.getenv("RAWG_API_KEY", "")          # https://rawg.io/apidocs
 NEWS_API_KEY    = os.getenv("NEWS_API_KEY", "")           # https://newsapi.org/  (optional)
+GEMINI_KEY      = os.getenv("GEMINI_KEY", "")             # https://aistudio.google.com/
 ADMIN_ID        = int(os.getenv("ADMIN_ID", "0"))
+
+GEMINI_MODEL    = "gemini-2.5-flash"
 
 DB_PATH         = "gaming_bot.db"
 CHECK_INTERVAL  = 15 * 60          # check sources every 15 minutes
@@ -614,9 +617,70 @@ async def fetch_rawg_releases(client: httpx.AsyncClient) -> list[dict]:
         })
     return releases
 
+# ──────────────────────── Gemini AI Rewriter ─────────────────────────────────
+
+def _gemini_rewrite(title: str, summary: str, category: str, source: str, url: str) -> Optional[str]:
+    """
+    Use Gemini Flash to rewrite an article into an engaging Ukrainian Telegram post.
+    Returns the rewritten text, or None on failure (caller falls back to plain format).
+    """
+    if not GEMINI_KEY:
+        return None
+    try:
+        import google.genai as genai
+        import google.genai.types as gtypes
+    except ImportError:
+        log.warning("google-genai not installed — skipping AI rewrite")
+        return None
+
+    cat_hints = {
+        "giveaway": "Це безкоштовна роздача гри. Зроби акцент на тому, що гра безкоштовна, і що треба поспішати.",
+        "release":  "Це новина про реліз або дату виходу гри. Підкресли дату і платформи.",
+        "update":   "Це патч або оновлення гри. Коротко перелічи найцікавіше що додали/виправили.",
+        "news":     "Це загальна ігрова новина. Подай її захопливо.",
+    }
+    hint = cat_hints.get(category, cat_hints["news"])
+
+    prompt = f"""Ти — редактор україномовного Telegram-каналу про відеоігри.
+Твоє завдання: перетворити нижченаведену англомовну новину на короткий, живий пост УКРАЇНСЬКОЮ мовою для Telegram-каналу.
+
+Правила:
+1. Пиши виключно УКРАЇНСЬКОЮ мовою.
+2. Починай одразу з суті — без вступних фраз типу "Ось новина" або "Привіт".
+3. Обсяг: 2–4 речення (максимум 300 символів тексту без заголовку).
+4. Додавай 1–2 доречних емодзі в тексті — не переборщуй.
+5. НЕ додавай посилань, хештегів, підписів "#реклама" чи будь-яких HTML-тегів — тільки чистий текст.
+6. НЕ вигадуй деталей яких немає в оригіналі.
+7. {hint}
+
+Оригінальний заголовок: {title}
+Короткий опис: {summary[:600] if summary else '(немає)'}
+Джерело: {source}
+
+Виведи ТІЛЬКИ готовий текст посту українською — без жодних пояснень, заголовків чи обгортки."""
+
+    try:
+        client = genai.Client(api_key=GEMINI_KEY)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=gtypes.GenerateContentConfig(
+                max_output_tokens=400,
+                temperature=0.7,
+            ),
+        )
+        text = (response.text or "").strip()
+        if len(text) < 20:
+            return None
+        return text
+    except Exception as exc:
+        log.warning("Gemini rewrite failed: %s", exc)
+        return None
+
+
 # ──────────────────────── Message Formatter ───────────────────────────────────
 
-def format_post(article: dict) -> str:
+def format_post(article: dict, ai_body: Optional[str] = None) -> str:
     cat      = article.get("category", "news")
     emoji    = CATEGORY_EMOJI.get(cat, "🎮")
     source   = article.get("source", "")
@@ -630,9 +694,11 @@ def format_post(article: dict) -> str:
 
     lines = []
     lines.append(f"{emoji}{plat_em} <b>{title}</b>")
+    lines.append("")
 
-    if summary:
-        lines.append("")
+    if ai_body:
+        lines.append(ai_body)
+    elif summary:
         lines.append(summary[:600])
 
     if url:
@@ -643,7 +709,6 @@ def format_post(article: dict) -> str:
         lines.append(f"\n📰 <i>Джерело: {source}</i>")
 
     text = "\n".join(lines)
-    # Telegram caption limit is 1024 for photos, 4096 for text messages
     return truncate(text, 1024)
 
 # ──────────────────────── Telegram Poster ─────────────────────────────────────
@@ -654,7 +719,26 @@ async def send_post(bot: Bot, article: dict, conn: sqlite3.Connection) -> bool:
     if is_posted(conn, h):
         return False
 
-    caption = format_post(article)
+    # Run Gemini rewrite in a thread (blocking SDK call) so we don't block the event loop
+    ai_body: Optional[str] = None
+    if GEMINI_KEY:
+        loop = asyncio.get_event_loop()
+        try:
+            ai_body = await loop.run_in_executor(
+                None,
+                _gemini_rewrite,
+                article.get("title", ""),
+                article.get("summary", ""),
+                article.get("category", "news"),
+                article.get("source", ""),
+                article.get("url", ""),
+            )
+            if ai_body:
+                log.info("Gemini rewrote: %s", article.get("title", "")[:60])
+        except Exception as exc:
+            log.warning("Gemini executor error: %s", exc)
+
+    caption = format_post(article, ai_body=ai_body)
     image   = article.get("image") or article.get("image_fallback") or ""
     url     = article.get("url", "")
     title   = article.get("title", "")
