@@ -1,0 +1,23 @@
+# Environment & secrets
+.env
+.envy
+
+# Logs
+*.log
+bot.log
+
+# Database
+*.db
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Cursor IDE
+.cursor/
+.cursor-server/
+
+# Misc
+.bash_history
+.cache/
