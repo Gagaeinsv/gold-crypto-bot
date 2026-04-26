@@ -67,9 +67,8 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "@your_bot")
 GROQ_MODEL   = "llama-3.1-8b-instant"
 GROQ_TIMEOUT = 20
 
-# Deep analysis models
-GEMINI_FLASH = "gemini-2.0-flash"        # /deepanalysis  (fast, cheap)
-GEMINI_PRO   = "gemini-2.5-pro-preview-05-06"  # /deepanalysis full (deep)
+# Deep analysis model (free tier)
+GEMINI_FLASH = "gemini-2.0-flash"
 
 TRIAL_DAYS        = 7
 PRICE_BASIC       = 550    # ~$5 net after Telegram 30% fee
@@ -2200,7 +2199,7 @@ def _get_macro_context(pair: str) -> str:
 
 
 def _build_deep_prompt(pair: str, price: float, tf_data: dict,
-                       macro: str, econ: dict, mode: str) -> str:
+                       macro: str, econ: dict) -> str:
     """Build the comprehensive prompt for Gemini."""
     cfg = PAIRS[pair]
 
@@ -2222,8 +2221,7 @@ def _build_deep_prompt(pair: str, price: float, tf_data: dict,
     if econ.get("has_danger"):
         econ_text = f"\n⚠️ HIGH-IMPACT USD EVENTS TODAY: {', '.join(econ['events'])}"
 
-    depth = "extremely detailed with specific price levels and probabilities" \
-            if mode == "opus" else "detailed and actionable"
+    depth = "detailed and actionable"
 
     return f"""You are a professional XAU/USD (Gold) trader and market analyst with 15+ years experience.
 Your analysis must be {depth}.
@@ -2286,15 +2284,10 @@ Format your response with clear sections and specific prices throughout.
 Be direct and actionable — this is for live trading decisions."""
 
 
-def _gemini_deep_analysis(pair: str, price: float, mode: str) -> str:
-    """
-    Run deep analysis using Google Gemini.
-    mode: 'flash' or 'pro'
-    """
+def _gemini_deep_analysis(pair: str, price: float) -> str:
+    """Run deep analysis using Google Gemini Flash (free tier)."""
     import google.genai as genai
     import google.genai.types as gtypes
-
-    model_id = GEMINI_PRO if mode == "pro" else GEMINI_FLASH
 
     # Gather all data
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
@@ -2315,14 +2308,14 @@ def _gemini_deep_analysis(pair: str, price: float, mode: str) -> str:
         except Exception:
             econ = {"has_danger": False, "events": []}
 
-    prompt = _build_deep_prompt(pair, price, tf_data, macro, econ, mode)
+    prompt = _build_deep_prompt(pair, price, tf_data, macro, econ)
 
     client = genai.Client(api_key=GEMINI_KEY)
     response = client.models.generate_content(
-        model=model_id,
+        model=GEMINI_FLASH,
         contents=prompt,
         config=gtypes.GenerateContentConfig(
-            max_output_tokens=2500 if mode == "pro" else 1800,
+            max_output_tokens=1800,
         ),
     )
     return response.text
@@ -2331,8 +2324,7 @@ def _gemini_deep_analysis(pair: str, price: float, mode: str) -> str:
 async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Usage:
-      /deepanalysis          — Gemini Flash (fast)
-      /deepanalysis full     — Gemini Pro   (deep)
+      /deepanalysis          — Gemini Flash (free)
       /deepanalysis BTCUSD   — different pair
     """
     if update.effective_chat.id != ADMIN_ID:
@@ -2348,22 +2340,17 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     args = context.args or []
-    mode = "flash"
     pair = "XAUUSD"
 
     for arg in args:
-        if arg.lower() == "full":
-            mode = "pro"
-        elif arg.upper() in PAIRS:
+        if arg.upper() in PAIRS:
             pair = arg.upper()
 
-    cfg        = PAIRS[pair]
-    model_name = GEMINI_PRO if mode == "pro" else GEMINI_FLASH
-    cost_hint  = "deep" if mode == "pro" else "fast"
+    cfg = PAIRS[pair]
 
     await update.message.reply_text(
         f"🧠 *Deep Analysis* — {cfg['emoji']} {cfg['name']}\n\n"
-        f"Model: `{model_name}`  ({cost_hint})\n"
+        f"Model: `{GEMINI_FLASH}`\n"
         f"⏳ Gathering data from 4 timeframes + macro news…\n\n"
         f"_This takes 30-60 seconds — please wait_",
         parse_mode="Markdown",
@@ -2377,12 +2364,12 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     try:
         loop   = asyncio.get_event_loop()
         result = await asyncio.wait_for(
-            loop.run_in_executor(None, _gemini_deep_analysis, pair, price, mode),
+            loop.run_in_executor(None, _gemini_deep_analysis, pair, price),
             timeout=120,
         )
     except asyncio.TimeoutError:
         await update.message.reply_text(
-            "⏱ Analysis timed out (120s). Try again or use `/deepanalysis` without `full`.",
+            "⏱ Analysis timed out (120s). Please try again.",
             parse_mode="Markdown",
         )
         return
@@ -2395,7 +2382,7 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     header = (
         f"🧠 *DEEP ANALYSIS — {cfg['emoji']} {cfg['name']}*\n"
         f"💰 Price: *{fmt_price(price, pair)}*  |  "
-        f"Model: `{model_name}`\n"
+        f"Model: `{GEMINI_FLASH}`\n"
         f"{'─' * 30}\n\n"
     )
     full_text = header + result
@@ -2422,7 +2409,7 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if i < len(chunks) - 1:
             await asyncio.sleep(0.5)
 
-    log.info("Deep analysis: %s %s mode=%s price=%s", pair, model_name, mode, price)
+    log.info("Deep analysis: %s model=%s price=%s", pair, GEMINI_FLASH, price)
 
 
 # ═══════════════════════════════════════════════════════════════════
