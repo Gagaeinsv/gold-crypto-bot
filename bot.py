@@ -846,9 +846,33 @@ def get_technicals(pair: str) -> dict:
 #  Groq analysis  (ONE call per full_analysis — never loops)
 # ═══════════════════════════════════════════════════════════════════
 
-def _groq_client():
-    from groq import Groq
-    return Groq(api_key=GROQ_KEY)
+def _gemini_text(prompt: str, max_tokens: int = 500) -> str:
+    """Generate text via Gemini Flash. Used as Groq fallback."""
+    import google.genai as genai
+    import google.genai.types as gtypes
+    client = genai.Client(api_key=GEMINI_KEY)
+    response = client.models.generate_content(
+        model=GEMINI_FLASH,
+        contents=prompt,
+        config=gtypes.GenerateContentConfig(max_output_tokens=max_tokens),
+    )
+    return response.text
+
+
+def _gemini_json_analysis(prompt: str) -> str:
+    """Ask Gemini for a JSON trading signal. Used as Groq fallback."""
+    import google.genai as genai
+    import google.genai.types as gtypes
+    client = genai.Client(api_key=GEMINI_KEY)
+    response = client.models.generate_content(
+        model=GEMINI_FLASH,
+        contents=prompt,
+        config=gtypes.GenerateContentConfig(
+            max_output_tokens=300,
+            response_mime_type="application/json",
+        ),
+    )
+    return response.text
 
 
 def _make_sl_tp(price: float, direction: str, sl_pct: float, tp_pct: float) -> tuple[float, float]:
@@ -871,6 +895,11 @@ def _normalize_confidence(raw_conf) -> int:
         return max(0, min(100, int(round(v))))
     except (TypeError, ValueError):
         return 35
+
+
+def _groq_client():
+    from groq import Groq
+    return Groq(api_key=GROQ_KEY)
 
 
 def groq_analysis(news_text: str, price: float, tech: dict,
@@ -904,9 +933,7 @@ def groq_analysis(news_text: str, price: float, tech: dict,
             tb = (f"RSI={tech['rsi']}({tech['rsi_zone']}), MACD={tech['macd_cross']}, "
                   f"EMA20={tech['ema20']}, EMA50={tech['ema50']}, "
                   f"Support={tech['support1']}, Resistance={tech['resist1']}")
-        raw = _groq_client().chat.completions.create(
-            model=GROQ_MODEL, timeout=GROQ_TIMEOUT,
-            messages=[{"role": "user", "content": (
+        analysis_prompt = (
                 f"You are a senior {cfg['name']} trader.\n"
                 f"Current price: {price}, Trend: {trend}, Volatility: {vol}\n"
                 f"Technicals: {tb}\nNews: {news_text[:300]}\n\n"
@@ -919,9 +946,19 @@ def groq_analysis(news_text: str, price: float, tech: dict,
                 "- If sentiment is bullish: stop_loss MUST be BELOW entry, take_profit MUST be ABOVE entry\n"
                 "Keys: sentiment, confidence, risk_level, recommendation, "
                 "optimal_entry, stop_loss, take_profit, risk_reward, entry_reason, main_driver"
-            )}],
-            temperature=0.3, max_tokens=280,
-        ).choices[0].message.content
+        )
+        try:
+            raw = _groq_client().chat.completions.create(
+                model=GROQ_MODEL, timeout=GROQ_TIMEOUT,
+                messages=[{"role": "user", "content": analysis_prompt}],
+                temperature=0.3, max_tokens=280,
+            ).choices[0].message.content
+        except Exception as groq_err:
+            if "429" in str(groq_err) or "rate_limit" in str(groq_err).lower():
+                log.info("Groq rate limit — falling back to Gemini for analysis")
+                raw = _gemini_json_analysis(analysis_prompt)
+            else:
+                raise
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         if m:
             parsed = json.loads(m.group())
@@ -945,7 +982,7 @@ def groq_analysis(news_text: str, price: float, tech: dict,
                     parsed["take_profit"] = tp
             return {**fallback, **parsed}
     except Exception as e:
-        log.warning("Groq analysis: %s", e)
+        log.warning("AI analysis failed (Groq+Gemini): %s", e)
     return fallback
 
 
@@ -1335,11 +1372,18 @@ def groq_article(topic_type: str, topic: str) -> str:
             "6. 📌 Practical tip (1 sentence)\n\n"
             "Length: 120-160 words. Use ONLY *bold* for the headline."
         )
-    result = _groq_client().chat.completions.create(
-        model=GROQ_MODEL, timeout=GROQ_TIMEOUT,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.6, max_tokens=500,
-    ).choices[0].message.content.strip()
+    try:
+        result = _groq_client().chat.completions.create(
+            model=GROQ_MODEL, timeout=GROQ_TIMEOUT,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.6, max_tokens=500,
+        ).choices[0].message.content.strip()
+    except Exception as groq_err:
+        if "429" in str(groq_err) or "rate_limit" in str(groq_err).lower():
+            log.info("Groq rate limit — falling back to Gemini for article")
+            result = _gemini_text(prompt, max_tokens=500)
+        else:
+            raise
     return result
 
 
