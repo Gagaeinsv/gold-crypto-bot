@@ -2736,35 +2736,32 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         result = response.text
 
-        header = "📊 *Chart Analysis*\n" + "─" * 28 + "\n\n"
+        # Convert Gemini markdown (**bold**) to plain text — Telegram only supports *bold*
+        result = re.sub(r"\*\*(.+?)\*\*", r"\1", result)
+        result = re.sub(r"__(.+?)__",     r"\1", result)
+        result = re.sub(r"#+\s*",         "",    result)
+
+        header = "📊 Chart Analysis\n" + "─" * 28 + "\n\n"
         full   = header + result
 
-        # Split at paragraph boundaries to avoid breaking markdown
-        if len(full) <= 4000:
-            try:
-                await update.message.reply_text(full, parse_mode="Markdown")
-            except Exception:
-                await update.message.reply_text(re.sub(r"[*_`#]", "", full))
-        else:
-            parts = []
-            remaining = full
-            while len(remaining) > 3800:
-                split_at = remaining.rfind("\n\n", 0, 3800)
-                if split_at == -1:
-                    split_at = remaining.rfind("\n", 0, 3800)
-                if split_at == -1:
-                    split_at = 3800
-                parts.append(remaining[:split_at])
-                remaining = remaining[split_at:].lstrip()
-            if remaining:
-                parts.append(remaining)
-            for i, part in enumerate(parts):
-                try:
-                    await update.message.reply_text(part, parse_mode="Markdown")
-                except Exception:
-                    await update.message.reply_text(re.sub(r"[*_`#]", "", part))
-                if i < len(parts) - 1:
-                    await asyncio.sleep(0.5)
+        # Split at paragraph boundaries
+        parts = []
+        remaining = full
+        while len(remaining) > 3800:
+            split_at = remaining.rfind("\n\n", 0, 3800)
+            if split_at == -1:
+                split_at = remaining.rfind("\n", 0, 3800)
+            if split_at == -1:
+                split_at = 3800
+            parts.append(remaining[:split_at])
+            remaining = remaining[split_at:].lstrip()
+        if remaining:
+            parts.append(remaining)
+
+        for i, part in enumerate(parts):
+            await update.message.reply_text(part)
+            if i < len(parts) - 1:
+                await asyncio.sleep(0.5)
 
         log.info("Chart analysis: cid=%s plan=%s", cid, acc["plan"])
 
