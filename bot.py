@@ -2624,12 +2624,20 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("❌ Vision analysis not configured.")
         return
 
-    # Check if message has a photo
+    # Check if message has a photo or image document
     photo = None
     if update.message.photo:
         photo = update.message.photo[-1]   # largest size
-    elif update.message.reply_to_message and update.message.reply_to_message.photo:
-        photo = update.message.reply_to_message.photo[-1]
+    elif update.message.document and update.message.document.mime_type and \
+            update.message.document.mime_type.startswith("image/"):
+        photo = update.message.document
+    elif update.message.reply_to_message:
+        rm = update.message.reply_to_message
+        if rm.photo:
+            photo = rm.photo[-1]
+        elif rm.document and rm.document.mime_type and \
+                rm.document.mime_type.startswith("image/"):
+            photo = rm.document
 
     if not photo:
         await update.message.reply_text(
@@ -2748,7 +2756,8 @@ async def handle_photo(update, context):
     acc = db_access(cid)
     if acc["plan"] not in ("diamond", "admin") and cid != ADMIN_ID:
         return
-    await cmd_chartanalysis(update, context)
+    if update.message and (update.message.photo or update.message.document):
+        await cmd_chartanalysis(update, context)
 
 async def cmd_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.id != ADMIN_ID:
@@ -3693,7 +3702,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
     app.job_queue.run_repeating(monitor, interval=60, first=15)
 
     # Start TradingView webhook server
