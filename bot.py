@@ -59,7 +59,7 @@ load_dotenv()
 TOKEN        = os.getenv("TOKEN",        "INSERT_TOKEN")
 NEWS_API     = os.getenv("NEWS_API",     "INSERT_NEWS_API")
 GROQ_KEY     = os.getenv("GROQ_KEY",     "INSERT_GROQ_KEY")
-ANTHROPIC_KEY = os.getenv("ANTHROPIC_KEY", "")   # for /deepanalysis
+GEMINI_KEY = os.getenv("GEMINI_KEY", "")   # for /deepanalysis and /chart
 ADMIN_ID     = int(os.getenv("ADMIN_ID", "123456789"))
 CHANNEL_ID   = os.getenv("CHANNEL_ID",  "@your_channel")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "@your_bot")
@@ -68,8 +68,8 @@ GROQ_MODEL   = "llama-3.1-8b-instant"
 GROQ_TIMEOUT = 20
 
 # Deep analysis models
-CLAUDE_SONNET = "claude-sonnet-4-5"   # /deepanalysis  (fast, ~$0.015)
-CLAUDE_OPUS   = "claude-opus-4-5"     # /deepanalysis full (~$0.08)
+GEMINI_FLASH = "gemini-2.0-flash"        # /deepanalysis  (fast, cheap)
+GEMINI_PRO   = "gemini-2.5-pro-preview-05-06"  # /deepanalysis full (deep)
 
 TRIAL_DAYS        = 7
 PRICE_BASIC       = 550    # ~$5 net after Telegram 30% fee
@@ -2065,7 +2065,7 @@ async def cmd_forcepost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Deep Analysis  (Claude Sonnet / Opus — admin only)
+#  Deep Analysis  (Gemini Flash / Pro — admin only)
 # ═══════════════════════════════════════════════════════════════════
 
 def _get_multi_tf_data(pair: str) -> dict:
@@ -2201,7 +2201,7 @@ def _get_macro_context(pair: str) -> str:
 
 def _build_deep_prompt(pair: str, price: float, tf_data: dict,
                        macro: str, econ: dict, mode: str) -> str:
-    """Build the comprehensive prompt for Claude."""
+    """Build the comprehensive prompt for Gemini."""
     cfg = PAIRS[pair]
 
     # Format multi-timeframe data
@@ -2286,14 +2286,15 @@ Format your response with clear sections and specific prices throughout.
 Be direct and actionable — this is for live trading decisions."""
 
 
-def _claude_deep_analysis(pair: str, price: float, mode: str) -> str:
+def _gemini_deep_analysis(pair: str, price: float, mode: str) -> str:
     """
-    Run deep analysis using Anthropic Claude.
-    mode: 'sonnet' or 'opus'
+    Run deep analysis using Google Gemini.
+    mode: 'flash' or 'pro'
     """
-    import anthropic
+    import google.genai as genai
+    import google.genai.types as gtypes
 
-    model = CLAUDE_OPUS if mode == "opus" else CLAUDE_SONNET
+    model_id = GEMINI_PRO if mode == "pro" else GEMINI_FLASH
 
     # Gather all data
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
@@ -2316,47 +2317,49 @@ def _claude_deep_analysis(pair: str, price: float, mode: str) -> str:
 
     prompt = _build_deep_prompt(pair, price, tf_data, macro, econ, mode)
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-    msg = client.messages.create(
-        model=model,
-        max_tokens=2500 if mode == "opus" else 1800,
-        messages=[{"role": "user", "content": prompt}],
+    client = genai.Client(api_key=GEMINI_KEY)
+    response = client.models.generate_content(
+        model=model_id,
+        contents=prompt,
+        config=gtypes.GenerateContentConfig(
+            max_output_tokens=2500 if mode == "pro" else 1800,
+        ),
     )
-    return msg.content[0].text
+    return response.text
 
 
 async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Usage:
-      /deepanalysis          — Claude Sonnet (fast, ~$0.015)
-      /deepanalysis full     — Claude Opus   (deep, ~$0.08)
+      /deepanalysis          — Gemini Flash (fast)
+      /deepanalysis full     — Gemini Pro   (deep)
       /deepanalysis BTCUSD   — different pair
     """
     if update.effective_chat.id != ADMIN_ID:
         await update.message.reply_text("⛔ Admin only.")
         return
 
-    if not ANTHROPIC_KEY:
+    if not GEMINI_KEY:
         await update.message.reply_text(
-            "❌ ANTHROPIC\\_KEY not set in .env\n\n"
-            "Get your key at: console.anthropic.com",
+            "❌ GEMINI\\_KEY not set in .env\n\n"
+            "Get your key at: aistudio.google.com",
             parse_mode="Markdown",
         )
         return
 
     args = context.args or []
-    mode = "sonnet"
+    mode = "flash"
     pair = "XAUUSD"
 
     for arg in args:
         if arg.lower() == "full":
-            mode = "opus"
+            mode = "pro"
         elif arg.upper() in PAIRS:
             pair = arg.upper()
 
     cfg        = PAIRS[pair]
-    model_name = CLAUDE_OPUS if mode == "opus" else CLAUDE_SONNET
-    cost_hint  = "~$0.08" if mode == "opus" else "~$0.015"
+    model_name = GEMINI_PRO if mode == "pro" else GEMINI_FLASH
+    cost_hint  = "deep" if mode == "pro" else "fast"
 
     await update.message.reply_text(
         f"🧠 *Deep Analysis* — {cfg['emoji']} {cfg['name']}\n\n"
@@ -2374,7 +2377,7 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     try:
         loop   = asyncio.get_event_loop()
         result = await asyncio.wait_for(
-            loop.run_in_executor(None, _claude_deep_analysis, pair, price, mode),
+            loop.run_in_executor(None, _gemini_deep_analysis, pair, price, mode),
             timeout=120,
         )
     except asyncio.TimeoutError:
@@ -2423,12 +2426,12 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Vision Chart Analysis  (Claude reads screenshot — all users)
+#  Vision Chart Analysis  (Gemini reads screenshot — all users)
 # ═══════════════════════════════════════════════════════════════════
 
 async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    User sends a chart screenshot → Claude Sonnet analyses it visually.
+    User sends a chart screenshot → Gemini Flash analyses it visually.
     Usage: send photo with caption /chart or just /chart then send photo
     Available to all subscribed users.
     """
@@ -2441,7 +2444,7 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    if not ANTHROPIC_KEY:
+    if not GEMINI_KEY:
         await update.message.reply_text("❌ Vision analysis not configured.")
         return
 
@@ -2460,7 +2463,7 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "3. Take a screenshot\n"
             "4. Send the screenshot to this bot\n"
             "   _(caption is optional)_\n\n"
-            "Claude will analyse the chart and give you:\n"
+            "Gemini will analyse the chart and give you:\n"
             "• Trend direction and strength\n"
             "• Key support & resistance levels\n"
             "• Entry, SL and TP suggestion\n"
@@ -2470,7 +2473,7 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     await update.message.reply_text(
-        "🔍 *Analysing your chart…*\n_Claude is reading the image — 15-30 seconds_",
+        "🔍 *Analysing your chart…*\n_Gemini is reading the image — 15-30 seconds_",
         parse_mode="Markdown",
     )
 
@@ -2478,8 +2481,6 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # Download photo from Telegram
         photo_file = await context.bot.get_file(photo.file_id)
         photo_bytes = await photo_file.download_as_bytearray()
-        import base64
-        photo_b64 = base64.standard_b64encode(bytes(photo_bytes)).decode("utf-8")
 
         # Get current price for context
         price = get_price("XAUUSD")
@@ -2522,27 +2523,21 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "If the chart quality is poor or unclear, say so."
         )
 
-        import anthropic
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        msg = client.messages.create(
-            model=CLAUDE_SONNET,   # Sonnet — vision + speed
-            max_tokens=1200,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type":  "image",
-                        "source": {
-                            "type":       "base64",
-                            "media_type": "image/jpeg",
-                            "data":       photo_b64,
-                        },
-                    },
-                    {"type": "text", "text": prompt},
-                ],
-            }],
+        import google.genai as genai
+        import google.genai.types as gtypes
+        import PIL.Image
+        import io
+
+        client = genai.Client(api_key=GEMINI_KEY)
+        image = PIL.Image.open(io.BytesIO(bytes(photo_bytes)))
+        response = client.models.generate_content(
+            model=GEMINI_FLASH,
+            contents=[prompt, image],
+            config=gtypes.GenerateContentConfig(
+                max_output_tokens=1200,
+            ),
         )
-        result = msg.content[0].text
+        result = response.text
 
         header = "📊 *Chart Analysis*\n" + "─" * 28 + "\n\n"
         full   = header + result
