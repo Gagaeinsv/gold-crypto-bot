@@ -2731,7 +2731,7 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             model=GEMINI_FLASH,
             contents=[prompt, image],
             config=gtypes.GenerateContentConfig(
-                max_output_tokens=1200,
+                max_output_tokens=2500,
             ),
         )
         result = response.text
@@ -2739,21 +2739,32 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         header = "📊 *Chart Analysis*\n" + "─" * 28 + "\n\n"
         full   = header + result
 
-        # Split if too long
+        # Split at paragraph boundaries to avoid breaking markdown
         if len(full) <= 4000:
             try:
                 await update.message.reply_text(full, parse_mode="Markdown")
             except Exception:
                 await update.message.reply_text(re.sub(r"[*_`#]", "", full))
         else:
-            parts = [full[i:i+3800] for i in range(0, len(full), 3800)]
+            parts = []
+            remaining = full
+            while len(remaining) > 3800:
+                split_at = remaining.rfind("\n\n", 0, 3800)
+                if split_at == -1:
+                    split_at = remaining.rfind("\n", 0, 3800)
+                if split_at == -1:
+                    split_at = 3800
+                parts.append(remaining[:split_at])
+                remaining = remaining[split_at:].lstrip()
+            if remaining:
+                parts.append(remaining)
             for i, part in enumerate(parts):
                 try:
                     await update.message.reply_text(part, parse_mode="Markdown")
                 except Exception:
                     await update.message.reply_text(re.sub(r"[*_`#]", "", part))
                 if i < len(parts) - 1:
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.5)
 
         log.info("Chart analysis: cid=%s plan=%s", cid, acc["plan"])
 
