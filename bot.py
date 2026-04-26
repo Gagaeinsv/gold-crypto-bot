@@ -59,7 +59,11 @@ load_dotenv()
 TOKEN        = os.getenv("TOKEN",        "INSERT_TOKEN")
 NEWS_API     = os.getenv("NEWS_API",     "INSERT_NEWS_API")
 GROQ_KEY     = os.getenv("GROQ_KEY",     "INSERT_GROQ_KEY")
-ANTHROPIC_KEY = os.getenv("ANTHROPIC_KEY", "")   # for /deepanalysis
+GEMINI_KEY   = (
+    os.getenv("GEMINI_KEY")
+    or os.getenv("GEMINI_API_KEY")
+    or os.getenv("GOOGLE_API_KEY", "")
+)
 ADMIN_ID     = int(os.getenv("ADMIN_ID", "123456789"))
 CHANNEL_ID   = os.getenv("CHANNEL_ID",  "@your_channel")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "@your_bot")
@@ -68,8 +72,12 @@ GROQ_MODEL   = "llama-3.1-8b-instant"
 GROQ_TIMEOUT = 20
 
 # Deep analysis models
-CLAUDE_SONNET = "claude-sonnet-4-5"   # /deepanalysis  (fast, ~$0.015)
-CLAUDE_OPUS   = "claude-opus-4-5"     # /deepanalysis full (~$0.08)
+GEMINI_FAST_MODEL = os.getenv("GEMINI_FAST_MODEL", "gemini-1.5-flash")
+GEMINI_DEEP_MODEL = os.getenv("GEMINI_DEEP_MODEL", "gemini-1.5-pro")
+
+PAID_PLANS = ("basic", "pro", "diamond")
+TRADE_CONTROL_PLANS = (*PAID_PLANS, "admin")
+AUTO_SIGNAL_PLANS = ("pro", "diamond", "admin")
 
 TRIAL_DAYS        = 7
 PRICE_BASIC       = 550    # ~$5 net after Telegram 30% fee
@@ -89,14 +97,14 @@ PAIRS: dict = {
         "name": "XAU/USD", "emoji": "🥇", "yahoo": "GC=F", "stooq": "xauusd",
         "news_q": "gold USD Fed XAU inflation",
         "sl_pct": 2.0, "tp_pct": 3.0,
-        "plans": ["trial", "basic", "pro", "admin"],
+        "plans": ["trial", "basic", "pro", "diamond", "admin"],
         "image": "https://images.unsplash.com/photo-1610375461246-83df859d849d?w=800&q=80",
     },
     "XAGUSD": {
         "name": "XAG/USD", "emoji": "🥈", "yahoo": "SI=F", "stooq": "xagusd",
         "news_q": "silver XAG price industrial demand",
         "sl_pct": 2.5, "tp_pct": 4.0,
-        "plans": ["basic", "pro", "admin"],
+        "plans": ["basic", "pro", "diamond", "admin"],
         "image": "https://images.unsplash.com/photo-1569025743873-ea3a9ade89f9?w=800&q=80",
     },
     # ── Top Crypto ───────────────────────────────────────────────
@@ -104,42 +112,42 @@ PAIRS: dict = {
         "name": "BTC/USD", "emoji": "₿", "yahoo": "BTC-USD", "stooq": "btcusd",
         "news_q": "bitcoin BTC crypto halving ETF",
         "sl_pct": 3.0, "tp_pct": 5.0,
-        "plans": ["pro", "admin"],
+        "plans": ["pro", "diamond", "admin"],
         "image": "https://images.unsplash.com/photo-1518546305927-5a555bb7020d?w=800&q=80",
     },
     "ETHUSD": {
         "name": "ETH/USD", "emoji": "Ξ", "yahoo": "ETH-USD", "stooq": "ethusd",
         "news_q": "ethereum ETH crypto DeFi upgrade",
         "sl_pct": 3.5, "tp_pct": 6.0,
-        "plans": ["pro", "admin"],
+        "plans": ["pro", "diamond", "admin"],
         "image": "https://images.unsplash.com/photo-1622630998477-20aa696ecb05?w=800&q=80",
     },
     "SOLUSD": {
         "name": "SOL/USD", "emoji": "◎", "yahoo": "SOL-USD", "stooq": "solusd",
         "news_q": "Solana SOL crypto network ecosystem",
         "sl_pct": 4.0, "tp_pct": 7.0,
-        "plans": ["pro", "admin"],
+        "plans": ["pro", "diamond", "admin"],
         "image": "https://images.unsplash.com/photo-1639762681485-074b7f938ba0?w=800&q=80",
     },
     "XRPUSD": {
         "name": "XRP/USD", "emoji": "✕", "yahoo": "XRP-USD", "stooq": "xrpusd",
         "news_q": "XRP Ripple SEC crypto payment",
         "sl_pct": 4.0, "tp_pct": 7.0,
-        "plans": ["pro", "admin"],
+        "plans": ["pro", "diamond", "admin"],
         "image": "https://images.unsplash.com/photo-1639762681485-074b7f938ba0?w=800&q=80",
     },
     "BNBUSD": {
         "name": "BNB/USD", "emoji": "🔶", "yahoo": "BNB-USD", "stooq": "bnbusd",
         "news_q": "BNB Binance crypto exchange",
         "sl_pct": 3.5, "tp_pct": 6.0,
-        "plans": ["pro", "admin"],
+        "plans": ["pro", "diamond", "admin"],
         "image": "https://images.unsplash.com/photo-1639762681485-074b7f938ba0?w=800&q=80",
     },
     "ADAUSD": {
         "name": "ADA/USD", "emoji": "🔵", "yahoo": "ADA-USD", "stooq": "adausd",
         "news_q": "Cardano ADA crypto blockchain",
         "sl_pct": 4.5, "tp_pct": 8.0,
-        "plans": ["pro", "admin"],
+        "plans": ["pro", "diamond", "admin"],
         "image": "https://images.unsplash.com/photo-1639762681485-074b7f938ba0?w=800&q=80",
     },
 }
@@ -292,7 +300,7 @@ def db_access(cid: int) -> dict:
     if cid == ADMIN_ID:
         return {"allowed": True, "plan": "admin", "days_left": 9999, "reason": ""}
 
-    if plan in ("basic", "pro") and row["sub_expires"]:
+    if plan in PAID_PLANS and row["sub_expires"]:
         exp = datetime.strptime(row["sub_expires"], "%Y-%m-%d").date()
         if exp >= today:
             return {"allowed": True, "plan": plan, "days_left": (exp - today).days, "reason": ""}
@@ -336,12 +344,13 @@ def db_stats() -> dict:
     with db_connect() as c:
         total = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         trial = c.execute("SELECT COUNT(*) FROM users WHERE plan='trial'").fetchone()[0]
-        basic = c.execute("SELECT COUNT(*) FROM users WHERE plan='basic'").fetchone()[0]
-        pro   = c.execute("SELECT COUNT(*) FROM users WHERE plan='pro'").fetchone()[0]
+        basic   = c.execute("SELECT COUNT(*) FROM users WHERE plan='basic'").fetchone()[0]
+        pro     = c.execute("SELECT COUNT(*) FROM users WHERE plan='pro'").fetchone()[0]
+        diamond = c.execute("SELECT COUNT(*) FROM users WHERE plan='diamond'").fetchone()[0]
         exp   = c.execute("SELECT COUNT(*) FROM users WHERE plan='expired'").fetchone()[0]
         stars = c.execute("SELECT SUM(stars) FROM payments").fetchone()[0] or 0
         posts = c.execute("SELECT COUNT(*) FROM channel_posts").fetchone()[0]
-    return dict(total=total, trial=trial, basic=basic, pro=pro, expired=exp,
+    return dict(total=total, trial=trial, basic=basic, pro=pro, diamond=diamond, expired=exp,
                 total_stars=stars, posts=posts)
 
 
@@ -435,7 +444,7 @@ def db_give_referral_bonus(referrer_id: int, referred_id: int) -> int:
             return 0
 
         today = datetime.utcnow().date()
-        if u["plan"] in ("basic", "pro") and u["sub_expires"]:
+        if u["plan"] in PAID_PLANS and u["sub_expires"]:
             base = max(datetime.strptime(u["sub_expires"], "%Y-%m-%d").date(), today)
             new_date = base + timedelta(days=REFERRAL_BONUS_DAYS)
             c.execute("UPDATE users SET sub_expires=? WHERE chat_id=?",
@@ -1772,11 +1781,14 @@ async def safe_edit(q, text: str, markup=None, **kwargs):
 #  Keyboards
 # ═══════════════════════════════════════════════════════════════════
 
-PLAN_EMOJI = {"trial": "🔬", "basic": "⭐", "pro": "💎", "admin": "👑", "expired": "❌"}
+PLAN_EMOJI = {
+    "trial": "🔬", "basic": "⭐", "pro": "💎", "diamond": "💠",
+    "admin": "👑", "expired": "❌",
+}
 
 
 def plan_label(p: str) -> str:
-    return {"trial": "Trial", "basic": "Basic", "pro": "Pro",
+    return {"trial": "Trial", "basic": "Basic", "pro": "Pro", "diamond": "Diamond",
             "admin": "Admin", "expired": "Expired"}.get(p, p)
 
 
@@ -1786,7 +1798,7 @@ def kb_main(plan: str = "trial", pair: str = DEFAULT_PAIR) -> InlineKeyboardMark
         [InlineKeyboardButton(f"🔀 Pair: {cfg['emoji']} {cfg['name']}", callback_data="choose_pair")],
         [InlineKeyboardButton("▶️ Analyse & Enter", callback_data="start")],
     ]
-    if plan in ("basic", "pro", "admin"):
+    if plan in TRADE_CONTROL_PLANS:
         rows.append([
             InlineKeyboardButton("⏹ Stop",  callback_data="stop"),
             InlineKeyboardButton("🔄 Reset", callback_data="reset"),
@@ -1804,7 +1816,7 @@ def kb_pairs(current_pair: str, plan: str) -> InlineKeyboardMarkup:
     for pid, cfg in PAIRS.items():
         accessible = plan in cfg["plans"]
         mark  = "✅" if pid == current_pair else ("🔒" if not accessible else "")
-        label = f"{mark} {cfg['emoji']} {cfg['name']}" + (" (Pro)" if not accessible else "")
+        label = f"{mark} {cfg['emoji']} {cfg['name']}" + (" (Pro/Diamond)" if not accessible else "")
         rows.append([InlineKeyboardButton(label, callback_data=f"pair_{pid}")])
     rows.append([InlineKeyboardButton("↩️ Back", callback_data="back_main")])
     return InlineKeyboardMarkup(rows)
@@ -1816,6 +1828,8 @@ def kb_sub() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"⭐ Basic — {PRICE_BASIC_3}⭐/3mo (~$12.5) 🔥", callback_data="buy_basic_3")],
         [InlineKeyboardButton(f"💎 Pro   — {PRICE_PRO}⭐/mo (~$9.99)",          callback_data="buy_pro_1")],
         [InlineKeyboardButton(f"💎 Pro   — {PRICE_PRO_3}⭐/3mo (~$25) 🔥",     callback_data="buy_pro_3")],
+        [InlineKeyboardButton(f"💠 Diamond — {PRICE_DIAMOND}⭐/mo (~$19.99)",   callback_data="buy_diamond_1")],
+        [InlineKeyboardButton(f"💠 Diamond — {PRICE_DIAMOND_3}⭐/3mo (~$49.99) 🔥", callback_data="buy_diamond_3")],
         [InlineKeyboardButton("↩️ Back", callback_data="back_main")],
     ])
 
@@ -1846,6 +1860,12 @@ def sub_info_text(acc: dict) -> str:
                   "₿ BTC — ✅", "Ξ ETH — ✅", "◎ SOL — ✅",
                   "✕ XRP — ✅", "🔶 BNB — ✅", "🔵 ADA — ✅",
                   "✅ Auto-signals", ""]
+    elif plan == "diamond":
+        lines += [f"💠 Diamond: *{dl} days* left", "",
+                  "🥇 XAU — ✅", "🥈 XAG — ✅",
+                  "₿ BTC — ✅", "Ξ ETH — ✅", "◎ SOL — ✅",
+                  "✕ XRP — ✅", "🔶 BNB — ✅", "🔵 ADA — ✅",
+                  "✅ Auto-signals", "✅ Premium deep/chart analysis", ""]
     elif plan in ("expired", "none"):
         lines += ["❌ *Subscription expired*", ""]
     lines += [
@@ -1864,6 +1884,13 @@ def sub_info_text(acc: dict) -> str:
         "  • Priority alerts",
         f"  1 mo — *{PRICE_PRO}⭐* (~$9.99)",
         f"  3 mo — *{PRICE_PRO_3}⭐* (~$25) 🔥 _save ~17%_",
+        "",
+        "*💠 Diamond — $19.99/mo*",
+        "  • Everything in Pro +",
+        "  • Premium deep/chart analysis",
+        "  • Highest priority alerts",
+        f"  1 mo — *{PRICE_DIAMOND}⭐* (~$19.99)",
+        f"  3 mo — *{PRICE_DIAMOND_3}⭐* (~$49.99) 🔥 _save ~17%_",
         "",
         "💡 _First week free for new users_",
     ]
@@ -2002,7 +2029,8 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"👑 *Admin Panel*\n\n"
         f"👥 Users: {s['total']}\n🔬 Trial: {s['trial']}\n"
-        f"⭐ Basic: {s['basic']}\n💎 Pro: {s['pro']}\n❌ Expired: {s['expired']}\n\n"
+        f"⭐ Basic: {s['basic']}\n💎 Pro: {s['pro']}\n"
+        f"💠 Diamond: {s['diamond']}\n❌ Expired: {s['expired']}\n\n"
         f"📨 Posts: {s['posts']}\n⭐ Stars: {s['total_stars']}\n\n"
         f"📡 *Traffic sources:*\n{utm_lines}",
         parse_mode="Markdown",
@@ -2015,20 +2043,20 @@ async def cmd_give(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     args = context.args
     if len(args) != 3:
-        await update.message.reply_text("❌ Format: /give 123456 pro 1")
+        await update.message.reply_text("❌ Format: /give 123456 diamond 1")
         return
     try:
         cid    = int(args[0])
         pk     = args[1].lower()
         months = int(args[2])
-        assert pk in ("basic", "pro", "trial"), f"Unknown plan: {pk}"
+        assert pk in (*PAID_PLANS, "trial"), f"Unknown plan: {pk}"
         new_exp = db_apply_payment(cid, 0, pk, months, "manual")
         await update.message.reply_text(
             f"✅ *{pk}* until {new_exp.strftime('%d.%m.%Y')} for {cid}",
             parse_mode="Markdown",
         )
     except (ValueError, AssertionError) as e:
-        await update.message.reply_text(f"❌ {e}\nFormat: /give 123456 pro 1")
+        await update.message.reply_text(f"❌ {e}\nFormat: /give 123456 diamond 1")
 
 
 async def cmd_forcepost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2065,7 +2093,7 @@ async def cmd_forcepost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Deep Analysis  (Claude Sonnet / Opus — admin only)
+#  Deep Analysis  (Gemini — admin only)
 # ═══════════════════════════════════════════════════════════════════
 
 def _get_multi_tf_data(pair: str) -> dict:
@@ -2201,7 +2229,7 @@ def _get_macro_context(pair: str) -> str:
 
 def _build_deep_prompt(pair: str, price: float, tf_data: dict,
                        macro: str, econ: dict, mode: str) -> str:
-    """Build the comprehensive prompt for Claude."""
+    """Build the comprehensive prompt for Gemini."""
     cfg = PAIRS[pair]
 
     # Format multi-timeframe data
@@ -2223,7 +2251,7 @@ def _build_deep_prompt(pair: str, price: float, tf_data: dict,
         econ_text = f"\n⚠️ HIGH-IMPACT USD EVENTS TODAY: {', '.join(econ['events'])}"
 
     depth = "extremely detailed with specific price levels and probabilities" \
-            if mode == "opus" else "detailed and actionable"
+            if mode == "deep" else "detailed and actionable"
 
     return f"""You are a professional XAU/USD (Gold) trader and market analyst with 15+ years experience.
 Your analysis must be {depth}.
@@ -2286,14 +2314,47 @@ Format your response with clear sections and specific prices throughout.
 Be direct and actionable — this is for live trading decisions."""
 
 
-def _claude_deep_analysis(pair: str, price: float, mode: str) -> str:
-    """
-    Run deep analysis using Anthropic Claude.
-    mode: 'sonnet' or 'opus'
-    """
-    import anthropic
+def _gemini_generate_text(prompt: str, model: str, max_tokens: int) -> str:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.25},
+    }
+    r = requests.post(url, params={"key": GEMINI_KEY}, json=payload, timeout=90)
+    r.raise_for_status()
+    data = r.json()
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError) as e:
+        raise RuntimeError(f"Unexpected Gemini response: {data}") from e
 
-    model = CLAUDE_OPUS if mode == "opus" else CLAUDE_SONNET
+
+def _gemini_generate_vision(prompt: str, image_b64: str, model: str, max_tokens: int) -> str:
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": "image/jpeg", "data": image_b64}},
+            ],
+        }],
+        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.25},
+    }
+    r = requests.post(url, params={"key": GEMINI_KEY}, json=payload, timeout=90)
+    r.raise_for_status()
+    data = r.json()
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError) as e:
+        raise RuntimeError(f"Unexpected Gemini response: {data}") from e
+
+
+def _gemini_deep_analysis(pair: str, price: float, mode: str) -> str:
+    """
+    Run deep analysis using Gemini.
+    mode: 'fast' or 'deep'
+    """
+    model = GEMINI_DEEP_MODEL if mode == "deep" else GEMINI_FAST_MODEL
 
     # Gather all data
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
@@ -2316,47 +2377,41 @@ def _claude_deep_analysis(pair: str, price: float, mode: str) -> str:
 
     prompt = _build_deep_prompt(pair, price, tf_data, macro, econ, mode)
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-    msg = client.messages.create(
-        model=model,
-        max_tokens=2500 if mode == "opus" else 1800,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return msg.content[0].text
+    return _gemini_generate_text(prompt, model, 2500 if mode == "deep" else 1800)
 
 
 async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Usage:
-      /deepanalysis          — Claude Sonnet (fast, ~$0.015)
-      /deepanalysis full     — Claude Opus   (deep, ~$0.08)
+      /deepanalysis          — Gemini Flash (fast)
+      /deepanalysis full     — Gemini Pro (deep)
       /deepanalysis BTCUSD   — different pair
     """
     if update.effective_chat.id != ADMIN_ID:
         await update.message.reply_text("⛔ Admin only.")
         return
 
-    if not ANTHROPIC_KEY:
+    if not GEMINI_KEY:
         await update.message.reply_text(
-            "❌ ANTHROPIC\\_KEY not set in .env\n\n"
-            "Get your key at: console.anthropic.com",
+            "❌ GEMINI\\_KEY not set in .env\n\n"
+            "Also supported: GEMINI\\_API\\_KEY or GOOGLE\\_API\\_KEY",
             parse_mode="Markdown",
         )
         return
 
     args = context.args or []
-    mode = "sonnet"
+    mode = "fast"
     pair = "XAUUSD"
 
     for arg in args:
         if arg.lower() == "full":
-            mode = "opus"
+            mode = "deep"
         elif arg.upper() in PAIRS:
             pair = arg.upper()
 
     cfg        = PAIRS[pair]
-    model_name = CLAUDE_OPUS if mode == "opus" else CLAUDE_SONNET
-    cost_hint  = "~$0.08" if mode == "opus" else "~$0.015"
+    model_name = GEMINI_DEEP_MODEL if mode == "deep" else GEMINI_FAST_MODEL
+    cost_hint  = "deep" if mode == "deep" else "fast"
 
     await update.message.reply_text(
         f"🧠 *Deep Analysis* — {cfg['emoji']} {cfg['name']}\n\n"
@@ -2374,7 +2429,7 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     try:
         loop   = asyncio.get_event_loop()
         result = await asyncio.wait_for(
-            loop.run_in_executor(None, _claude_deep_analysis, pair, price, mode),
+            loop.run_in_executor(None, _gemini_deep_analysis, pair, price, mode),
             timeout=120,
         )
     except asyncio.TimeoutError:
@@ -2423,12 +2478,12 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Vision Chart Analysis  (Claude reads screenshot — all users)
+#  Vision Chart Analysis  (Gemini reads screenshot — all users)
 # ═══════════════════════════════════════════════════════════════════
 
 async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    User sends a chart screenshot → Claude Sonnet analyses it visually.
+    User sends a chart screenshot → Gemini analyses it visually.
     Usage: send photo with caption /chart or just /chart then send photo
     Available to all subscribed users.
     """
@@ -2441,7 +2496,7 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    if not ANTHROPIC_KEY:
+    if not GEMINI_KEY:
         await update.message.reply_text("❌ Vision analysis not configured.")
         return
 
@@ -2460,7 +2515,7 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "3. Take a screenshot\n"
             "4. Send the screenshot to this bot\n"
             "   _(caption is optional)_\n\n"
-            "Claude will analyse the chart and give you:\n"
+            "Gemini will analyse the chart and give you:\n"
             "• Trend direction and strength\n"
             "• Key support & resistance levels\n"
             "• Entry, SL and TP suggestion\n"
@@ -2470,7 +2525,7 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     await update.message.reply_text(
-        "🔍 *Analysing your chart…*\n_Claude is reading the image — 15-30 seconds_",
+        "🔍 *Analysing your chart…*\n_Gemini is reading the image — 15-30 seconds_",
         parse_mode="Markdown",
     )
 
@@ -2522,27 +2577,7 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "If the chart quality is poor or unclear, say so."
         )
 
-        import anthropic
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        msg = client.messages.create(
-            model=CLAUDE_SONNET,   # Sonnet — vision + speed
-            max_tokens=1200,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type":  "image",
-                        "source": {
-                            "type":       "base64",
-                            "media_type": "image/jpeg",
-                            "data":       photo_b64,
-                        },
-                    },
-                    {"type": "text", "text": prompt},
-                ],
-            }],
-        )
-        result = msg.content[0].text
+        result = _gemini_generate_vision(prompt, photo_b64, GEMINI_FAST_MODEL, 1200)
 
         header = "📊 *Chart Analysis*\n" + "─" * 28 + "\n\n"
         full   = header + result
@@ -2644,7 +2679,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await q.answer()
 
     if q.data == "choose_pair":
-        await safe_edit(q, "🔀 *Select pair*\n\n🔒 BTC & ETH — Pro only",
+        await safe_edit(q, "🔀 *Select pair*\n\n🔒 Crypto pairs — Pro or Diamond only",
                         markup=kb_pairs(u.selected_pair, plan))
         return
 
@@ -2655,7 +2690,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await safe_edit(q, "❌ Unknown pair.", markup=kb_main(plan, u.selected_pair))
             return
         if plan not in cfg["plans"]:
-            await safe_edit(q, f"🔒 *{cfg['name']} — Pro only*", markup=kb_sub())
+            await safe_edit(q, f"🔒 *{cfg['name']} — Pro or Diamond only*", markup=kb_sub())
             return
         u.selected_pair = new_pair
         price = get_price(new_pair)
@@ -2699,10 +2734,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "buy_basic_3": ("basic", 3, PRICE_BASIC_3, "Basic — 3 months"),
         "buy_pro_1":   ("pro",   1, PRICE_PRO,     "Pro — 1 month"),
         "buy_pro_3":   ("pro",   3, PRICE_PRO_3,   "Pro — 3 months"),
+        "buy_diamond_1": ("diamond", 1, PRICE_DIAMOND,   "Diamond — 1 month"),
+        "buy_diamond_3": ("diamond", 3, PRICE_DIAMOND_3, "Diamond — 3 months"),
     }
     if q.data in buy_map:
         pk, months, stars, title = buy_map[q.data]
-        desc = "XAU/USD analysis" if pk == "basic" else "XAU+BTC+ETH + auto-signals"
+        desc = {
+            "basic": "XAU/XAG analysis",
+            "pro": "All pairs + auto-signals",
+            "diamond": "All pairs + priority analysis + auto-signals",
+        }[pk]
         await context.bot.send_invoice(
             chat_id=cid, title=f"Trading Bot — {title}", description=desc,
             payload=f"{pk}_{months}", provider_token="",
@@ -2966,7 +3007,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                         f"🎯 *Level reached! {cfg['emoji']} {cfg['name']}*\n"
                         f"Entry: *{fmt_price(ps.entry_price, pair)}*")
 
-                if (plan in ("pro", "admin")
+                if (plan in AUTO_SIGNAL_PLANS
                         and not ps.has_trade and not ps.is_waiting
                         and time.time() - ps.last_signal_time > AUTO_COOLDOWN):
                     prev = _prev_prices.get(pair)
@@ -3306,11 +3347,11 @@ async def _tv_webhook_handler(request) -> "web.Response":
         source=source, message_id=getattr(msg, "message_id", 0),
     )
 
-    # Notify Pro users
+    # Notify auto-signal subscribers
     notified = 0
     for cid, u in list(USERS.items()):
         acc = db_access(cid)
-        if acc["plan"] in ("pro", "admin"):
+        if acc["plan"] in AUTO_SIGNAL_PLANS:
             try:
                 await safe_send(
                     app_ref.bot, cid,

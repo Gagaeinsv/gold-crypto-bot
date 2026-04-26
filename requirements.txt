@@ -6,5 +6,4 @@ pandas
 python-dotenv
 matplotlib
 numpy
-anthropic
 aiohttp
