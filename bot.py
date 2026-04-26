@@ -2666,10 +2666,6 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         photo_file = await context.bot.get_file(photo.file_id)
         photo_bytes = await photo_file.download_as_bytearray()
 
-        # Get current price for context
-        price = get_price("XAUUSD")
-        price_ctx = f"Current XAU/USD price: {fmt_price(price, 'XAUUSD')}" if price else ""
-
         # User caption as additional context
         user_note = ""
         if update.message.caption and update.message.caption.strip():
@@ -2678,33 +2674,38 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 user_note = f"\nUser note: {note}"
 
         prompt = (
-            f"You are a professional XAU/USD chart analyst.\n"
-            f"{price_ctx}{user_note}\n\n"
-            "Analyse this trading chart screenshot and provide:\n\n"
-            "1. **CHART OVERVIEW**\n"
-            "   - What asset and timeframe do you see?\n"
-            "   - What indicators are visible?\n\n"
-            "2. **TREND ANALYSIS**\n"
-            "   - Current trend direction (up/down/sideways)\n"
-            "   - Trend strength and momentum\n"
-            "   - Key pattern if visible (breakout, reversal, consolidation)\n\n"
-            "3. **KEY LEVELS** (give specific prices if visible on chart)\n"
-            "   - Major resistance levels\n"
-            "   - Major support levels\n"
-            "   - Most important level right now\n\n"
-            "4. **TRADE SETUP**\n"
+            "You are a professional trading chart analyst.\n"
+            "Analyse the chart screenshot provided by the user.\n"
+            "First identify the asset and timeframe from the chart itself — do NOT assume XAU/USD.\n"
+            f"{user_note}\n\n"
+            "Provide analysis in this exact structure:\n\n"
+            "**ASSET & TIMEFRAME**\n"
+            "   - Asset identified from chart (pair name)\n"
+            "   - Timeframe visible\n"
+            "   - Indicators visible\n\n"
+            "**TREND ANALYSIS**\n"
+            "   - Direction: UP / DOWN / SIDEWAYS\n"
+            "   - Strength and momentum\n"
+            "   - Key pattern (breakout / reversal / consolidation)\n\n"
+            "**KEY LEVELS** (use exact prices from the chart)\n"
+            "   - Resistance 1: [price] — reason\n"
+            "   - Resistance 2: [price] — reason\n"
+            "   - Support 1: [price] — reason\n"
+            "   - Support 2: [price] — reason\n"
+            "   - Most critical level right now: [price]\n\n"
+            "**TRADE SETUP**\n"
             "   - Direction: BUY or SELL\n"
-            "   - Entry zone\n"
-            "   - Stop Loss placement and reasoning\n"
-            "   - Take Profit 1 (conservative)\n"
-            "   - Take Profit 2 (extended)\n"
-            "   - Risk/Reward ratio\n\n"
-            "5. **RECOMMENDATION**\n"
-            "   - Overall verdict: ENTER / WAIT / AVOID\n"
-            "   - Confidence: X/100\n"
+            "   - Entry zone: [exact price or range]\n"
+            "   - Stop Loss: [exact price] — reason\n"
+            "   - Take Profit 1: [exact price]\n"
+            "   - Take Profit 2: [exact price]\n"
+            "   - R:R ratio: [X:1]\n"
+            "   - Trigger: [what must happen to enter]\n\n"
+            "**VERDICT**\n"
+            "   - Action: ENTER / WAIT / AVOID\n"
+            "   - Confidence: [X]/100\n"
             "   - Key thing to watch\n\n"
-            "Be specific with price levels where visible. "
-            "If the chart quality is poor or unclear, say so."
+            "Use only the prices visible on the chart. Be direct and specific."
         )
 
         import google.genai as genai
