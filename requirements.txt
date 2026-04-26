@@ -1,0 +1,10 @@
+python-telegram-bot[job-queue]
+requests
+groq
+yfinance
+pandas
+python-dotenv
+matplotlib
+numpy
+anthropic
+aiohttp
