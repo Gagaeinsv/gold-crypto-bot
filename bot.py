@@ -1853,7 +1853,7 @@ def plan_label(p: str) -> str:
             "admin": "Admin", "expired": "Expired"}.get(p, p)
 
 
-def kb_main(plan: str = "trial", pair: str = DEFAULT_PAIR) -> InlineKeyboardMarkup:
+def kb_main(plan: str = "trial", pair: str = DEFAULT_PAIR, deep_left: int | None = None) -> InlineKeyboardMarkup:
     cfg = PAIRS[pair]
     rows = [
         [InlineKeyboardButton(f"🔀 Pair: {cfg['emoji']} {cfg['name']}", callback_data="choose_pair")],
@@ -1865,6 +1865,16 @@ def kb_main(plan: str = "trial", pair: str = DEFAULT_PAIR) -> InlineKeyboardMark
             InlineKeyboardButton("🔄 Reset", callback_data="reset"),
         ])
         rows.append([InlineKeyboardButton("📊 Trade Status", callback_data="status")])
+    if plan in ("diamond", "admin"):
+        if plan == "admin":
+            deep_label = "🧠 Deep Analysis"
+        else:
+            left = deep_left if deep_left is not None else DEEP_ANALYSIS_DAILY_LIMIT
+            deep_label = f"🧠 Deep Analysis ({left}/{DEEP_ANALYSIS_DAILY_LIMIT})"
+        rows.append([
+            InlineKeyboardButton(deep_label, callback_data="deepanalysis_menu"),
+            InlineKeyboardButton("📸 Chart AI", callback_data="chart_ai"),
+        ])
     rows.append([
         InlineKeyboardButton("💳 Subscription", callback_data="sub_menu"),
         InlineKeyboardButton("🤝 Refer & Earn",  callback_data="refer"),
@@ -1872,7 +1882,14 @@ def kb_main(plan: str = "trial", pair: str = DEFAULT_PAIR) -> InlineKeyboardMark
     return InlineKeyboardMarkup(rows)
 
 
-def kb_pairs(current_pair: str, plan: str) -> InlineKeyboardMarkup:
+def kb_main_for(cid: int, plan: str, pair: str = DEFAULT_PAIR) -> InlineKeyboardMarkup:
+    """Build kb_main with correct deep_left counter for the given user."""
+    if plan == "diamond":
+        used = db_deepanalysis_count_today(cid)
+        deep_left = max(0, DEEP_ANALYSIS_DAILY_LIMIT - used)
+    else:
+        deep_left = None
+    return kb_main(plan, pair, deep_left=deep_left)
     rows = []
     for pid, cfg in PAIRS.items():
         accessible = plan in cfg["plans"]
@@ -2048,7 +2065,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         welcome,
-        reply_markup=kb_main(plan, DEFAULT_PAIR),
+        reply_markup=kb_main_for(cid, plan, DEFAULT_PAIR),
         parse_mode="Markdown",
     )
 
@@ -2802,12 +2819,47 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await q.message.delete()
         return
 
+    if q.data == "chart_ai":
+        if acc["plan"] not in ("diamond", "admin") and cid != ADMIN_ID:
+            await q.answer("💠 Diamond plan only", show_alert=True)
+            return
+        await safe_edit(q,
+            "📸 *Chart AI Analysis*\n\n"
+            "Send me a screenshot of your chart and I'll analyse it.\n\n"
+            "1. Take a screenshot of your TradingView/broker chart\n"
+            "2. Send the photo to this chat\n"
+            "   _(caption is optional)_",
+            markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="back_main")]]),
+        )
+        return
+        if acc["plan"] not in ("diamond", "admin") and cid != ADMIN_ID:
+            await q.answer("💠 Diamond plan only", show_alert=True)
+            return
+        if cid != ADMIN_ID:
+            used = db_deepanalysis_count_today(cid)
+            if used >= DEEP_ANALYSIS_DAILY_LIMIT:
+                await q.answer(f"⏳ Daily limit reached ({DEEP_ANALYSIS_DAILY_LIMIT}/day). Resets at midnight UTC.", show_alert=True)
+                return
+            remaining = f"  ({DEEP_ANALYSIS_DAILY_LIMIT - used} left today)"
+        else:
+            remaining = ""
+        rows = []
+        for pid, cfg in PAIRS.items():
+            if plan in cfg["plans"] or cid == ADMIN_ID:
+                rows.append([InlineKeyboardButton(
+                    f"{cfg['emoji']} {cfg['name']}",
+                    callback_data=f"deepanalysis_{pid}",
+                )])
+        rows.append([InlineKeyboardButton("❌ Cancel", callback_data="deepanalysis_cancel")])
+        await safe_edit(q, f"🧠 *Deep Analysis{remaining}*\n\nChoose a pair to analyse:", markup=InlineKeyboardMarkup(rows))
+        return
+
     if q.data.startswith("deepanalysis_"):
-        pair = q.data[len("deepanalysis_"):]
-        if pair not in PAIRS:
+        pair_key = q.data[len("deepanalysis_"):]
+        if pair_key not in PAIRS:
             return
         await q.message.delete()
-        await _run_deepanalysis(update, context, cid, acc, pair)
+        await _run_deepanalysis(update, context, cid, acc, pair_key)
         return
 
     if q.data == "choose_pair":
@@ -2819,7 +2871,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         new_pair = q.data[5:]
         cfg = PAIRS.get(new_pair)
         if not cfg:
-            await safe_edit(q, "❌ Unknown pair.", markup=kb_main(plan, u.selected_pair))
+            await safe_edit(q, "❌ Unknown pair.", markup=kb_main_for(cid, plan, u.selected_pair))
             return
         if plan not in cfg["plans"]:
             await safe_edit(q, f"🔒 *{cfg['name']} — Pro only*", markup=kb_sub())
@@ -2830,12 +2882,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             q,
             f"✅ *{cfg['emoji']} {cfg['name']}*\n\n"
             f"Price: *{fmt_price(price, new_pair) if price else 'N/A'}*",
-            markup=kb_main(plan, new_pair),
+            markup=kb_main_for(cid, plan, new_pair),
         )
         return
 
     if q.data == "back_main":
-        await safe_edit(q, "🤖 *AI Trading Bot*", markup=kb_main(plan, u.selected_pair))
+        await safe_edit(q, "🤖 *AI Trading Bot*", markup=kb_main_for(cid, plan, u.selected_pair))
         return
 
     if q.data == "refer":
@@ -2912,7 +2964,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await safe_edit(q,
                 "⏱ *Analysis timed out.*\n\n"
                 "_The server took too long. This usually happens once — please try again._",
-                markup=kb_main(plan, pair),
+                markup=kb_main_for(cid, plan, pair),
             )
             return
         u.pending_analysis = a
@@ -2927,7 +2979,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if q.data == "confirm_now":
         price_val = get_price(pair)
         if not price_val:
-            await safe_edit(q, "❌ Price error.", markup=kb_main(plan, pair))
+            await safe_edit(q, "❌ Price error.", markup=kb_main_for(cid, plan, pair))
             return
         a  = u.pending_analysis or {}
         ai = a.get("ai", {})
@@ -2956,29 +3008,29 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             opt = float(q.data[5:])
         except ValueError:
-            await safe_edit(q, "❌ Error.", markup=kb_main(plan, pair))
+            await safe_edit(q, "❌ Error.", markup=kb_main_for(cid, plan, pair))
             return
         ps.waiting_entry_price = opt
         ps.persist(cid, pair)
         await safe_edit(q, f"⏳ Waiting for *{fmt_price(opt, pair)}*",
-                        markup=kb_main(plan, pair))
+                        markup=kb_main_for(cid, plan, pair))
         return
 
     if q.data == "cancel":
         u.pending_analysis = None
-        await safe_edit(q, "↩️ Cancelled", markup=kb_main(plan, pair))
+        await safe_edit(q, "↩️ Cancelled", markup=kb_main_for(cid, plan, pair))
         return
 
     if q.data == "stop":
         ps.running = False
         ps.persist(cid, pair)
-        await safe_edit(q, "⏹ Stopped", markup=kb_main(plan, pair))
+        await safe_edit(q, "⏹ Stopped", markup=kb_main_for(cid, plan, pair))
         return
 
     if q.data == "reset":
         ps.reset(cid, pair)
         u.pending_analysis = None
-        await safe_edit(q, "🔄 *Reset*", markup=kb_main(plan, pair))
+        await safe_edit(q, "🔄 *Reset*", markup=kb_main_for(cid, plan, pair))
         return
 
     if q.data == "status":
@@ -2992,7 +3044,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     f"{'🟢' if ch >= 0 else '🔴'} *{ch:+.2f}%*"
                 )
         msg = "\n\n".join(lines) if lines else "ℹ️ No active trades"
-        await safe_edit(q, f"📊 *Status*\n\n{msg}", markup=kb_main(plan, u.selected_pair))
+        await safe_edit(q, f"📊 *Status*\n\n{msg}", markup=kb_main_for(cid, plan, u.selected_pair))
         return
 
     # ── Signal accuracy stats ────────────────────────────────────
@@ -3152,7 +3204,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 text = (build_analysis_text(a)
                                         + f"\n\n📡 *Auto-signal!*{priority_tag} Score: *{a['score']}/100*")
                                 await safe_send(context.bot, cid, text,
-                                                reply_markup=kb_main(plan, pair))
+                                                reply_markup=kb_main_for(cid, plan, pair))
                                 ps.last_signal_time  = time.time()
                                 ps.last_signal_score = a["score"]
                                 ps.persist(cid, pair)
@@ -3491,7 +3543,7 @@ async def _tv_webhook_handler(request) -> "web.Response":
                 await safe_send(
                     app_ref.bot, cid,
                     f"⚡ *New TradingView Signal!*\n\n{text}",
-                    reply_markup=kb_main(acc["plan"], pair),
+                    reply_markup=kb_main_for(cid, acc["plan"], pair),
                 )
                 notified += 1
             except Exception:
