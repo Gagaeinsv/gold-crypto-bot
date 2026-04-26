@@ -2392,9 +2392,15 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     cid = update.effective_chat.id
     acc = db_access(cid)
 
-    if not acc["allowed"] and cid != ADMIN_ID:
+    if acc["plan"] not in ("diamond", "admin") and cid != ADMIN_ID:
         await update.message.reply_text(
-            "⛔ Subscribe to use Deep Analysis.\n\nTap /start → 💳 Subscription",
+            "💠 *Deep Analysis* is a Diamond-exclusive feature.\n\n"
+            "Upgrade to Diamond to unlock:\n"
+            "• 🧠 AI deep analysis on any pair\n"
+            "• 📸 Chart screenshot analysis\n"
+            "• Priority auto-signals\n\n"
+            "Tap /start → 💳 Subscription",
+            parse_mode="Markdown",
         )
         return
 
