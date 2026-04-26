@@ -88,14 +88,14 @@ PAIRS: dict = {
         "name": "XAU/USD", "emoji": "🥇", "yahoo": "GC=F", "stooq": "xauusd",
         "news_q": "gold USD Fed XAU inflation",
         "sl_pct": 2.0, "tp_pct": 3.0,
-        "plans": ["trial", "basic", "pro", "admin"],
+        "plans": ["trial", "basic", "pro", "diamond", "admin"],
         "image": "https://images.unsplash.com/photo-1610375461246-83df859d849d?w=800&q=80",
     },
     "XAGUSD": {
         "name": "XAG/USD", "emoji": "🥈", "yahoo": "SI=F", "stooq": "xagusd",
         "news_q": "silver XAG price industrial demand",
         "sl_pct": 2.5, "tp_pct": 4.0,
-        "plans": ["basic", "pro", "admin"],
+        "plans": ["basic", "pro", "diamond", "admin"],
         "image": "https://images.unsplash.com/photo-1569025743873-ea3a9ade89f9?w=800&q=80",
     },
     # ── Top Crypto ───────────────────────────────────────────────
@@ -103,42 +103,42 @@ PAIRS: dict = {
         "name": "BTC/USD", "emoji": "₿", "yahoo": "BTC-USD", "stooq": "btcusd",
         "news_q": "bitcoin BTC crypto halving ETF",
         "sl_pct": 3.0, "tp_pct": 5.0,
-        "plans": ["pro", "admin"],
+        "plans": ["pro", "diamond", "admin"],
         "image": "https://images.unsplash.com/photo-1518546305927-5a555bb7020d?w=800&q=80",
     },
     "ETHUSD": {
         "name": "ETH/USD", "emoji": "Ξ", "yahoo": "ETH-USD", "stooq": "ethusd",
         "news_q": "ethereum ETH crypto DeFi upgrade",
         "sl_pct": 3.5, "tp_pct": 6.0,
-        "plans": ["pro", "admin"],
+        "plans": ["pro", "diamond", "admin"],
         "image": "https://images.unsplash.com/photo-1622630998477-20aa696ecb05?w=800&q=80",
     },
     "SOLUSD": {
         "name": "SOL/USD", "emoji": "◎", "yahoo": "SOL-USD", "stooq": "solusd",
         "news_q": "Solana SOL crypto network ecosystem",
         "sl_pct": 4.0, "tp_pct": 7.0,
-        "plans": ["pro", "admin"],
+        "plans": ["pro", "diamond", "admin"],
         "image": "https://images.unsplash.com/photo-1639762681485-074b7f938ba0?w=800&q=80",
     },
     "XRPUSD": {
         "name": "XRP/USD", "emoji": "✕", "yahoo": "XRP-USD", "stooq": "xrpusd",
         "news_q": "XRP Ripple SEC crypto payment",
         "sl_pct": 4.0, "tp_pct": 7.0,
-        "plans": ["pro", "admin"],
+        "plans": ["pro", "diamond", "admin"],
         "image": "https://images.unsplash.com/photo-1639762681485-074b7f938ba0?w=800&q=80",
     },
     "BNBUSD": {
         "name": "BNB/USD", "emoji": "🔶", "yahoo": "BNB-USD", "stooq": "bnbusd",
         "news_q": "BNB Binance crypto exchange",
         "sl_pct": 3.5, "tp_pct": 6.0,
-        "plans": ["pro", "admin"],
+        "plans": ["pro", "diamond", "admin"],
         "image": "https://images.unsplash.com/photo-1639762681485-074b7f938ba0?w=800&q=80",
     },
     "ADAUSD": {
         "name": "ADA/USD", "emoji": "🔵", "yahoo": "ADA-USD", "stooq": "adausd",
         "news_q": "Cardano ADA crypto blockchain",
         "sl_pct": 4.5, "tp_pct": 8.0,
-        "plans": ["pro", "admin"],
+        "plans": ["pro", "diamond", "admin"],
         "image": "https://images.unsplash.com/photo-1639762681485-074b7f938ba0?w=800&q=80",
     },
 }
@@ -291,7 +291,7 @@ def db_access(cid: int) -> dict:
     if cid == ADMIN_ID:
         return {"allowed": True, "plan": "admin", "days_left": 9999, "reason": ""}
 
-    if plan in ("basic", "pro") and row["sub_expires"]:
+    if plan in ("basic", "pro", "diamond") and row["sub_expires"]:
         exp = datetime.strptime(row["sub_expires"], "%Y-%m-%d").date()
         if exp >= today:
             return {"allowed": True, "plan": plan, "days_left": (exp - today).days, "reason": ""}
@@ -334,14 +334,15 @@ def db_apply_payment(cid: int, stars: int, plan_key: str, months: int, charge_id
 def db_stats() -> dict:
     with db_connect() as c:
         total = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        trial = c.execute("SELECT COUNT(*) FROM users WHERE plan='trial'").fetchone()[0]
-        basic = c.execute("SELECT COUNT(*) FROM users WHERE plan='basic'").fetchone()[0]
-        pro   = c.execute("SELECT COUNT(*) FROM users WHERE plan='pro'").fetchone()[0]
-        exp   = c.execute("SELECT COUNT(*) FROM users WHERE plan='expired'").fetchone()[0]
-        stars = c.execute("SELECT SUM(stars) FROM payments").fetchone()[0] or 0
+        trial   = c.execute("SELECT COUNT(*) FROM users WHERE plan='trial'").fetchone()[0]
+        basic   = c.execute("SELECT COUNT(*) FROM users WHERE plan='basic'").fetchone()[0]
+        pro     = c.execute("SELECT COUNT(*) FROM users WHERE plan='pro'").fetchone()[0]
+        diamond = c.execute("SELECT COUNT(*) FROM users WHERE plan='diamond'").fetchone()[0]
+        exp     = c.execute("SELECT COUNT(*) FROM users WHERE plan='expired'").fetchone()[0]
+        stars   = c.execute("SELECT SUM(stars) FROM payments").fetchone()[0] or 0
         posts = c.execute("SELECT COUNT(*) FROM channel_posts").fetchone()[0]
-    return dict(total=total, trial=trial, basic=basic, pro=pro, expired=exp,
-                total_stars=stars, posts=posts)
+    return dict(total=total, trial=trial, basic=basic, pro=pro, diamond=diamond,
+                expired=exp, total_stars=stars, posts=posts)
 
 
 def db_save_post(pair: str, post_type: str, score: int,
@@ -434,7 +435,7 @@ def db_give_referral_bonus(referrer_id: int, referred_id: int) -> int:
             return 0
 
         today = datetime.utcnow().date()
-        if u["plan"] in ("basic", "pro") and u["sub_expires"]:
+        if u["plan"] in ("basic", "pro", "diamond") and u["sub_expires"]:
             base = max(datetime.strptime(u["sub_expires"], "%Y-%m-%d").date(), today)
             new_date = base + timedelta(days=REFERRAL_BONUS_DAYS)
             c.execute("UPDATE users SET sub_expires=? WHERE chat_id=?",
@@ -1771,11 +1772,11 @@ async def safe_edit(q, text: str, markup=None, **kwargs):
 #  Keyboards
 # ═══════════════════════════════════════════════════════════════════
 
-PLAN_EMOJI = {"trial": "🔬", "basic": "⭐", "pro": "💎", "admin": "👑", "expired": "❌"}
+PLAN_EMOJI = {"trial": "🔬", "basic": "⭐", "pro": "💎", "diamond": "💠", "admin": "👑", "expired": "❌"}
 
 
 def plan_label(p: str) -> str:
-    return {"trial": "Trial", "basic": "Basic", "pro": "Pro",
+    return {"trial": "Trial", "basic": "Basic", "pro": "Pro", "diamond": "Diamond",
             "admin": "Admin", "expired": "Expired"}.get(p, p)
 
 
@@ -1785,7 +1786,7 @@ def kb_main(plan: str = "trial", pair: str = DEFAULT_PAIR) -> InlineKeyboardMark
         [InlineKeyboardButton(f"🔀 Pair: {cfg['emoji']} {cfg['name']}", callback_data="choose_pair")],
         [InlineKeyboardButton("▶️ Analyse & Enter", callback_data="start")],
     ]
-    if plan in ("basic", "pro", "admin"):
+    if plan in ("basic", "pro", "diamond", "admin"):
         rows.append([
             InlineKeyboardButton("⏹ Stop",  callback_data="stop"),
             InlineKeyboardButton("🔄 Reset", callback_data="reset"),
@@ -1815,6 +1816,8 @@ def kb_sub() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"⭐ Basic — {PRICE_BASIC_3}⭐/3mo (~$12.5) 🔥", callback_data="buy_basic_3")],
         [InlineKeyboardButton(f"💎 Pro   — {PRICE_PRO}⭐/mo (~$9.99)",          callback_data="buy_pro_1")],
         [InlineKeyboardButton(f"💎 Pro   — {PRICE_PRO_3}⭐/3mo (~$25) 🔥",     callback_data="buy_pro_3")],
+        [InlineKeyboardButton(f"💠 Diamond — {PRICE_DIAMOND}⭐/mo (~$19.99)",        callback_data="buy_diamond_1")],
+        [InlineKeyboardButton(f"💠 Diamond — {PRICE_DIAMOND_3}⭐/3mo (~$49.99) 🔥", callback_data="buy_diamond_3")],
         [InlineKeyboardButton("↩️ Back", callback_data="back_main")],
     ])
 
@@ -1845,6 +1848,13 @@ def sub_info_text(acc: dict) -> str:
                   "₿ BTC — ✅", "Ξ ETH — ✅", "◎ SOL — ✅",
                   "✕ XRP — ✅", "🔶 BNB — ✅", "🔵 ADA — ✅",
                   "✅ Auto-signals", ""]
+    elif plan == "diamond":
+        lines += [f"💠 Diamond: *{dl} days* left", "",
+                  "🥇 XAU — ✅", "🥈 XAG — ✅",
+                  "₿ BTC — ✅", "Ξ ETH — ✅", "◎ SOL — ✅",
+                  "✕ XRP — ✅", "🔶 BNB — ✅", "🔵 ADA — ✅",
+                  "✅ Auto-signals (priority)", "✅ Chart AI screenshot analysis",
+                  "✅ Priority alerts (lower threshold)", ""]
     elif plan in ("expired", "none"):
         lines += ["❌ *Subscription expired*", ""]
     lines += [
@@ -1863,6 +1873,14 @@ def sub_info_text(acc: dict) -> str:
         "  • Priority alerts",
         f"  1 mo — *{PRICE_PRO}⭐* (~$9.99)",
         f"  3 mo — *{PRICE_PRO_3}⭐* (~$25) 🔥 _save ~17%_",
+        "",
+        "*💠 Diamond — $19.99/mo*",
+        "  • Everything in Pro +",
+        "  • 📸 Chart AI screenshot analysis",
+        "  • Priority signals (lower threshold)",
+        "  • Faster auto-signal cooldown",
+        f"  1 mo — *{PRICE_DIAMOND}⭐* (~$19.99)",
+        f"  3 mo — *{PRICE_DIAMOND_3}⭐* (~$49.99) 🔥 _save ~17%_",
         "",
         "💡 _First week free for new users_",
     ]
@@ -2001,7 +2019,7 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"👑 *Admin Panel*\n\n"
         f"👥 Users: {s['total']}\n🔬 Trial: {s['trial']}\n"
-        f"⭐ Basic: {s['basic']}\n💎 Pro: {s['pro']}\n❌ Expired: {s['expired']}\n\n"
+        f"⭐ Basic: {s['basic']}\n💎 Pro: {s['pro']}\n💠 Diamond: {s['diamond']}\n❌ Expired: {s['expired']}\n\n"
         f"📨 Posts: {s['posts']}\n⭐ Stars: {s['total_stars']}\n\n"
         f"📡 *Traffic sources:*\n{utm_lines}",
         parse_mode="Markdown",
@@ -2020,7 +2038,7 @@ async def cmd_give(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         cid    = int(args[0])
         pk     = args[1].lower()
         months = int(args[2])
-        assert pk in ("basic", "pro", "trial"), f"Unknown plan: {pk}"
+        assert pk in ("basic", "pro", "diamond", "trial"), f"Unknown plan: {pk}"
         new_exp = db_apply_payment(cid, 0, pk, months, "manual")
         await update.message.reply_text(
             f"✅ *{pk}* until {new_exp.strftime('%d.%m.%Y')} for {cid}",
@@ -2420,14 +2438,19 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """
     User sends a chart screenshot → Gemini Flash analyses it visually.
     Usage: send photo with caption /chart or just /chart then send photo
-    Available to all subscribed users.
+    Available to Diamond plan users only.
     """
     cid = update.effective_chat.id
     acc = db_access(cid)
-    if not acc["allowed"] and cid != ADMIN_ID:
+    if acc["plan"] not in ("diamond", "admin") and cid != ADMIN_ID:
         await update.message.reply_text(
-            "⛔ Subscribe to use Chart Analysis.\n\n"
+            "💠 *Chart AI Analysis* is a Diamond-exclusive feature.\n\n"
+            "Upgrade to Diamond to unlock:\n"
+            "• 📸 Screenshot chart analysis\n"
+            "• Priority auto-signals\n"
+            "• Lower alert threshold\n\n"
             "Tap /start → 💳 Subscription",
+            parse_mode="Markdown",
         )
         return
 
@@ -2557,7 +2580,7 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def handle_photo(update, context):
     cid = update.effective_chat.id
     acc = db_access(cid)
-    if not acc["allowed"] and cid != ADMIN_ID:
+    if acc["plan"] not in ("diamond", "admin") and cid != ADMIN_ID:
         return
     await cmd_chartanalysis(update, context)
 
@@ -2677,14 +2700,20 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     buy_map = {
-        "buy_basic_1": ("basic", 1, PRICE_BASIC,   "Basic — 1 month"),
-        "buy_basic_3": ("basic", 3, PRICE_BASIC_3, "Basic — 3 months"),
-        "buy_pro_1":   ("pro",   1, PRICE_PRO,     "Pro — 1 month"),
-        "buy_pro_3":   ("pro",   3, PRICE_PRO_3,   "Pro — 3 months"),
+        "buy_basic_1":   ("basic",   1, PRICE_BASIC,     "Basic — 1 month"),
+        "buy_basic_3":   ("basic",   3, PRICE_BASIC_3,   "Basic — 3 months"),
+        "buy_pro_1":     ("pro",     1, PRICE_PRO,       "Pro — 1 month"),
+        "buy_pro_3":     ("pro",     3, PRICE_PRO_3,     "Pro — 3 months"),
+        "buy_diamond_1": ("diamond", 1, PRICE_DIAMOND,   "Diamond — 1 month"),
+        "buy_diamond_3": ("diamond", 3, PRICE_DIAMOND_3, "Diamond — 3 months"),
     }
     if q.data in buy_map:
         pk, months, stars, title = buy_map[q.data]
-        desc = "XAU/USD analysis" if pk == "basic" else "XAU+BTC+ETH + auto-signals"
+        desc = (
+            "XAU/USD analysis" if pk == "basic"
+            else "XAU+BTC+ETH + auto-signals + chart AI" if pk == "diamond"
+            else "XAU+BTC+ETH + auto-signals"
+        )
         await context.bot.send_invoice(
             chat_id=cid, title=f"Trading Bot — {title}", description=desc,
             payload=f"{pk}_{months}", provider_token="",
@@ -2948,20 +2977,23 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                         f"🎯 *Level reached! {cfg['emoji']} {cfg['name']}*\n"
                         f"Entry: *{fmt_price(ps.entry_price, pair)}*")
 
-                if (plan in ("pro", "admin")
-                        and not ps.has_trade and not ps.is_waiting
-                        and time.time() - ps.last_signal_time > AUTO_COOLDOWN):
-                    prev = _prev_prices.get(pair)
-                    if prev:
-                        a = full_analysis(price, prev, pair)
-                        if a["score"] >= 75 and a["score"] > ps.last_signal_score:
-                            text = (build_analysis_text(a)
-                                    + f"\n\n📡 *Auto-signal!* Score: *{a['score']}/100*")
-                            await safe_send(context.bot, cid, text,
-                                            reply_markup=kb_main(plan, pair))
-                            ps.last_signal_time  = time.time()
-                            ps.last_signal_score = a["score"]
-                            ps.persist(cid, pair)
+                if (plan in ("pro", "diamond", "admin")
+                        and not ps.has_trade and not ps.is_waiting):
+                    cooldown   = AUTO_COOLDOWN // 2 if plan in ("diamond", "admin") else AUTO_COOLDOWN
+                    score_min  = 65 if plan in ("diamond", "admin") else 75
+                    if time.time() - ps.last_signal_time > cooldown:
+                        prev = _prev_prices.get(pair)
+                        if prev:
+                            a = full_analysis(price, prev, pair)
+                            if a["score"] >= score_min and a["score"] > ps.last_signal_score:
+                                priority_tag = " 💠 *Priority*" if plan == "diamond" else ""
+                                text = (build_analysis_text(a)
+                                        + f"\n\n📡 *Auto-signal!*{priority_tag} Score: *{a['score']}/100*")
+                                await safe_send(context.bot, cid, text,
+                                                reply_markup=kb_main(plan, pair))
+                                ps.last_signal_time  = time.time()
+                                ps.last_signal_score = a["score"]
+                                ps.persist(cid, pair)
 
 
 # ═══════════════════════════════════════════════════════════════════
