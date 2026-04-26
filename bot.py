@@ -2731,15 +2731,16 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             model=GEMINI_FLASH,
             contents=[prompt, image],
             config=gtypes.GenerateContentConfig(
-                max_output_tokens=2500,
+                max_output_tokens=8192,
             ),
         )
         result = response.text
 
-        # Convert Gemini markdown (**bold**) to plain text — Telegram only supports *bold*
-        result = re.sub(r"\*\*(.+?)\*\*", r"\1", result)
-        result = re.sub(r"__(.+?)__",     r"\1", result)
-        result = re.sub(r"#+\s*",         "",    result)
+        # Strip ALL markdown characters from Gemini output
+        result = re.sub(r"\*+", "", result)
+        result = re.sub(r"_+",  "", result)
+        result = re.sub(r"`+",  "", result)
+        result = re.sub(r"#+\s*", "", result)
 
         header = "📊 Chart Analysis\n" + "─" * 28 + "\n\n"
         full   = header + result
