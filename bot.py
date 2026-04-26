@@ -2371,9 +2371,10 @@ Respond ONLY in this exact structure. Use the actual numbers from the data above
    Direction : BUY / SELL
    Entry zone: [exact price or range, e.g. 3285–3290]
    Stop Loss : [exact price] (reason: [why this level])
-   TP1       : [exact price] (+[R] R)
-   TP2       : [exact price] (+[R] R)
-   R:R ratio : [X:1]
+   TP1       : [exact price] (+[R] R) — conservative
+   TP2       : [exact price] (+[R] R) — main target
+   TP3       : [exact price] (+[R] R) — extended
+   R:R ratio : [X:1] (to TP2)
    Trigger   : [what must happen to enter — e.g. "break and close above 3295 on 15m"]
    Timeframe : [expected duration]
 
@@ -2383,6 +2384,7 @@ Respond ONLY in this exact structure. Use the actual numbers from the data above
    Stop Loss : [exact price]
    TP1       : [exact price]
    TP2       : [exact price]
+   TP3       : [exact price]
    R:R ratio : [X:1]
    Trigger   : [entry condition]
    Timeframe : [expected duration]
@@ -2674,38 +2676,48 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 user_note = f"\nUser note: {note}"
 
         prompt = (
-            "You are a professional trading chart analyst.\n"
-            "Analyse the chart screenshot provided by the user.\n"
-            "First identify the asset and timeframe from the chart itself — do NOT assume XAU/USD.\n"
+            "You are a senior proprietary trader specialising in technical and fundamental analysis.\n"
+            "The user has sent you a chart screenshot. Your job is TWO things:\n"
+            "1. Analyse what you see on the chart (visual technical analysis)\n"
+            "2. Combine it with your knowledge of the current market context for that asset\n"
+            "Identify the asset and timeframe FROM THE CHART ITSELF.\n"
             f"{user_note}\n\n"
-            "Provide analysis in this exact structure:\n\n"
-            "**ASSET & TIMEFRAME**\n"
-            "   - Asset identified from chart (pair name)\n"
-            "   - Timeframe visible\n"
-            "   - Indicators visible\n\n"
-            "**TREND ANALYSIS**\n"
-            "   - Direction: UP / DOWN / SIDEWAYS\n"
-            "   - Strength and momentum\n"
-            "   - Key pattern (breakout / reversal / consolidation)\n\n"
-            "**KEY LEVELS** (use exact prices from the chart)\n"
-            "   - Resistance 1: [price] — reason\n"
-            "   - Resistance 2: [price] — reason\n"
-            "   - Support 1: [price] — reason\n"
-            "   - Support 2: [price] — reason\n"
-            "   - Most critical level right now: [price]\n\n"
-            "**TRADE SETUP**\n"
-            "   - Direction: BUY or SELL\n"
-            "   - Entry zone: [exact price or range]\n"
-            "   - Stop Loss: [exact price] — reason\n"
-            "   - Take Profit 1: [exact price]\n"
-            "   - Take Profit 2: [exact price]\n"
-            "   - R:R ratio: [X:1]\n"
-            "   - Trigger: [what must happen to enter]\n\n"
-            "**VERDICT**\n"
-            "   - Action: ENTER / WAIT / AVOID\n"
-            "   - Confidence: [X]/100\n"
-            "   - Key thing to watch\n\n"
-            "Use only the prices visible on the chart. Be direct and specific."
+            "Respond in this exact structure with specific prices throughout:\n\n"
+            "📊 *ASSET & TIMEFRAME*\n"
+            "   Asset: [pair from chart]\n"
+            "   Timeframe: [from chart]\n"
+            "   Indicators visible: [list]\n\n"
+            "📈 *TREND ANALYSIS*\n"
+            "   Direction: UP / DOWN / SIDEWAYS\n"
+            "   Momentum: strong / moderate / weak\n"
+            "   Pattern: [e.g. descending channel, double top, flag...]\n"
+            "   Candle context: [last few candles — what they suggest]\n\n"
+            "🔑 *KEY LEVELS* (exact prices from chart)\n"
+            "   Resistance 1: [price] — [why]\n"
+            "   Resistance 2: [price] — [why]\n"
+            "   Support 1: [price] — [why]\n"
+            "   Support 2: [price] — [why]\n"
+            "   Critical level NOW: [price] — [why]\n\n"
+            "🌍 *MARKET CONTEXT* (your knowledge of this asset)\n"
+            "   Recent fundamental drivers affecting this pair\n"
+            "   Current market sentiment (risk-on / risk-off)\n"
+            "   Correlation factors (DXY, BTC dominance, macro etc.)\n\n"
+            "🎯 *TRADE SIGNAL*\n"
+            "   Direction: 🟢 BUY / 🔴 SELL\n"
+            "   Entry: [exact price or zone, e.g. 1.4240–1.4260]\n"
+            "   Stop Loss: [exact price] — [reason: key level, ATR, structure]\n"
+            "   TP1: [exact price] — [+X pips / R] conservative\n"
+            "   TP2: [exact price] — [+X pips / R] main target\n"
+            "   TP3: [exact price] — [+X pips / R] extended target\n"
+            "   R:R to TP2: [X:1]\n"
+            "   Trigger: [exact condition to enter — e.g. 'break and close above 1.4270 on 4h']\n"
+            "   Invalidation: [price that cancels this setup]\n\n"
+            "⚡ *FINAL VERDICT*\n"
+            "   Action: ENTER NOW / WAIT FOR TRIGGER / AVOID\n"
+            "   Confidence: [X]/100\n"
+            "   Timeframe: [expected move duration]\n"
+            "   Key risk: [main thing that could go wrong]\n\n"
+            "Use only prices visible on the chart for levels. Be precise and direct."
         )
 
         import google.genai as genai
