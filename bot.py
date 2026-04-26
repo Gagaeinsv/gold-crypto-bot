@@ -68,7 +68,7 @@ GROQ_MODEL   = "llama-3.1-8b-instant"
 GROQ_TIMEOUT = 20
 
 # Deep analysis model (free tier)
-GEMINI_FLASH = "gemini-2.0-flash"
+GEMINI_FLASH = "gemini-2.5-flash"
 
 TRIAL_DAYS        = 7
 PRICE_BASIC       = 550    # ~$5 net after Telegram 30% fee
