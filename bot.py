@@ -59,7 +59,8 @@ load_dotenv()
 TOKEN        = os.getenv("TOKEN",        "INSERT_TOKEN")
 NEWS_API     = os.getenv("NEWS_API",     "INSERT_NEWS_API")
 GROQ_KEY     = os.getenv("GROQ_KEY",     "INSERT_GROQ_KEY")
-GEMINI_KEY = os.getenv("GEMINI_KEY", "")   # for /deepanalysis and /chart
+GEMINI_KEY   = os.getenv("GEMINI_KEY",   "")   # for /deepanalysis and /chart
+GOLD_API_KEY = os.getenv("GOLD_API_KEY", "")   # goldapi.io — spot price for XAU/XAG
 ADMIN_ID     = int(os.getenv("ADMIN_ID", "123456789"))
 CHANNEL_ID   = os.getenv("CHANNEL_ID",  "@your_channel")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "@your_bot")
@@ -638,6 +639,42 @@ def get_price(pair: str) -> float | None:
         rounded = round(p, decimals)
         _price_cache[pair] = (rounded, time.time())
         return rounded
+
+    # ── Gold API (goldapi.io) — spot price for XAU/XAG, highest priority ──
+    if pair in ("XAUUSD", "XAGUSD") and GOLD_API_KEY:
+        symbol = "XAU" if pair == "XAUUSD" else "XAG"
+        try:
+            r = requests.get(
+                f"https://www.goldapi.io/api/{symbol}/USD",
+                headers={"x-access-token": GOLD_API_KEY, "Content-Type": "application/json"},
+                timeout=6,
+            )
+            r.raise_for_status()
+            p = float(r.json().get("price", 0))
+            if p and _valid_price(p, pair):
+                log.debug("Price %s = %s (GoldAPI spot)", pair, p)
+                return _save(p)
+        except Exception as e:
+            log.debug("GoldAPI (%s): %s", pair, e)
+
+    # ── metals.live — free spot price for XAU/XAG, no key required ──
+    if pair in ("XAUUSD", "XAGUSD"):
+        symbol = "gold" if pair == "XAUUSD" else "silver"
+        try:
+            r = requests.get(
+                "https://metals.live/api/spot",
+                timeout=6,
+            )
+            r.raise_for_status()
+            data = r.json()
+            for item in data:
+                if item.get("metal", "").lower() == symbol:
+                    p = float(item.get("price", 0))
+                    if p and _valid_price(p, pair):
+                        log.debug("Price %s = %s (metals.live spot)", pair, p)
+                        return _save(p)
+        except Exception as e:
+            log.debug("metals.live (%s): %s", pair, e)
 
     # Binance — real-time for crypto
     if pair in _BINANCE_SYMBOLS:
