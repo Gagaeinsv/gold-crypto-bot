@@ -1360,14 +1360,27 @@ EDU_TOPICS = [
     "What is volatility and how it affects trading",
     "How to calculate position size correctly",
     "Technical vs fundamental analysis — the difference",
+    "What is Parabolic SAR and how to use it",
+    "Bollinger Bands explained for traders",
+    "How to trade breakouts correctly",
+    "Risk management — the 1% rule explained",
+    "What drives silver prices — XAG fundamentals",
+    "How to use moving averages in trading",
 ]
 
 NEWS_TOPICS = [
-    "gold price Fed inflation USD",
-    "bitcoin crypto market ETF",
-    "ethereum DeFi crypto news",
-    "central bank interest rates gold",
-    "crypto regulation market impact",
+    "gold XAU price Fed inflation safe haven",
+    "bitcoin BTC price ETF crypto market",
+    "ethereum ETH DeFi crypto news",
+    "silver XAG price industrial demand",
+    "XRP Ripple SEC crypto regulation",
+    "Solana SOL crypto ecosystem news",
+    "BNB Binance crypto exchange news",
+    "Cardano ADA blockchain crypto",
+    "central bank interest rates dollar DXY",
+    "crypto market sentiment bitcoin altcoins",
+    "gold inflation hedge geopolitical risk",
+    "Federal Reserve policy interest rates markets",
 ]
 
 
@@ -3195,8 +3208,10 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
         if h in ARTICLE_HOURS_UTC and h != _last_article_hour:
             _last_article_hour = h
             topic_type = "edu" if _article_index % 2 == 0 else "news"
-            topic = (EDU_TOPICS[(_article_index // 2) % len(EDU_TOPICS)]
-                     if topic_type == "edu" else random.choice(NEWS_TOPICS))
+            if topic_type == "edu":
+                topic = EDU_TOPICS[(_article_index // 2) % len(EDU_TOPICS)]
+            else:
+                topic = NEWS_TOPICS[(_article_index // 2) % len(NEWS_TOPICS)]
             _article_index += 1
             try:
                 body = groq_article(topic_type, topic)
@@ -3714,9 +3729,11 @@ async def cmd_forcearticle(update, context):
     args = context.args or []
     topic_type = args[0].lower() if args and args[0].lower() in ("news", "edu") else "edu"
     await update.message.reply_text(f"Generating {topic_type} article...")
-    topic = (random.choice(NEWS_TOPICS) if topic_type == "news" else EDU_TOPICS[_article_index % len(EDU_TOPICS)])
-    if topic_type == "edu":
-        _article_index += 1
+    if topic_type == "news":
+        topic = NEWS_TOPICS[(_article_index // 2) % len(NEWS_TOPICS)]
+    else:
+        topic = EDU_TOPICS[(_article_index // 2) % len(EDU_TOPICS)]
+    _article_index += 1
     try:
         body = groq_article(topic_type, topic)
         text = format_article_post(topic_type, body)
