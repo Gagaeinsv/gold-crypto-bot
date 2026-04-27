@@ -2005,6 +2005,9 @@ def kb_main_for(cid: int, plan: str, pair: str = DEFAULT_PAIR) -> InlineKeyboard
     else:
         deep_left = None
     return kb_main(plan, pair, deep_left=deep_left)
+
+
+def kb_pairs(current_pair: str, plan: str) -> InlineKeyboardMarkup:
     rows = []
     for pid, cfg in PAIRS.items():
         accessible = plan in cfg["plans"]
@@ -2996,7 +2999,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await safe_edit(q, "❌ Unknown pair.", markup=kb_main_for(cid, plan, u.selected_pair))
             return
         if plan not in cfg["plans"]:
-            await safe_edit(q, f"🔒 *{cfg['name']} — Pro only*", markup=kb_sub())
+            await safe_edit(q, f"🔒 *{cfg['name']}* requires Pro or Diamond plan.", markup=kb_sub())
             return
         u.selected_pair = new_pair
         price = get_price(new_pair)
