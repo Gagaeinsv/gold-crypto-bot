@@ -1974,7 +1974,7 @@ def kb_main(plan: str = "trial", pair: str = DEFAULT_PAIR, deep_left: int | None
         [InlineKeyboardButton(f"🔀 Pair: {cfg['emoji']} {cfg['name']}", callback_data="choose_pair")],
         [InlineKeyboardButton("▶️ Analyse & Enter", callback_data="start")],
     ]
-    if plan in ("basic", "pro", "diamond", "admin"):
+    if plan in ("basic", "pro", "diamond", "admin", "trial"):
         rows.append([
             InlineKeyboardButton("⏹ Stop",  callback_data="stop"),
             InlineKeyboardButton("🔄 Reset", callback_data="reset"),
@@ -2044,7 +2044,7 @@ def sub_info_text(acc: dict) -> str:
     lines = [f"💳 *Plan: {PLAN_EMOJI.get(plan, '?')} {plan_label(plan)}*", ""]
     if plan == "trial":
         lines += [f"🔬 Trial: *{dl} days* left", "",
-                  "🥇 XAU/USD — ✅", "₿ BTC — ✅", "Ξ ETH — ✅", ""]
+                  "🥇 XAU/USD — ✅", "₿ BTC — 🔒", "Ξ ETH — 🔒", ""]
     elif plan == "basic":
         lines += [f"⭐ Basic: *{dl} days* left", "",
                   "🥇 XAU/USD — ✅", "🥈 XAG/USD — ✅",
@@ -2566,9 +2566,9 @@ def _gemini_deep_analysis(pair: str, price: float) -> str:
 async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Usage:
-      /deepanalysis          — shows pair selection (uses user's current pair by default)
+      /deepanalysis          — shows pair selection
       /deepanalysis BTCUSD   — analyse specific pair directly
-    Available to all subscribed users. Limit: 3 per day (admin unlimited).
+    Diamond + Admin only. Limit: 3 per day.
     """
     cid = update.effective_chat.id
     acc = db_access(cid)
@@ -2988,7 +2988,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if q.data == "choose_pair":
-        await safe_edit(q, "🔀 *Select pair*\n\n🔒 BTC & ETH — Pro only",
+        await safe_edit(q, "🔀 *Select pair*\n\n🔒 XAG — Basic+\n🔒 BTC/ETH/SOL/XRP/BNB/ADA — Pro+",
                         markup=kb_pairs(u.selected_pair, plan))
         return
 
