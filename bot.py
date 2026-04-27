@@ -1980,16 +1980,22 @@ def kb_main(plan: str = "trial", pair: str = DEFAULT_PAIR, deep_left: int | None
             InlineKeyboardButton("🔄 Reset", callback_data="reset"),
         ])
         rows.append([InlineKeyboardButton("📊 Trade Status", callback_data="status")])
-    if plan in ("diamond", "admin"):
+    if plan in ("trial", "diamond", "admin"):
         if plan == "admin":
             deep_label = "🧠 Deep Analysis"
+        elif plan == "trial":
+            left = deep_left if deep_left is not None else 1
+            deep_label = f"🧠 Deep Analysis ({left}/1)"
         else:
             left = deep_left if deep_left is not None else DEEP_ANALYSIS_DAILY_LIMIT
             deep_label = f"🧠 Deep Analysis ({left}/{DEEP_ANALYSIS_DAILY_LIMIT})"
-        rows.append([
-            InlineKeyboardButton(deep_label, callback_data="deepanalysis_menu"),
-            InlineKeyboardButton("📸 Chart AI", callback_data="chart_ai"),
-        ])
+        if plan in ("diamond", "admin"):
+            rows.append([
+                InlineKeyboardButton(deep_label, callback_data="deepanalysis_menu"),
+                InlineKeyboardButton("📸 Chart AI", callback_data="chart_ai"),
+            ])
+        else:
+            rows.append([InlineKeyboardButton(deep_label, callback_data="deepanalysis_menu")])
     rows.append([
         InlineKeyboardButton("💳 Subscription", callback_data="sub_menu"),
         InlineKeyboardButton("🤝 Refer & Earn",  callback_data="refer"),
@@ -1999,9 +2005,10 @@ def kb_main(plan: str = "trial", pair: str = DEFAULT_PAIR, deep_left: int | None
 
 def kb_main_for(cid: int, plan: str, pair: str = DEFAULT_PAIR) -> InlineKeyboardMarkup:
     """Build kb_main with correct deep_left counter for the given user."""
-    if plan == "diamond":
+    if plan in ("trial", "diamond"):
         used = db_deepanalysis_count_today(cid)
-        deep_left = max(0, DEEP_ANALYSIS_DAILY_LIMIT - used)
+        limit = 1 if plan == "trial" else DEEP_ANALYSIS_DAILY_LIMIT
+        deep_left = max(0, limit - used)
     else:
         deep_left = None
     return kb_main(plan, pair, deep_left=deep_left)
@@ -2044,7 +2051,8 @@ def sub_info_text(acc: dict) -> str:
     lines = [f"💳 *Plan: {PLAN_EMOJI.get(plan, '?')} {plan_label(plan)}*", ""]
     if plan == "trial":
         lines += [f"🔬 Trial: *{dl} days* left", "",
-                  "🥇 XAU/USD — ✅", "₿ BTC — 🔒", "Ξ ETH — 🔒", ""]
+                  "🥇 XAU/USD — ✅", "₿ BTC — 🔒", "Ξ ETH — 🔒", "",
+                  "🧠 Deep Analysis — ✅ _(1/day)_", ""]
     elif plan == "basic":
         lines += [f"⭐ Basic: *{dl} days* left", "",
                   "🥇 XAU/USD — ✅", "🥈 XAG/USD — ✅",
@@ -2568,18 +2576,15 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     Usage:
       /deepanalysis          — shows pair selection
       /deepanalysis BTCUSD   — analyse specific pair directly
-    Diamond + Admin only. Limit: 3 per day.
+    Trial: 1/day (XAU only). Diamond: 3/day (all pairs). Admin: unlimited.
     """
     cid = update.effective_chat.id
     acc = db_access(cid)
+    plan = acc["plan"]
 
-    if acc["plan"] not in ("diamond", "admin") and cid != ADMIN_ID:
+    if plan not in ("trial", "diamond", "admin") and cid != ADMIN_ID:
         await update.message.reply_text(
-            "💠 *Deep Analysis* is a Diamond-exclusive feature.\n\n"
-            "Upgrade to Diamond to unlock:\n"
-            "• 🧠 AI deep analysis on any pair\n"
-            "• 📸 Chart screenshot analysis\n"
-            "• Priority auto-signals\n\n"
+            "💠 *Deep Analysis* is available on Trial (1/day) and Diamond (3/day).\n\n"
             "Tap /start → 💳 Subscription",
             parse_mode="Markdown",
         )
@@ -2592,17 +2597,25 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    # Check daily limit (admin is unlimited)
+    # Check daily limit
     if cid != ADMIN_ID:
         used = db_deepanalysis_count_today(cid)
-        limit = DEEP_ANALYSIS_DAILY_LIMIT
+        limit = 1 if plan == "trial" else DEEP_ANALYSIS_DAILY_LIMIT
         if used >= limit:
-            await update.message.reply_text(
-                f"⏳ *Daily limit reached* ({limit}/day)\n\n"
-                f"You've used all {limit} deep analyses for today.\n"
-                f"Resets at midnight UTC.",
-                parse_mode="Markdown",
-            )
+            if plan == "trial":
+                await update.message.reply_text(
+                    "⏳ *Trial limit reached* (1/day)\n\n"
+                    "Upgrade to 💠 Diamond to get *3 deep analyses per day* on any pair.\n\n"
+                    "Tap /start → 💳 Subscription",
+                    parse_mode="Markdown",
+                )
+            else:
+                await update.message.reply_text(
+                    f"⏳ *Daily limit reached* ({limit}/day)\n\n"
+                    f"You've used all {limit} deep analyses for today.\n"
+                    f"Resets at midnight UTC.",
+                    parse_mode="Markdown",
+                )
             return
 
     args = context.args or []
@@ -2630,7 +2643,11 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data="deepanalysis_cancel")])
 
     used = db_deepanalysis_count_today(cid) if cid != ADMIN_ID else 0
-    remaining = f"  ({DEEP_ANALYSIS_DAILY_LIMIT - used} left today)" if cid != ADMIN_ID else ""
+    limit = 1 if plan == "trial" else DEEP_ANALYSIS_DAILY_LIMIT
+    if cid != ADMIN_ID:
+        remaining = f"  ({limit - used} left today)"
+    else:
+        remaining = ""
 
     await update.message.reply_text(
         f"🧠 *Deep Analysis{remaining}*\n\nChoose a pair to analyse:",
@@ -2679,8 +2696,11 @@ async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair:
     # Log usage (admin unlimited)
     if cid != ADMIN_ID:
         db_deepanalysis_log(cid, pair)
-        used = db_deepanalysis_count_today(cid)
-        remaining_note = f"\n_Deep analyses today: {used}/{DEEP_ANALYSIS_DAILY_LIMIT}_"
+        used  = db_deepanalysis_count_today(cid)
+        limit = 1 if acc["plan"] == "trial" else DEEP_ANALYSIS_DAILY_LIMIT
+        remaining_note = f"\n_Deep analyses today: {used}/{limit}_"
+        if acc["plan"] == "trial" and used >= limit:
+            remaining_note += "\n_Upgrade to 💠 Diamond for 3/day on all pairs_"
     else:
         remaining_note = ""
 
@@ -2957,20 +2977,27 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="back_main")]]),
         )
         return
-        if acc["plan"] not in ("diamond", "admin") and cid != ADMIN_ID:
-            await q.answer("💠 Diamond plan only", show_alert=True)
+
+    if q.data == "deepanalysis_menu":
+        cur_plan = acc["plan"]
+        if cur_plan not in ("trial", "diamond", "admin") and cid != ADMIN_ID:
+            await q.answer("Not available on your plan", show_alert=True)
             return
         if cid != ADMIN_ID:
             used = db_deepanalysis_count_today(cid)
-            if used >= DEEP_ANALYSIS_DAILY_LIMIT:
-                await q.answer(f"⏳ Daily limit reached ({DEEP_ANALYSIS_DAILY_LIMIT}/day). Resets at midnight UTC.", show_alert=True)
+            limit = 1 if cur_plan == "trial" else DEEP_ANALYSIS_DAILY_LIMIT
+            if used >= limit:
+                msg = (f"⏳ Trial limit reached (1/day).\nUpgrade to Diamond for 3/day."
+                       if cur_plan == "trial"
+                       else f"⏳ Daily limit reached ({limit}/day). Resets at midnight UTC.")
+                await q.answer(msg, show_alert=True)
                 return
-            remaining = f"  ({DEEP_ANALYSIS_DAILY_LIMIT - used} left today)"
+            remaining = f"  ({limit - used} left today)"
         else:
             remaining = ""
         rows = []
         for pid, cfg in PAIRS.items():
-            if plan in cfg["plans"] or cid == ADMIN_ID:
+            if cur_plan in cfg["plans"] or cid == ADMIN_ID:
                 rows.append([InlineKeyboardButton(
                     f"{cfg['emoji']} {cfg['name']}",
                     callback_data=f"deepanalysis_{pid}",
