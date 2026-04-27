@@ -1220,6 +1220,7 @@ def groq_channel_post(a: dict, post_type: str) -> str:
     lbl   = _sentiment_label(ai)
     si    = {"SAFE": "🟢", "RISK": "🟡", "DANGER": "🔴"}.get(lbl, "⚪")
     dr, de = _direction(ai, a["trend"], a.get("tech"))
+
     header = {
         "morning":   "☀️ *Morning Overview*",
         "midday":    "🌤 *Midday Signal*",
@@ -1227,26 +1228,50 @@ def groq_channel_post(a: dict, post_type: str) -> str:
         "manual":    "📡 *Signal*",
         "scheduled": "📊 *Analysis*",
     }.get(post_type, "📊 *Analysis*")
+
+    dir_emoji = "🟢" if dr == "BUY" else "🔴"
+
+    # TP1 / TP2 / TP3
+    entry  = float(ai.get("optimal_entry") or price)
+    sl     = float(ai.get("stop_loss")     or _make_sl_tp(price, dr, cfg["sl_pct"], cfg["tp_pct"])[0])
+    tp_pct = cfg["tp_pct"]
+    sl_pct = cfg["sl_pct"]
+    if dr == "BUY":
+        tp1 = round(entry * (1 + tp_pct * 0.5 / 100), 5)
+        tp2 = round(entry * (1 + tp_pct / 100), 5)
+        tp3 = round(entry * (1 + tp_pct * 1.8 / 100), 5)
+    else:
+        tp1 = round(entry * (1 - tp_pct * 0.5 / 100), 5)
+        tp2 = round(entry * (1 - tp_pct / 100), 5)
+        tp3 = round(entry * (1 - tp_pct * 1.8 / 100), 5)
+
     verdict = (
-        "✅ Good entry opportunity" if score >= 75 else
-        "⚠️ Neutral conditions"     if score >= 50 else
-        "🔴 Stay on the sidelines"
+        "✅ *Good entry opportunity*" if score >= 75 else
+        "⚠️ *Wait for better conditions*" if score >= 50 else
+        "🔴 *Stay on the sidelines*"
     )
+
+    div = "─" * 28
     lines = [
         f"{header} | {cfg['emoji']} {cfg['name']}",
-        "",
-        f"💰 Price: *{fmt_price(price, pair)}*",
-        f"{'🟢' if dr == 'BUY' else '🔴'} *{dr}* {de}",
-        f"{si} Sentiment: *{(ai.get('sentiment') or '?').upper()}*  "
+        div,
+        f"💰 Price:  *{fmt_price(price, pair)}*",
+        f"{dir_emoji} Signal: *{dr}* {de}",
+        f"{si} Sentiment: *{(ai.get('sentiment') or '?').upper()}*  |  "
         f"Confidence: *{ai.get('confidence', '?')}%*",
-        f"📐 Entry: *{ai.get('optimal_entry', price)}* | "
-        f"SL: *{ai.get('stop_loss', '?')}* | TP: *{ai.get('take_profit', '?')}*",
+        "",
+        f"📐 *Trade Setup:*",
+        f"   Entry:  *{fmt_price(entry, pair)}*",
+        f"   SL:     *{fmt_price(sl, pair)}*",
+        f"   TP1:    *{fmt_price(tp1, pair)}*",
+        f"   TP2:    *{fmt_price(tp2, pair)}*",
+        f"   TP3:    *{fmt_price(tp3, pair)}*",
         "",
         f"📊 Score: `{score_bar(score)}`  *{score}/100*",
         "",
         verdict,
-        "",
-        f"▶️ Details → {BOT_USERNAME}",
+        div,
+        f"🤖 {BOT_USERNAME}",
     ]
     return "\n".join(lines)
 
@@ -1256,10 +1281,14 @@ def groq_channel_post(a: dict, post_type: str) -> str:
 # ═══════════════════════════════════════════════════════════════════
 
 _RSS_FEEDS = [
-    ("Reuters",       "https://feeds.reuters.com/reuters/businessNews"),
-    ("CoinDesk",      "https://www.coindesk.com/arc/outboundfeeds/rss/"),
-    ("CryptoNews",    "https://cryptonews.com/news/feed/"),
-    ("Investing.com", "https://www.investing.com/rss/news_25.rss"),
+    ("Reuters Markets",   "https://feeds.reuters.com/reuters/businessNews"),
+    ("MarketWatch",       "https://feeds.content.dowjones.io/public/rss/mw_topstories"),
+    ("CoinDesk",          "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+    ("CryptoNews",        "https://cryptonews.com/news/feed/"),
+    ("Investing.com",     "https://www.investing.com/rss/news_25.rss"),
+    ("FXStreet",          "https://www.fxstreet.com/rss/news"),
+    ("ForexLive",         "https://www.forexlive.com/feed/news"),
+    ("Kitco Gold",        "https://www.kitco.com/rss/news/kitconews.rss"),
 ]
 _NEWS_KW = ["gold", "xau", "bitcoin", "btc", "crypto", "ethereum",
             "eth", "fed", "inflation", "market", "trading", "usd"]
@@ -1343,40 +1372,59 @@ NEWS_TOPICS = [
 
 
 def groq_article(topic_type: str, topic: str) -> str:
-    """Single Groq call to generate an article. Raises on error."""
+    """Generate an article post. For news — uses real RSS headline. Raises on error."""
     if topic_type == "news":
-        news = get_news_for_article(topic)
-        news_block = f"Recent news (last 48h):\n{news[:800]}\n\n" if news else ""
+        # Pick the freshest relevant RSS article as the base
+        items = get_news_rss()
+        if items:
+            # Try to find one matching the topic keywords
+            kws = topic.lower().split()
+            scored = []
+            for it in items:
+                text = (it["title"] + " " + it["summary"]).lower()
+                scored.append((sum(k in text for k in kws), it))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            best = scored[0][1]
+            news_block = (
+                f"SOURCE: {best['source']}\n"
+                f"HEADLINE: {best['title']}\n"
+                f"SUMMARY: {best['summary']}\n"
+            )
+        else:
+            # Fallback to NewsAPI
+            news_raw = get_news_for_article(topic)
+            news_block = f"Recent news:\n{news_raw[:600]}\n" if news_raw else ""
+
         prompt = (
-            f"You are a financial journalist. Topic: {topic}\n"
-            f"{news_block}"
-            "Write a concise news article in English for a Telegram trading channel.\n"
-            "Structure:\n"
-            "1. *Bold headline* (1 sentence)\n"
-            "2. Main news — what happened (2-3 sentences)\n"
-            "3. Market context — numbers and causes (2-3 sentences)\n"
-            "4. Market impact — how prices may react (1-2 sentences)\n"
-            "5. 📌 Trader tip — one concrete action (1 sentence)\n\n"
-            "Length: 120-180 words. Use ONLY *bold* for the headline."
+            f"You are a financial news editor for a Telegram trading channel.\n"
+            f"Based on this real news item, write a post:\n\n"
+            f"{news_block}\n"
+            "Requirements:\n"
+            "- Headline: one bold sentence summarising the news\n"
+            "- What happened: 2 sentences (facts, numbers)\n"
+            "- Why it matters for traders: 2 sentences (price impact, which assets)\n"
+            "- Market reaction: what to watch (1-2 sentences)\n"
+            "- 📌 Trader tip: one concrete actionable takeaway\n\n"
+            "Length: 100-150 words. Use *bold* ONLY for the headline. No hashtags."
         )
     else:
         prompt = (
-            f"You are an experienced trader and educator. Topic: {topic}\n"
-            "Write a concise educational post in English for a Telegram trading channel.\n"
-            "Structure:\n"
-            "1. *Bold headline* (1 sentence)\n"
-            "2. Definition — what it is (1-2 sentences)\n"
-            "3. How it works — with a concrete example (2-3 sentences)\n"
-            "4. Why traders need it (1-2 sentences)\n"
-            "5. ⚠️ Common mistake to avoid (1 sentence)\n"
-            "6. 📌 Practical tip (1 sentence)\n\n"
-            "Length: 120-160 words. Use ONLY *bold* for the headline."
+            f"You are an experienced trader writing for a Telegram trading channel.\n"
+            f"Topic: {topic}\n\n"
+            "Write an educational post:\n"
+            "- *Bold headline* (1 sentence)\n"
+            "- What it is: 1-2 sentences\n"
+            "- How it works: concrete example with numbers (2-3 sentences)\n"
+            "- Why traders need it: 1-2 sentences\n"
+            "- ⚠️ Common mistake: 1 sentence\n"
+            "- 📌 Practical tip: 1 sentence\n\n"
+            "Length: 120-160 words. Use *bold* ONLY for the headline. No hashtags."
         )
     try:
         result = _groq_client().chat.completions.create(
             model=GROQ_MODEL, timeout=GROQ_TIMEOUT,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.6, max_tokens=500,
+            temperature=0.5, max_tokens=500,
         ).choices[0].message.content.strip()
     except Exception as groq_err:
         if "429" in str(groq_err) or "rate_limit" in str(groq_err).lower():
@@ -1388,13 +1436,13 @@ def groq_article(topic_type: str, topic: str) -> str:
 
 
 def format_article_post(topic_type: str, body: str) -> str:
-    div = "─" * 28
+    div = "─" * 30
     if topic_type == "edu":
         header = f"📚 *Educational Post*\n{div}"
-        footer = f"\n{div}\n🤖 Trade with AI → {BOT_USERNAME}"
+        footer = f"\n{div}\n💡 _Learn more → {BOT_USERNAME}_"
     else:
         header = f"📰 *Market News*\n{div}"
-        footer = f"\n{div}\n📊 Signals & analysis → {BOT_USERNAME}"
+        footer = f"\n{div}\n📊 _Signals & analysis → {BOT_USERNAME}_"
     return f"{header}\n\n{body}\n{footer}"
 
 
