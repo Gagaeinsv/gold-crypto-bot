@@ -640,7 +640,28 @@ def get_price(pair: str) -> float | None:
         _price_cache[pair] = (rounded, time.time())
         return rounded
 
-    # ── Gold API (goldapi.io) — spot price for XAU/XAG, highest priority ──
+    # ── Swissquote — real spot price for XAU/XAG, free, no key ──
+    if pair in ("XAUUSD", "XAGUSD"):
+        sq_symbol = "XAU" if pair == "XAUUSD" else "XAG"
+        try:
+            r = requests.get(
+                f"https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/{sq_symbol}/USD",
+                timeout=6,
+            )
+            r.raise_for_status()
+            data = r.json()
+            prices = data[0]["spreadProfilePrices"]
+            # use "prime" spread profile mid price
+            for sp in prices:
+                if sp.get("spreadProfile") == "prime":
+                    p = round((float(sp["bid"]) + float(sp["ask"])) / 2, 2)
+                    if _valid_price(p, pair):
+                        log.debug("Price %s = %s (Swissquote spot)", pair, p)
+                        return _save(p)
+        except Exception as e:
+            log.debug("Swissquote (%s): %s", pair, e)
+
+    # ── Gold API (goldapi.io) — spot price for XAU/XAG ──
     if pair in ("XAUUSD", "XAGUSD") and GOLD_API_KEY:
         symbol = "XAU" if pair == "XAUUSD" else "XAG"
         try:
@@ -657,17 +678,13 @@ def get_price(pair: str) -> float | None:
         except Exception as e:
             log.debug("GoldAPI (%s): %s", pair, e)
 
-    # ── metals.live — free spot price for XAU/XAG, no key required ──
+    # ── metals.live — free spot price for XAU/XAG ──
     if pair in ("XAUUSD", "XAGUSD"):
         symbol = "gold" if pair == "XAUUSD" else "silver"
         try:
-            r = requests.get(
-                "https://metals.live/api/spot",
-                timeout=6,
-            )
+            r = requests.get("https://metals.live/api/spot", timeout=6)
             r.raise_for_status()
-            data = r.json()
-            for item in data:
+            for item in r.json():
                 if item.get("metal", "").lower() == symbol:
                     p = float(item.get("price", 0))
                     if p and _valid_price(p, pair):
