@@ -1071,10 +1071,14 @@ def _calc_score(tech: dict, ai: dict, econ: dict, trend: str, vol: str) -> int:
     lbl = _sentiment_label(ai)
     s   = 0
 
-    # Trend — bearish now subtracts points
-    if trend == "up":     s += _SW["trend_up"]
-    elif trend == "flat": s += _SW["trend_flat"]
-    else:                 s += _SW["trend_down"]   # down = -10
+    # Trend — score is symmetric for BUY vs SELL
+    sent = (ai.get("sentiment") or "neutral").lower()
+    is_bear = sent == "bearish"
+    if trend == "flat":
+        s += _SW["trend_flat"]
+    else:
+        aligned = (trend == "up" and not is_bear) or (trend == "down" and is_bear)
+        s += _SW["trend_up"] if aligned else _SW["trend_down"]
 
     # Volatility
     if vol == "normal": s += _SW["vol_normal"]
@@ -1082,7 +1086,6 @@ def _calc_score(tech: dict, ai: dict, econ: dict, trend: str, vol: str) -> int:
     # chaos adds nothing
 
     # Technicals — only add when direction aligns with sentiment
-    sent = (ai.get("sentiment") or "neutral").lower()
     if tech.get("ok"):
         if sent != "bearish":   # for BUY/neutral signals
             s += min(
