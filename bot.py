@@ -18,12 +18,15 @@ import concurrent.futures
 import csv
 import io
 import json
+import hashlib
+import hmac
 import logging
 import os
 import random
 import re
 import sqlite3
 import time
+import uuid
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -61,6 +64,11 @@ NEWS_API     = os.getenv("NEWS_API",     "INSERT_NEWS_API")
 GROQ_KEY     = os.getenv("GROQ_KEY",     "INSERT_GROQ_KEY")
 GEMINI_KEY   = os.getenv("GEMINI_KEY",   "")   # for /deepanalysis and /chart
 GOLD_API_KEY = os.getenv("GOLD_API_KEY", "")   # goldapi.io — spot price for XAU/XAG
+NOWPAYMENTS_API_KEY   = os.getenv("NOWPAYMENTS_API_KEY", "")
+NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "")
+# Public base URL of your server, used for NOWPayments IPN callback.
+# Example: https://yourdomain.com  (or http://YOUR_SERVER_IP:8080 if you expose the port)
+PUBLIC_BASE_URL       = os.getenv("PUBLIC_BASE_URL", "")
 ADMIN_ID     = int(os.getenv("ADMIN_ID", "123456789"))
 CHANNEL_ID   = os.getenv("CHANNEL_ID",  "@your_channel")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "@your_bot")
@@ -78,6 +86,14 @@ PRICE_BASIC_3     = 1375   # 3-month ~17% discount
 PRICE_PRO_3       = 2750
 PRICE_DIAMOND     = 2150   # ~$19.99/mo
 PRICE_DIAMOND_3   = 5375   # 3mo ~17% off (~$49.99)
+
+# USD list prices used for crypto payments (NOWPayments)
+USD_BASIC_1     = 5.00
+USD_BASIC_3     = 12.50
+USD_PRO_1       = 9.99
+USD_PRO_3       = 25.00
+USD_DIAMOND_1   = 19.99
+USD_DIAMOND_3   = 49.99
 DB_PATH           = "users.db"
 CHANNEL_HOURS_UTC = [6, 12, 18]   # market analysis posts (UTC)
 ARTICLE_HOURS_UTC = [8, 14, 20]   # article posts — separate from analysis
@@ -266,6 +282,19 @@ def db_init() -> None:
                 pair       TEXT    NOT NULL,
                 used_at    TEXT    DEFAULT (datetime('now'))
             );
+            CREATE TABLE IF NOT EXISTS crypto_payments (
+                payment_id     TEXT    PRIMARY KEY,
+                chat_id        INTEGER NOT NULL,
+                plan           TEXT    NOT NULL,
+                months         INTEGER NOT NULL,
+                price_usd      REAL    NOT NULL,
+                pay_currency   TEXT    NOT NULL,
+                pay_amount     REAL,
+                pay_address    TEXT,
+                status         TEXT    DEFAULT 'waiting',
+                created_at     TEXT    DEFAULT (datetime('now')),
+                updated_at     TEXT
+            );
         """)
 
 
@@ -359,6 +388,138 @@ def db_apply_payment(cid: int, stars: int, plan_key: str, months: int, charge_id
             (cid, stars, plan_key, months, charge_id),
         )
     return new_exp
+
+
+# ── Payment idempotency helpers ───────────────────────────────────
+
+def db_payment_exists(charge_id: str) -> bool:
+    with db_connect() as c:
+        row = c.execute(
+            "SELECT 1 FROM payments WHERE telegram_charge_id=? LIMIT 1",
+            (charge_id,),
+        ).fetchone()
+    return row is not None
+
+
+# ── NOWPayments (crypto) payment helpers ──────────────────────────
+
+NOWPAYMENTS_BASE = "https://api.nowpayments.io/v1"
+NOWPAYMENTS_PAY_CURRENCY = "usdttrc20"
+
+
+def _nowp_headers() -> dict:
+    return {
+        "x-api-key": NOWPAYMENTS_API_KEY,
+        "Content-Type": "application/json",
+    }
+
+
+def db_crypto_payment_upsert(
+    payment_id: str,
+    chat_id: int,
+    plan: str,
+    months: int,
+    price_usd: float,
+    pay_currency: str,
+    pay_amount: float | None = None,
+    pay_address: str | None = None,
+    status: str = "waiting",
+) -> None:
+    with db_connect() as c:
+        c.execute(
+            "INSERT INTO crypto_payments(payment_id,chat_id,plan,months,price_usd,pay_currency,pay_amount,pay_address,status,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,datetime('now')) "
+            "ON CONFLICT(payment_id) DO UPDATE SET "
+            "pay_amount=excluded.pay_amount, pay_address=excluded.pay_address, status=excluded.status, updated_at=datetime('now')",
+            (payment_id, chat_id, plan, months, price_usd, pay_currency, pay_amount, pay_address, status),
+        )
+
+
+def db_crypto_payment_get(payment_id: str) -> sqlite3.Row | None:
+    with db_connect() as c:
+        return c.execute(
+            "SELECT * FROM crypto_payments WHERE payment_id=?",
+            (payment_id,),
+        ).fetchone()
+
+
+def nowp_create_payment(chat_id: int, plan: str, months: int, price_usd: float) -> dict:
+    """
+    Create a NOWPayments invoice for USDT TRC20.
+    Returns dict with payment_id, pay_address, pay_amount, invoice_url (if available).
+    """
+    if not NOWPAYMENTS_API_KEY:
+        raise RuntimeError("NOWPAYMENTS_API_KEY not set")
+    if not PUBLIC_BASE_URL:
+        raise RuntimeError("PUBLIC_BASE_URL not set")
+
+    order_id = f"tg_{chat_id}_{plan}_{months}_{uuid.uuid4().hex[:10]}"
+    payload = {
+        "price_amount": float(price_usd),
+        "price_currency": "usd",
+        "pay_currency": NOWPAYMENTS_PAY_CURRENCY,
+        "order_id": order_id,
+        "order_description": f"Telegram subscription: {plan} x{months}mo (chat {chat_id})",
+        "ipn_callback_url": f"{PUBLIC_BASE_URL.rstrip('/')}/nowpayments",
+    }
+    r = requests.post(f"{NOWPAYMENTS_BASE}/payment", headers=_nowp_headers(), json=payload, timeout=12)
+    r.raise_for_status()
+    data = r.json()
+    payment_id = str(data.get("payment_id") or "")
+    if not payment_id:
+        raise RuntimeError(f"NOWPayments create payment failed: {data}")
+
+    pay_address = data.get("pay_address")
+    pay_amount = data.get("pay_amount")
+    invoice_url = data.get("invoice_url") or data.get("payment_url")
+
+    db_crypto_payment_upsert(
+        payment_id=payment_id,
+        chat_id=chat_id,
+        plan=plan,
+        months=months,
+        price_usd=float(price_usd),
+        pay_currency=NOWPAYMENTS_PAY_CURRENCY,
+        pay_amount=float(pay_amount) if pay_amount else None,
+        pay_address=str(pay_address) if pay_address else None,
+        status=str(data.get("payment_status") or "waiting"),
+    )
+    return {
+        "payment_id": payment_id,
+        "pay_address": pay_address,
+        "pay_amount": pay_amount,
+        "pay_currency": NOWPAYMENTS_PAY_CURRENCY,
+        "invoice_url": invoice_url,
+        "raw": data,
+    }
+
+
+def nowp_get_payment(payment_id: str) -> dict:
+    if not NOWPAYMENTS_API_KEY:
+        raise RuntimeError("NOWPAYMENTS_API_KEY not set")
+    r = requests.get(f"{NOWPAYMENTS_BASE}/payment/{payment_id}", headers=_nowp_headers(), timeout=12)
+    r.raise_for_status()
+    return r.json()
+
+
+def _nowp_is_paid(status: str) -> bool:
+    s = (status or "").lower()
+    return s in ("finished", "confirmed", "sending")
+
+
+def _nowp_is_failed(status: str) -> bool:
+    s = (status or "").lower()
+    return s in ("failed", "expired", "refunded")
+
+
+def db_has_charge_id(charge_id: str) -> bool:
+    """True if a payment with this charge_id was already applied."""
+    with db_connect() as c:
+        row = c.execute(
+            "SELECT 1 FROM payments WHERE telegram_charge_id=? LIMIT 1",
+            (charge_id,),
+        ).fetchone()
+    return row is not None
 
 
 def db_stats() -> dict:
@@ -2029,15 +2190,21 @@ def kb_pairs(current_pair: str, plan: str) -> InlineKeyboardMarkup:
 
 
 def kb_sub() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"⭐ Basic — {PRICE_BASIC}⭐/mo (~$5)",          callback_data="buy_basic_1")],
-        [InlineKeyboardButton(f"⭐ Basic — {PRICE_BASIC_3}⭐/3mo (~$12.5) 🔥", callback_data="buy_basic_3")],
+    rows = [
+        [InlineKeyboardButton(f"⭐ Basic — {PRICE_BASIC}⭐/mo (~$5)",            callback_data="buy_basic_1")],
+        [InlineKeyboardButton(f"⭐ Basic — {PRICE_BASIC_3}⭐/3mo (~$12.5) 🔥",   callback_data="buy_basic_3")],
         [InlineKeyboardButton(f"💎 Pro   — {PRICE_PRO}⭐/mo (~$9.99)",          callback_data="buy_pro_1")],
-        [InlineKeyboardButton(f"💎 Pro   — {PRICE_PRO_3}⭐/3mo (~$25) 🔥",     callback_data="buy_pro_3")],
-        [InlineKeyboardButton(f"💠 Diamond — {PRICE_DIAMOND}⭐/mo (~$19.99)",        callback_data="buy_diamond_1")],
+        [InlineKeyboardButton(f"💎 Pro   — {PRICE_PRO_3}⭐/3mo (~$25) 🔥",      callback_data="buy_pro_3")],
+        [InlineKeyboardButton(f"💠 Diamond — {PRICE_DIAMOND}⭐/mo (~$19.99)",   callback_data="buy_diamond_1")],
         [InlineKeyboardButton(f"💠 Diamond — {PRICE_DIAMOND_3}⭐/3mo (~$49.99) 🔥", callback_data="buy_diamond_3")],
-        [InlineKeyboardButton("↩️ Back", callback_data="back_main")],
-    ])
+    ]
+    # Optional crypto payments (NOWPayments)
+    if NOWPAYMENTS_API_KEY and PUBLIC_BASE_URL and NOWPAYMENTS_IPN_SECRET:
+        rows += [
+            [InlineKeyboardButton("₮ Pay with Crypto (USDT TRC20)", callback_data="crypto_menu")],
+        ]
+    rows.append([InlineKeyboardButton("↩️ Back", callback_data="back_main")])
+    return InlineKeyboardMarkup(rows)
 
 
 def kb_confirm(opt: float, pair: str) -> InlineKeyboardMarkup:
@@ -3068,6 +3235,154 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await safe_edit(q, sub_info_text(acc), markup=kb_sub())
         return
 
+    # ── Crypto payments (NOWPayments) ────────────────────────────
+    if q.data == "crypto_menu":
+        if not (NOWPAYMENTS_API_KEY and PUBLIC_BASE_URL and NOWPAYMENTS_IPN_SECRET):
+            await safe_edit(
+                q,
+                "❌ Crypto payments are not configured.\n\n"
+                "Admin needs to set:\n"
+                "- NOWPAYMENTS_API_KEY\n"
+                "- NOWPAYMENTS_IPN_SECRET\n"
+                "- PUBLIC_BASE_URL",
+                markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="sub_menu")]]),
+            )
+            return
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("₮ Basic — 1 mo ($5)",       callback_data="crypto_pay_basic_1")],
+            [InlineKeyboardButton("₮ Basic — 3 mo ($12.5)",    callback_data="crypto_pay_basic_3")],
+            [InlineKeyboardButton("₮ Pro — 1 mo ($9.99)",      callback_data="crypto_pay_pro_1")],
+            [InlineKeyboardButton("₮ Pro — 3 mo ($25)",        callback_data="crypto_pay_pro_3")],
+            [InlineKeyboardButton("₮ Diamond — 1 mo ($19.99)", callback_data="crypto_pay_diamond_1")],
+            [InlineKeyboardButton("₮ Diamond — 3 mo ($49.99)", callback_data="crypto_pay_diamond_3")],
+            [InlineKeyboardButton("↩️ Back", callback_data="sub_menu")],
+        ])
+        await safe_edit(
+            q,
+            "₮ *Pay with Crypto (USDT TRC20)*\n\n"
+            "Choose your plan. You'll receive an address and exact amount.\n"
+            "_Auto-activation after confirmation._",
+            markup=kb,
+        )
+        return
+
+    if q.data.startswith("crypto_pay_"):
+        if not (NOWPAYMENTS_API_KEY and PUBLIC_BASE_URL and NOWPAYMENTS_IPN_SECRET):
+            await q.answer("Crypto payments not configured", show_alert=True)
+            return
+        try:
+            _, _, plan_key, months_s = q.data.split("_", 3)
+            months = int(months_s)
+        except Exception:
+            await q.answer("Bad crypto plan option", show_alert=True)
+            return
+
+        price_map = {
+            ("basic", 1): USD_BASIC_1,
+            ("basic", 3): USD_BASIC_3,
+            ("pro", 1): USD_PRO_1,
+            ("pro", 3): USD_PRO_3,
+            ("diamond", 1): USD_DIAMOND_1,
+            ("diamond", 3): USD_DIAMOND_3,
+        }
+        price_usd = price_map.get((plan_key, months))
+        if price_usd is None:
+            await q.answer("Unknown plan", show_alert=True)
+            return
+
+        await safe_edit(q, "⏳ Creating crypto invoice…")
+        try:
+            inv = nowp_create_payment(cid, plan_key, months, float(price_usd))
+        except Exception as e:
+            await safe_edit(
+                q,
+                f"❌ Could not create payment: {str(e)[:160]}",
+                markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")]]),
+            )
+            return
+
+        payment_id = inv["payment_id"]
+        addr = inv.get("pay_address") or "—"
+        amt = inv.get("pay_amount") or "—"
+        url = inv.get("invoice_url")
+
+        lines = [
+            "₮ *Crypto Payment Created*",
+            "",
+            f"Plan: *{plan_label(plan_key)}*  |  Months: *{months}*",
+            f"Currency: *USDT (TRC20)*",
+            f"Amount: *{amt}*",
+            f"Address: `{addr}`",
+            "",
+            "After payment gets confirmed, your plan will activate automatically.",
+        ]
+        if url:
+            lines += ["", f"Invoice link: `{url}`"]
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Check payment", callback_data=f"crypto_check_{payment_id}")],
+            [InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")],
+        ])
+        await safe_edit(q, "\n".join(lines), markup=kb)
+        return
+
+    if q.data.startswith("crypto_check_"):
+        payment_id = q.data[len("crypto_check_"):]
+        row = db_crypto_payment_get(payment_id)
+        if not row:
+            await q.answer("Payment not found", show_alert=True)
+            return
+        await safe_edit(q, "⏳ Checking payment status…")
+        try:
+            st = nowp_get_payment(payment_id)
+        except Exception as e:
+            await safe_edit(
+                q,
+                f"❌ Status check failed: {str(e)[:160]}",
+                markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")]]),
+            )
+            return
+        status = str(st.get("payment_status") or st.get("status") or "waiting")
+        db_crypto_payment_upsert(
+            payment_id=payment_id,
+            chat_id=int(row["chat_id"]),
+            plan=str(row["plan"]),
+            months=int(row["months"]),
+            price_usd=float(row["price_usd"]),
+            pay_currency=str(row["pay_currency"]),
+            pay_amount=float(st.get("pay_amount")) if st.get("pay_amount") else row["pay_amount"],
+            pay_address=str(st.get("pay_address") or row["pay_address"]),
+            status=status,
+        )
+        if _nowp_is_paid(status):
+            # activate if not already activated
+            charge_id = f"nowp:{payment_id}"
+            new_exp = db_apply_payment(int(row["chat_id"]), 0, str(row["plan"]), int(row["months"]), charge_id)
+            await safe_edit(
+                q,
+                f"✅ *Payment confirmed!*\\n\\n"
+                f"Plan: *{plan_label(str(row['plan']))}*\\n"
+                f"Active until: *{new_exp.strftime('%d.%m.%Y')}*",
+                markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="back_main")]]),
+            )
+        elif _nowp_is_failed(status):
+            await safe_edit(
+                q,
+                f"❌ Payment status: *{status}*\\n\\n"
+                f"If you already paid, please wait for confirmations or try again.",
+                markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")]]),
+            )
+        else:
+            await safe_edit(
+                q,
+                f"⏳ Payment status: *{status}*\\n\\n"
+                f"Waiting for confirmation…",
+                markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Refresh", callback_data=f"crypto_check_{payment_id}")],
+                    [InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")],
+                ]),
+            )
+        return
+
     buy_map = {
         "buy_basic_1":   ("basic",   1, PRICE_BASIC,     "Basic — 1 month"),
         "buy_basic_3":   ("basic",   3, PRICE_BASIC_3,   "Basic — 3 months"),
@@ -3711,6 +4026,74 @@ async def _tv_webhook_handler(request) -> "web.Response":
     return web.Response(text=f"ok signal_id={sig_id}")
 
 
+async def _nowpayments_ipn_handler(request) -> "web.Response":
+    """
+    Handle NOWPayments IPN callbacks.
+    Validates HMAC-SHA512 signature (x-nowpayments-sig) using NOWPAYMENTS_IPN_SECRET.
+    """
+    from aiohttp import web
+    if not NOWPAYMENTS_IPN_SECRET:
+        return web.Response(status=503, text="IPN not configured")
+
+    sig = request.headers.get("x-nowpayments-sig", "")
+    raw = await request.read()
+    if not sig:
+        return web.Response(status=403, text="Missing signature")
+
+    # NOWPayments signature: HMAC-SHA512 over raw body using IPN secret
+    mac = hmac.new(NOWPAYMENTS_IPN_SECRET.encode("utf-8"), raw, hashlib.sha512).hexdigest()
+    if not hmac.compare_digest(mac, sig):
+        log.warning("NOWPayments IPN: bad signature from %s", request.remote)
+        return web.Response(status=403, text="Bad signature")
+
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return web.Response(status=400, text="Invalid JSON")
+
+    payment_id = str(data.get("payment_id") or "")
+    status = str(data.get("payment_status") or data.get("status") or "")
+    if not payment_id:
+        return web.Response(status=400, text="Missing payment_id")
+
+    row = db_crypto_payment_get(payment_id)
+    if not row:
+        # Payment might have been created elsewhere; ignore to avoid leaking info
+        log.info("NOWPayments IPN: unknown payment_id=%s", payment_id)
+        return web.Response(text="ok")
+
+    # Update DB record
+    db_crypto_payment_upsert(
+        payment_id=payment_id,
+        chat_id=int(row["chat_id"]),
+        plan=str(row["plan"]),
+        months=int(row["months"]),
+        price_usd=float(row["price_usd"]),
+        pay_currency=str(row["pay_currency"]),
+        pay_amount=float(data.get("pay_amount")) if data.get("pay_amount") else row["pay_amount"],
+        pay_address=str(data.get("pay_address") or row["pay_address"]),
+        status=status or str(row["status"]),
+    )
+
+    charge_id = f"nowp:{payment_id}"
+    if _nowp_is_paid(status) and not db_payment_exists(charge_id):
+        try:
+            new_exp = db_apply_payment(int(row["chat_id"]), 0, str(row["plan"]), int(row["months"]), charge_id)
+            app_ref = _get_app_ref()
+            if app_ref is not None:
+                await safe_send(
+                    app_ref.bot,
+                    int(row["chat_id"]),
+                    f"✅ *Crypto payment confirmed!*\\n\\n"
+                    f"{PLAN_EMOJI.get(str(row['plan']), '💳')} *{plan_label(str(row['plan']))}*\\n"
+                    f"Active until: *{new_exp.strftime('%d.%m.%Y')}*\\n\\nTap /start",
+                )
+        except Exception as e:
+            log.error("NOWPayments IPN activation failed: %s", e)
+
+    return web.Response(text="ok")
+
+
 # Global reference to PTB Application for webhook handler
 _APP_REF = None
 
@@ -3720,18 +4103,27 @@ def _get_app_ref():
 
 
 async def _start_webhook_server() -> None:
-    """Start aiohttp webhook server. Only starts if TV_WEBHOOK_SECRET is set in .env"""
-    if not TV_WEBHOOK_SECRET or TV_WEBHOOK_SECRET == "change_this_secret_123":
-        log.info("TradingView webhook disabled (TV_WEBHOOK_SECRET not configured)")
+    """
+    Start aiohttp webhook server (shared).
+    - TradingView: /tv (requires TV_WEBHOOK_SECRET)
+    - NOWPayments: /nowpayments (requires NOWPAYMENTS_IPN_SECRET)
+    """
+    tv_enabled = bool(TV_WEBHOOK_SECRET and TV_WEBHOOK_SECRET != "change_this_secret_123")
+    nowp_enabled = bool(NOWPAYMENTS_IPN_SECRET)
+    if not (tv_enabled or nowp_enabled):
+        log.info("Webhook server disabled (no TV_WEBHOOK_SECRET / NOWPAYMENTS_IPN_SECRET)")
         return
     try:
         from aiohttp import web
     except ImportError:
-        log.warning("aiohttp not installed — TradingView webhook disabled.")
+        log.warning("aiohttp not installed — webhook server disabled.")
         return
 
     app_web = web.Application()
-    app_web.router.add_post("/tv", _tv_webhook_handler)
+    if tv_enabled:
+        app_web.router.add_post("/tv", _tv_webhook_handler)
+    if nowp_enabled:
+        app_web.router.add_post("/nowpayments", _nowpayments_ipn_handler)
 
     async def health(request):
         return web.Response(text="ok")
@@ -3741,7 +4133,12 @@ async def _start_webhook_server() -> None:
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", TV_WEBHOOK_PORT)
     await site.start()
-    log.info("✅ TradingView webhook listening on port %d", TV_WEBHOOK_PORT)
+    routes = []
+    if tv_enabled:
+        routes.append("/tv")
+    if nowp_enabled:
+        routes.append("/nowpayments")
+    log.info("✅ Webhook server listening on port %d (%s)", TV_WEBHOOK_PORT, ", ".join(routes))
 
 
 async def cmd_tvinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
