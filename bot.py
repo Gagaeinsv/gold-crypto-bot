@@ -22,6 +22,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import sqlite3
 import time
 import xml.etree.ElementTree as ET
@@ -86,6 +87,34 @@ PRICE_BASIC_3     = 1375   # 3-month ~17% discount
 PRICE_PRO_3       = 2750
 PRICE_DIAMOND     = 2150   # ~$19.99/mo
 PRICE_DIAMOND_3   = 5375   # 3mo ~17% off (~$49.99)
+PLAN_PRICES_STARS = {
+    ("basic", 1): PRICE_BASIC,
+    ("basic", 3): PRICE_BASIC_3,
+    ("pro", 1): PRICE_PRO,
+    ("pro", 3): PRICE_PRO_3,
+    ("diamond", 1): PRICE_DIAMOND,
+    ("diamond", 3): PRICE_DIAMOND_3,
+}
+PLAN_PRICES_USD = {
+    ("basic", 1): "5",
+    ("basic", 3): "12.50",
+    ("pro", 1): "9.99",
+    ("pro", 3): "25",
+    ("diamond", 1): "19.99",
+    ("diamond", 3): "49.99",
+}
+PLAN_DESCRIPTIONS = {
+    "basic": "XAU/XAG analysis",
+    "pro": "All pairs + auto-signals",
+    "diamond": "All pairs + priority analysis + auto-signals",
+}
+CRYPTO_WALLETS = {
+    "USDT TRC20": os.getenv("CRYPTO_USDT_TRC20_ADDRESS", "").strip(),
+    "USDT ERC20": os.getenv("CRYPTO_USDT_ERC20_ADDRESS", "").strip(),
+    "BTC": os.getenv("CRYPTO_BTC_ADDRESS", "").strip(),
+    "ETH": os.getenv("CRYPTO_ETH_ADDRESS", "").strip(),
+    "TON": os.getenv("CRYPTO_TON_ADDRESS", "").strip(),
+}
 DB_PATH           = "users.db"
 CHANNEL_HOURS_UTC = [6, 12, 18]   # market analysis posts (UTC)
 ARTICLE_HOURS_UTC = [8, 14, 20]   # article posts — separate from analysis
@@ -219,6 +248,17 @@ def db_init() -> None:
                 paid_at            TEXT DEFAULT (datetime('now')),
                 telegram_charge_id TEXT
             );
+            CREATE TABLE IF NOT EXISTS pending_crypto_payments (
+                code         TEXT PRIMARY KEY,
+                chat_id      INTEGER NOT NULL,
+                plan         TEXT    NOT NULL,
+                months       INTEGER NOT NULL,
+                amount_usd   TEXT    NOT NULL,
+                status       TEXT    DEFAULT 'pending',
+                created_at   TEXT    DEFAULT (datetime('now')),
+                confirmed_at TEXT,
+                tx_hash      TEXT
+            );
             CREATE TABLE IF NOT EXISTS channel_posts (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 pair       TEXT,
@@ -320,9 +360,16 @@ def db_access(cid: int) -> dict:
 
 
 def db_apply_payment(cid: int, stars: int, plan_key: str, months: int, charge_id: str) -> date:
+    if plan_key not in PAID_PLANS or months not in (1, 3):
+        raise ValueError(f"Invalid paid plan payload: {plan_key}_{months}")
     today = datetime.utcnow().date()
     with db_connect() as c:
         row = c.execute("SELECT sub_expires FROM users WHERE chat_id=?", (cid,)).fetchone()
+        if row is None:
+            c.execute(
+                "INSERT INTO users(chat_id,plan,last_active) VALUES(?,'expired',datetime('now'))",
+                (cid,),
+            )
         base = (
             max(datetime.strptime(row["sub_expires"], "%Y-%m-%d").date(), today)
             if row and row["sub_expires"]
@@ -340,6 +387,77 @@ def db_apply_payment(cid: int, stars: int, plan_key: str, months: int, charge_id
     return new_exp
 
 
+def db_apply_trial(cid: int, days: int, charge_id: str = "manual_trial") -> date:
+    today = datetime.utcnow().date()
+    trial_ends = today + timedelta(days=days)
+    with db_connect() as c:
+        if c.execute("SELECT 1 FROM users WHERE chat_id=?", (cid,)).fetchone() is None:
+            c.execute(
+                "INSERT INTO users(chat_id,plan,trial_ends,last_active) VALUES(?,'trial',?,datetime('now'))",
+                (cid, trial_ends.strftime("%Y-%m-%d")),
+            )
+        else:
+            c.execute(
+                "UPDATE users SET plan='trial',trial_ends=?,last_active=datetime('now') WHERE chat_id=?",
+                (trial_ends.strftime("%Y-%m-%d"), cid),
+            )
+        c.execute(
+            "INSERT INTO payments(chat_id,stars,plan,months,telegram_charge_id) VALUES(?,?,?,?,?)",
+            (cid, 0, "trial", max(days // 30, 1), charge_id),
+        )
+    return trial_ends
+
+
+def _parse_plan_payload(payload: str) -> tuple[str, int, int] | None:
+    try:
+        plan_key, months_raw = payload.split("_", 1)
+        months = int(months_raw)
+    except (ValueError, AttributeError):
+        return None
+    stars = PLAN_PRICES_STARS.get((plan_key, months))
+    if stars is None:
+        return None
+    return plan_key, months, stars
+
+
+def _crypto_wallet_lines() -> list[str]:
+    return [f"*{name}:* `{address}`" for name, address in CRYPTO_WALLETS.items() if address]
+
+
+def db_create_crypto_payment(cid: int, plan_key: str, months: int) -> dict:
+    if (plan_key, months) not in PLAN_PRICES_USD:
+        raise ValueError(f"Invalid crypto plan: {plan_key}_{months}")
+    code = secrets.token_hex(4).upper()
+    amount = PLAN_PRICES_USD[(plan_key, months)]
+    with db_connect() as c:
+        c.execute(
+            "INSERT INTO pending_crypto_payments(code,chat_id,plan,months,amount_usd) VALUES(?,?,?,?,?)",
+            (code, cid, plan_key, months, amount),
+        )
+    return {"code": code, "plan": plan_key, "months": months, "amount_usd": amount}
+
+
+def db_confirm_crypto_payment(code: str, tx_hash: str = "") -> dict | None:
+    code = code.upper()
+    with db_connect() as c:
+        row = c.execute(
+            "SELECT * FROM pending_crypto_payments WHERE code=? AND status='pending'",
+            (code,),
+        ).fetchone()
+    if row is None:
+        return None
+    new_exp = db_apply_payment(
+        int(row["chat_id"]), 0, row["plan"], int(row["months"]),
+        f"crypto:{code}:{tx_hash or 'manual'}",
+    )
+    with db_connect() as c:
+        c.execute(
+            "UPDATE pending_crypto_payments SET status='confirmed',confirmed_at=datetime('now'),tx_hash=? WHERE code=?",
+            (tx_hash, code),
+        )
+    return {"chat_id": int(row["chat_id"]), "plan": row["plan"], "months": int(row["months"]), "expires": new_exp}
+
+
 def db_stats() -> dict:
     with db_connect() as c:
         total = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
@@ -350,8 +468,11 @@ def db_stats() -> dict:
         exp   = c.execute("SELECT COUNT(*) FROM users WHERE plan='expired'").fetchone()[0]
         stars = c.execute("SELECT SUM(stars) FROM payments").fetchone()[0] or 0
         posts = c.execute("SELECT COUNT(*) FROM channel_posts").fetchone()[0]
+        pending_crypto = c.execute(
+            "SELECT COUNT(*) FROM pending_crypto_payments WHERE status='pending'"
+        ).fetchone()[0]
     return dict(total=total, trial=trial, basic=basic, pro=pro, diamond=diamond, expired=exp,
-                total_stars=stars, posts=posts)
+                total_stars=stars, posts=posts, pending_crypto=pending_crypto)
 
 
 def db_save_post(pair: str, post_type: str, score: int,
@@ -1830,7 +1951,20 @@ def kb_sub() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(f"💎 Pro   — {PRICE_PRO_3}⭐/3mo (~$25) 🔥",     callback_data="buy_pro_3")],
         [InlineKeyboardButton(f"💠 Diamond — {PRICE_DIAMOND}⭐/mo (~$19.99)",   callback_data="buy_diamond_1")],
         [InlineKeyboardButton(f"💠 Diamond — {PRICE_DIAMOND_3}⭐/3mo (~$49.99) 🔥", callback_data="buy_diamond_3")],
+        [InlineKeyboardButton("₿ Pay directly with crypto", callback_data="crypto_menu")],
         [InlineKeyboardButton("↩️ Back", callback_data="back_main")],
+    ])
+
+
+def kb_crypto_plans() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⭐ Basic — $5 / 1 mo", callback_data="crypto_basic_1")],
+        [InlineKeyboardButton("⭐ Basic — $12.50 / 3 mo", callback_data="crypto_basic_3")],
+        [InlineKeyboardButton("💎 Pro — $9.99 / 1 mo", callback_data="crypto_pro_1")],
+        [InlineKeyboardButton("💎 Pro — $25 / 3 mo", callback_data="crypto_pro_3")],
+        [InlineKeyboardButton("💠 Diamond — $19.99 / 1 mo", callback_data="crypto_diamond_1")],
+        [InlineKeyboardButton("💠 Diamond — $49.99 / 3 mo", callback_data="crypto_diamond_3")],
+        [InlineKeyboardButton("↩️ Back", callback_data="sub_menu")],
     ])
 
 
@@ -2031,7 +2165,8 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"👥 Users: {s['total']}\n🔬 Trial: {s['trial']}\n"
         f"⭐ Basic: {s['basic']}\n💎 Pro: {s['pro']}\n"
         f"💠 Diamond: {s['diamond']}\n❌ Expired: {s['expired']}\n\n"
-        f"📨 Posts: {s['posts']}\n⭐ Stars: {s['total_stars']}\n\n"
+        f"📨 Posts: {s['posts']}\n⭐ Stars: {s['total_stars']}\n"
+        f"₿ Pending crypto: {s['pending_crypto']}\n\n"
         f"📡 *Traffic sources:*\n{utm_lines}",
         parse_mode="Markdown",
     )
@@ -2050,7 +2185,10 @@ async def cmd_give(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         pk     = args[1].lower()
         months = int(args[2])
         assert pk in (*PAID_PLANS, "trial"), f"Unknown plan: {pk}"
-        new_exp = db_apply_payment(cid, 0, pk, months, "manual")
+        if pk == "trial":
+            new_exp = db_apply_trial(cid, 30 * months)
+        else:
+            new_exp = db_apply_payment(cid, 0, pk, months, "manual")
         await update.message.reply_text(
             f"✅ *{pk}* until {new_exp.strftime('%d.%m.%Y')} for {cid}",
             parse_mode="Markdown",
@@ -2086,10 +2224,25 @@ async def cmd_forcepost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"❌ {e}")
 
 
-        db_save_post(pair, post_type, a["score"], a["ai"].get("sentiment", "?"), price, 0)
-        await update.message.reply_text(f"✅ Published! Score={a['score']}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ {e}")
+async def cmd_confirmcrypto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Usage: /confirmcrypto <code> [tx_hash]"""
+    if update.effective_chat.id != ADMIN_ID:
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("❌ Format: /confirmcrypto ABCD1234 tx_hash")
+        return
+    result = db_confirm_crypto_payment(args[0], args[1] if len(args) > 1 else "")
+    if result is None:
+        await update.message.reply_text("❌ Pending crypto payment not found.")
+        return
+    await update.message.reply_text(
+        f"✅ Crypto confirmed\n"
+        f"User: `{result['chat_id']}`\n"
+        f"Plan: *{plan_label(result['plan'])}* x{result['months']} mo\n"
+        f"Until: *{result['expires'].strftime('%d.%m.%Y')}*",
+        parse_mode="Markdown",
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2729,21 +2882,58 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await safe_edit(q, sub_info_text(acc), markup=kb_sub())
         return
 
+    if q.data == "crypto_menu":
+        if not _crypto_wallet_lines():
+            await safe_edit(q, "❌ Direct crypto payment is not configured yet.", markup=kb_sub())
+            return
+        await safe_edit(
+            q,
+            "₿ *Direct crypto payment*\n\nChoose a plan, send payment to one of the configured wallets, then admin confirms it.",
+            markup=kb_crypto_plans(),
+        )
+        return
+
+    if q.data.startswith("crypto_"):
+        try:
+            _, pk, months_raw = q.data.split("_", 2)
+            months = int(months_raw)
+            pending = db_create_crypto_payment(cid, pk, months)
+        except (ValueError, sqlite3.IntegrityError) as e:
+            await safe_edit(q, f"❌ Crypto payment error: {e}", markup=kb_crypto_plans())
+            return
+        wallets = "\n".join(_crypto_wallet_lines())
+        await safe_edit(
+            q,
+            f"₿ *Direct crypto payment*\n\n"
+            f"Plan: *{plan_label(pk)}* x{months} mo\n"
+            f"Amount: *${pending['amount_usd']}* equivalent\n"
+            f"Payment code: `{pending['code']}`\n\n"
+            f"{wallets}\n\n"
+            f"After sending, include this code with your transaction proof. "
+            f"Admin confirms with `/confirmcrypto {pending['code']} <tx_hash>`.",
+            markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")]]),
+        )
+        try:
+            await context.bot.send_message(
+                ADMIN_ID,
+                f"₿ *Pending crypto payment*\n"
+                f"Code: `{pending['code']}`\nUser: `{cid}`\n"
+                f"Plan: *{plan_label(pk)}* x{months} mo\nAmount: *${pending['amount_usd']}*",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            log.warning("Crypto pending admin notify failed: %s", e)
+        return
+
     buy_map = {
-        "buy_basic_1": ("basic", 1, PRICE_BASIC,   "Basic — 1 month"),
-        "buy_basic_3": ("basic", 3, PRICE_BASIC_3, "Basic — 3 months"),
-        "buy_pro_1":   ("pro",   1, PRICE_PRO,     "Pro — 1 month"),
-        "buy_pro_3":   ("pro",   3, PRICE_PRO_3,   "Pro — 3 months"),
-        "buy_diamond_1": ("diamond", 1, PRICE_DIAMOND,   "Diamond — 1 month"),
-        "buy_diamond_3": ("diamond", 3, PRICE_DIAMOND_3, "Diamond — 3 months"),
+        f"buy_{plan}_{months}": (
+            plan, months, stars, f"{plan_label(plan)} — {months} month{'s' if months > 1 else ''}"
+        )
+        for (plan, months), stars in PLAN_PRICES_STARS.items()
     }
     if q.data in buy_map:
         pk, months, stars, title = buy_map[q.data]
-        desc = {
-            "basic": "XAU/XAG analysis",
-            "pro": "All pairs + auto-signals",
-            "diamond": "All pairs + priority analysis + auto-signals",
-        }[pk]
+        desc = PLAN_DESCRIPTIONS[pk]
         await context.bot.send_invoice(
             chat_id=cid, title=f"Trading Bot — {title}", description=desc,
             payload=f"{pk}_{months}", provider_token="",
@@ -2869,7 +3059,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
 async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.pre_checkout_query.answer(ok=True)
+    q = update.pre_checkout_query
+    parsed = _parse_plan_payload(q.invoice_payload)
+    if parsed is None:
+        await q.answer(ok=False, error_message="Invalid subscription payload.")
+        return
+    _pk, _months, expected_stars = parsed
+    if q.currency != "XTR" or q.total_amount != expected_stars:
+        await q.answer(ok=False, error_message="Invalid subscription amount.")
+        return
+    await q.answer(ok=True)
 
 
 async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2878,9 +3077,16 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     stars   = payment.total_amount
     payload = payment.invoice_payload
     charge  = payment.telegram_payment_charge_id
-    parts   = payload.split("_")
-    pk      = parts[0]
-    months  = int(parts[1]) if len(parts) > 1 else 1
+    parsed = _parse_plan_payload(payload)
+    if parsed is None:
+        log.error("Invalid payment payload: %s", payload)
+        await update.message.reply_text("❌ Payment payload invalid. Contact admin.")
+        return
+    pk, months, expected_stars = parsed
+    if payment.currency != "XTR" or stars != expected_stars:
+        log.error("Invalid payment amount: payload=%s currency=%s stars=%s", payload, payment.currency, stars)
+        await update.message.reply_text("❌ Payment amount invalid. Contact admin.")
+        return
     new_exp = db_apply_payment(cid, stars, pk, months, charge)
     uname   = update.effective_user.username or str(cid)
     log.info("💰 PAYMENT: @%s | %s x%d mo | %d⭐ | until %s",
@@ -3500,6 +3706,7 @@ def main() -> None:
     app.add_handler(CommandHandler("chart",        cmd_chartanalysis))
     app.add_handler(CommandHandler("admin",        cmd_admin))
     app.add_handler(CommandHandler("give",         cmd_give))
+    app.add_handler(CommandHandler("confirmcrypto", cmd_confirmcrypto))
     app.add_handler(CommandHandler("forcepost",    cmd_forcepost))
     app.add_handler(CommandHandler("forcearticle", cmd_forcearticle))
     app.add_handler(CommandHandler("welcome",      cmd_welcome))
