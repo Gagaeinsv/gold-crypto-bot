@@ -16,6 +16,8 @@ Dependencies: pip install python-telegram-bot[job-queue] requests groq yfinance 
 import asyncio
 import concurrent.futures
 import csv
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -115,6 +117,12 @@ CRYPTO_WALLETS = {
     "ETH": os.getenv("CRYPTO_ETH_ADDRESS", "").strip(),
     "TON": os.getenv("CRYPTO_TON_ADDRESS", "").strip(),
 }
+NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY", "").strip()
+NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "").strip()
+NOWPAYMENTS_IPN_URL = os.getenv("NOWPAYMENTS_IPN_URL", "").strip()
+NOWPAYMENTS_PAY_CURRENCY = os.getenv("NOWPAYMENTS_PAY_CURRENCY", "usdttrc20").strip()
+NOWPAYMENTS_SUCCESS_URL = os.getenv("NOWPAYMENTS_SUCCESS_URL", "").strip()
+NOWPAYMENTS_CANCEL_URL = os.getenv("NOWPAYMENTS_CANCEL_URL", "").strip()
 DB_PATH           = "users.db"
 CHANNEL_HOURS_UTC = [6, 12, 18]   # market analysis posts (UTC)
 ARTICLE_HOURS_UTC = [8, 14, 20]   # article posts — separate from analysis
@@ -257,7 +265,10 @@ def db_init() -> None:
                 status       TEXT    DEFAULT 'pending',
                 created_at   TEXT    DEFAULT (datetime('now')),
                 confirmed_at TEXT,
-                tx_hash      TEXT
+                tx_hash      TEXT,
+                provider     TEXT    DEFAULT 'manual',
+                provider_invoice_id TEXT,
+                payment_url  TEXT
             );
             CREATE TABLE IF NOT EXISTS channel_posts (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -309,6 +320,17 @@ def db_init() -> None:
                 message_id   INTEGER DEFAULT 0
             );
         """)
+        cols = {
+            row["name"]
+            for row in c.execute("PRAGMA table_info(pending_crypto_payments)").fetchall()
+        }
+        for name, ddl in {
+            "provider": "ALTER TABLE pending_crypto_payments ADD COLUMN provider TEXT DEFAULT 'manual'",
+            "provider_invoice_id": "ALTER TABLE pending_crypto_payments ADD COLUMN provider_invoice_id TEXT",
+            "payment_url": "ALTER TABLE pending_crypto_payments ADD COLUMN payment_url TEXT",
+        }.items():
+            if name not in cols:
+                c.execute(ddl)
 
 
 def db_upsert_user(cid: int, username: str = "", fname: str = "") -> None:
@@ -424,17 +446,75 @@ def _crypto_wallet_lines() -> list[str]:
     return [f"*{name}:* `{address}`" for name, address in CRYPTO_WALLETS.items() if address]
 
 
-def db_create_crypto_payment(cid: int, plan_key: str, months: int) -> dict:
+def _crypto_provider_enabled() -> bool:
+    return bool(NOWPAYMENTS_API_KEY)
+
+
+def db_create_crypto_payment(
+    cid: int,
+    plan_key: str,
+    months: int,
+    provider: str = "manual",
+    provider_invoice_id: str = "",
+    payment_url: str = "",
+) -> dict:
     if (plan_key, months) not in PLAN_PRICES_USD:
         raise ValueError(f"Invalid crypto plan: {plan_key}_{months}")
     code = secrets.token_hex(4).upper()
     amount = PLAN_PRICES_USD[(plan_key, months)]
     with db_connect() as c:
         c.execute(
-            "INSERT INTO pending_crypto_payments(code,chat_id,plan,months,amount_usd) VALUES(?,?,?,?,?)",
-            (code, cid, plan_key, months, amount),
+            "INSERT INTO pending_crypto_payments("
+            "code,chat_id,plan,months,amount_usd,provider,provider_invoice_id,payment_url"
+            ") VALUES(?,?,?,?,?,?,?,?)",
+            (code, cid, plan_key, months, amount, provider, provider_invoice_id, payment_url),
         )
-    return {"code": code, "plan": plan_key, "months": months, "amount_usd": amount}
+    return {
+        "code": code, "plan": plan_key, "months": months, "amount_usd": amount,
+        "provider": provider, "provider_invoice_id": provider_invoice_id, "payment_url": payment_url,
+    }
+
+
+def _nowpayments_headers() -> dict:
+    return {"x-api-key": NOWPAYMENTS_API_KEY, "Content-Type": "application/json"}
+
+
+def create_nowpayments_invoice(cid: int, plan_key: str, months: int) -> dict:
+    if not NOWPAYMENTS_API_KEY:
+        raise RuntimeError("NOWPayments API key is not configured")
+    pending = db_create_crypto_payment(cid, plan_key, months, provider="nowpayments")
+    payload = {
+        "price_amount": float(pending["amount_usd"]),
+        "price_currency": "usd",
+        "order_id": pending["code"],
+        "order_description": f"Trading Bot {plan_label(plan_key)} x{months} mo",
+    }
+    if NOWPAYMENTS_IPN_URL:
+        payload["ipn_callback_url"] = NOWPAYMENTS_IPN_URL
+    if NOWPAYMENTS_PAY_CURRENCY:
+        payload["pay_currency"] = NOWPAYMENTS_PAY_CURRENCY
+    if NOWPAYMENTS_SUCCESS_URL:
+        payload["success_url"] = NOWPAYMENTS_SUCCESS_URL
+    if NOWPAYMENTS_CANCEL_URL:
+        payload["cancel_url"] = NOWPAYMENTS_CANCEL_URL
+
+    r = requests.post(
+        "https://api.nowpayments.io/v1/invoice",
+        headers=_nowpayments_headers(),
+        json=payload,
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()
+    invoice_id = str(data.get("id") or data.get("invoice_id") or "")
+    payment_url = data.get("invoice_url") or data.get("payment_url") or ""
+    with db_connect() as c:
+        c.execute(
+            "UPDATE pending_crypto_payments SET provider_invoice_id=?,payment_url=? WHERE code=?",
+            (invoice_id, payment_url, pending["code"]),
+        )
+    pending.update({"provider_invoice_id": invoice_id, "payment_url": payment_url})
+    return pending
 
 
 def db_confirm_crypto_payment(code: str, tx_hash: str = "") -> dict | None:
@@ -454,6 +534,38 @@ def db_confirm_crypto_payment(code: str, tx_hash: str = "") -> dict | None:
         c.execute(
             "UPDATE pending_crypto_payments SET status='confirmed',confirmed_at=datetime('now'),tx_hash=? WHERE code=?",
             (tx_hash, code),
+        )
+    return {"chat_id": int(row["chat_id"]), "plan": row["plan"], "months": int(row["months"]), "expires": new_exp}
+
+
+def _verify_nowpayments_signature(raw_body: bytes, data: dict, signature: str) -> bool:
+    if not NOWPAYMENTS_IPN_SECRET or not signature:
+        return False
+    digest_raw = hmac.new(NOWPAYMENTS_IPN_SECRET.encode(), raw_body, hashlib.sha512).hexdigest()
+    if hmac.compare_digest(digest_raw, signature):
+        return True
+    sorted_body = json.dumps(data, separators=(",", ":"), sort_keys=True).encode()
+    digest_sorted = hmac.new(NOWPAYMENTS_IPN_SECRET.encode(), sorted_body, hashlib.sha512).hexdigest()
+    return hmac.compare_digest(digest_sorted, signature)
+
+
+def db_confirm_provider_crypto_payment(code: str, provider: str, provider_payment_id: str) -> dict | None:
+    code = code.upper()
+    with db_connect() as c:
+        row = c.execute(
+            "SELECT * FROM pending_crypto_payments WHERE code=? AND provider=? AND status='pending'",
+            (code, provider),
+        ).fetchone()
+    if row is None:
+        return None
+    new_exp = db_apply_payment(
+        int(row["chat_id"]), 0, row["plan"], int(row["months"]),
+        f"{provider}:{provider_payment_id or code}",
+    )
+    with db_connect() as c:
+        c.execute(
+            "UPDATE pending_crypto_payments SET status='confirmed',confirmed_at=datetime('now'),tx_hash=? WHERE code=?",
+            (provider_payment_id, code),
         )
     return {"chat_id": int(row["chat_id"]), "plan": row["plan"], "months": int(row["months"]), "expires": new_exp}
 
@@ -2883,12 +2995,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if q.data == "crypto_menu":
-        if not _crypto_wallet_lines():
+        if not _crypto_provider_enabled() and not _crypto_wallet_lines():
             await safe_edit(q, "❌ Direct crypto payment is not configured yet.", markup=kb_sub())
             return
+        mode = "automatic invoice" if _crypto_provider_enabled() else "manual wallet transfer"
         await safe_edit(
             q,
-            "₿ *Direct crypto payment*\n\nChoose a plan, send payment to one of the configured wallets, then admin confirms it.",
+            f"₿ *Direct crypto payment*\n\nMode: *{mode}*\nChoose a plan below.",
             markup=kb_crypto_plans(),
         )
         return
@@ -2897,28 +3010,50 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             _, pk, months_raw = q.data.split("_", 2)
             months = int(months_raw)
-            pending = db_create_crypto_payment(cid, pk, months)
+            pending = (
+                create_nowpayments_invoice(cid, pk, months)
+                if _crypto_provider_enabled()
+                else db_create_crypto_payment(cid, pk, months)
+            )
         except (ValueError, sqlite3.IntegrityError) as e:
             await safe_edit(q, f"❌ Crypto payment error: {e}", markup=kb_crypto_plans())
             return
-        wallets = "\n".join(_crypto_wallet_lines())
-        await safe_edit(
-            q,
-            f"₿ *Direct crypto payment*\n\n"
-            f"Plan: *{plan_label(pk)}* x{months} mo\n"
-            f"Amount: *${pending['amount_usd']}* equivalent\n"
-            f"Payment code: `{pending['code']}`\n\n"
-            f"{wallets}\n\n"
-            f"After sending, include this code with your transaction proof. "
-            f"Admin confirms with `/confirmcrypto {pending['code']} <tx_hash>`.",
-            markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")]]),
-        )
+        except requests.RequestException as e:
+            log.error("NOWPayments invoice failed: %s", e)
+            await safe_edit(q, "❌ Crypto provider invoice failed. Try again later.", markup=kb_crypto_plans())
+            return
+        if pending.get("payment_url"):
+            text = (
+                f"₿ *Crypto invoice created*\n\n"
+                f"Plan: *{plan_label(pk)}* x{months} mo\n"
+                f"Amount: *${pending['amount_usd']}*\n"
+                f"Payment code: `{pending['code']}`\n\n"
+                f"Pay with the button below. The bot will activate your plan automatically after provider confirmation."
+            )
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Open crypto invoice", url=pending["payment_url"])],
+                [InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")],
+            ])
+        else:
+            wallets = "\n".join(_crypto_wallet_lines())
+            text = (
+                f"₿ *Direct crypto payment*\n\n"
+                f"Plan: *{plan_label(pk)}* x{months} mo\n"
+                f"Amount: *${pending['amount_usd']}* equivalent\n"
+                f"Payment code: `{pending['code']}`\n\n"
+                f"{wallets}\n\n"
+                f"After sending, include this code with your transaction proof. "
+                f"Admin confirms with `/confirmcrypto {pending['code']} <tx_hash>`."
+            )
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")]])
+        await safe_edit(q, text, markup=markup)
         try:
             await context.bot.send_message(
                 ADMIN_ID,
                 f"₿ *Pending crypto payment*\n"
                 f"Code: `{pending['code']}`\nUser: `{cid}`\n"
-                f"Plan: *{plan_label(pk)}* x{months} mo\nAmount: *${pending['amount_usd']}*",
+                f"Plan: *{plan_label(pk)}* x{months} mo\n"
+                f"Amount: *${pending['amount_usd']}*\nProvider: `{pending['provider']}`",
                 parse_mode="Markdown",
             )
         except Exception as e:
@@ -3573,6 +3708,48 @@ async def _tv_webhook_handler(request) -> "web.Response":
     return web.Response(text=f"ok signal_id={sig_id}")
 
 
+async def _nowpayments_ipn_handler(request) -> "web.Response":
+    """Handle NOWPayments payment status callbacks."""
+    from aiohttp import web
+
+    raw = await request.read()
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return web.Response(status=400, text="Invalid JSON")
+
+    sig = request.headers.get("x-nowpayments-sig", "")
+    if not _verify_nowpayments_signature(raw, data, sig):
+        log.warning("NOWPayments IPN: invalid signature")
+        return web.Response(status=403, text="Forbidden")
+
+    status = str(data.get("payment_status", "")).lower()
+    if status not in {"confirmed", "finished"}:
+        return web.Response(text=f"ignored status={status}")
+
+    code = str(data.get("order_id", "")).upper()
+    payment_id = str(data.get("payment_id") or data.get("invoice_id") or "")
+    result = db_confirm_provider_crypto_payment(code, "nowpayments", payment_id)
+    if result is None:
+        log.warning("NOWPayments IPN: no pending payment for order_id=%s", code)
+        return web.Response(status=404, text="Payment not found")
+
+    app_ref = _get_app_ref()
+    if app_ref is not None:
+        try:
+            await safe_send(
+                app_ref.bot,
+                result["chat_id"],
+                f"✅ *Crypto payment confirmed!*\n\n"
+                f"{PLAN_EMOJI.get(result['plan'], '⭐')} *{plan_label(result['plan'])}*\n"
+                f"Active until: *{result['expires'].strftime('%d.%m.%Y')}*",
+            )
+        except Exception as e:
+            log.warning("NOWPayments user notify failed: %s", e)
+    log.info("NOWPayments confirmed: code=%s plan=%s user=%s", code, result["plan"], result["chat_id"])
+    return web.Response(text="ok")
+
+
 # Global reference to PTB Application for webhook handler
 _APP_REF = None
 
@@ -3582,9 +3759,11 @@ def _get_app_ref():
 
 
 async def _start_webhook_server() -> None:
-    """Start aiohttp webhook server. Only starts if TV_WEBHOOK_SECRET is set in .env"""
-    if not TV_WEBHOOK_SECRET or TV_WEBHOOK_SECRET == "change_this_secret_123":
-        log.info("TradingView webhook disabled (TV_WEBHOOK_SECRET not configured)")
+    """Start aiohttp webhook server for TradingView and crypto provider callbacks."""
+    tv_enabled = bool(TV_WEBHOOK_SECRET and TV_WEBHOOK_SECRET != "change_this_secret_123")
+    crypto_enabled = bool(NOWPAYMENTS_IPN_SECRET)
+    if not tv_enabled and not crypto_enabled:
+        log.info("Webhook server disabled (TradingView and crypto provider webhooks not configured)")
         return
     try:
         from aiohttp import web
@@ -3593,7 +3772,10 @@ async def _start_webhook_server() -> None:
         return
 
     app_web = web.Application()
-    app_web.router.add_post("/tv", _tv_webhook_handler)
+    if tv_enabled:
+        app_web.router.add_post("/tv", _tv_webhook_handler)
+    if crypto_enabled:
+        app_web.router.add_post("/crypto/nowpayments", _nowpayments_ipn_handler)
 
     async def health(request):
         return web.Response(text="ok")
