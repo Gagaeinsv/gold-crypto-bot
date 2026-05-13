@@ -79,7 +79,7 @@ GEMINI_FAST_MODEL = os.getenv("GEMINI_FAST_MODEL", "gemini-1.5-flash")
 GEMINI_DEEP_MODEL = os.getenv("GEMINI_DEEP_MODEL", "gemini-1.5-pro")
 
 PAID_PLANS = ("basic", "pro", "diamond")
-TRADE_CONTROL_PLANS = (*PAID_PLANS, "admin")
+TRADE_CONTROL_PLANS = (*PAID_PLANS, "trial", "admin")
 AUTO_SIGNAL_PLANS = ("pro", "diamond", "admin")
 
 TRIAL_DAYS        = 7
@@ -288,6 +288,10 @@ def db_init() -> None:
                 sl_warning_sent   INTEGER DEFAULT 0,
                 last_signal_time  REAL    DEFAULT 0,
                 last_signal_score INTEGER DEFAULT 0,
+                direction         TEXT    DEFAULT 'BUY',
+                sl_price          REAL,
+                tp_price          REAL,
+                waiting_trigger   TEXT    DEFAULT 'below',
                 PRIMARY KEY (chat_id, pair)
             );
             CREATE TABLE IF NOT EXISTS referrals (
@@ -330,6 +334,18 @@ def db_init() -> None:
             "payment_url": "ALTER TABLE pending_crypto_payments ADD COLUMN payment_url TEXT",
         }.items():
             if name not in cols:
+                c.execute(ddl)
+        trade_cols = {
+            row["name"]
+            for row in c.execute("PRAGMA table_info(active_trades)").fetchall()
+        }
+        for name, ddl in {
+            "direction": "ALTER TABLE active_trades ADD COLUMN direction TEXT DEFAULT 'BUY'",
+            "sl_price": "ALTER TABLE active_trades ADD COLUMN sl_price REAL",
+            "tp_price": "ALTER TABLE active_trades ADD COLUMN tp_price REAL",
+            "waiting_trigger": "ALTER TABLE active_trades ADD COLUMN waiting_trigger TEXT DEFAULT 'below'",
+        }.items():
+            if name not in trade_cols:
                 c.execute(ddl)
 
 
@@ -599,17 +615,25 @@ def db_save_post(pair: str, post_type: str, score: int,
 
 def db_save_trade(chat_id: int, pair: str, entry_price: float | None,
                   waiting_price: float | None, sl_warning: bool,
-                  last_sig_time: float, last_sig_score: int) -> None:
+                  last_sig_time: float, last_sig_score: int,
+                  direction: str, sl_price: float | None,
+                  tp_price: float | None, waiting_trigger: str) -> None:
     with db_connect() as c:
         c.execute(
-            "INSERT INTO active_trades VALUES(?,?,?,?,?,?,?) "
+            "INSERT INTO active_trades("
+            "chat_id,pair,entry_price,waiting_price,sl_warning_sent,last_signal_time,"
+            "last_signal_score,direction,sl_price,tp_price,waiting_trigger"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(chat_id,pair) DO UPDATE SET "
             "entry_price=excluded.entry_price, waiting_price=excluded.waiting_price, "
             "sl_warning_sent=excluded.sl_warning_sent, "
             "last_signal_time=excluded.last_signal_time, "
-            "last_signal_score=excluded.last_signal_score",
+            "last_signal_score=excluded.last_signal_score, "
+            "direction=excluded.direction, sl_price=excluded.sl_price, "
+            "tp_price=excluded.tp_price, waiting_trigger=excluded.waiting_trigger",
             (chat_id, pair, entry_price, waiting_price,
-             int(sl_warning), last_sig_time, last_sig_score),
+             int(sl_warning), last_sig_time, last_sig_score,
+             direction, sl_price, tp_price, waiting_trigger),
         )
 
 
@@ -619,6 +643,40 @@ def db_load_trades(chat_id: int) -> dict:
             "SELECT * FROM active_trades WHERE chat_id=?", (chat_id,)
         ).fetchall()
     return {r["pair"]: r for r in rows}
+
+
+def db_monitor_chat_ids() -> set[int]:
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    with db_connect() as c:
+        trade_ids = {
+            int(r["chat_id"])
+            for r in c.execute(
+                "SELECT DISTINCT chat_id FROM active_trades "
+                "WHERE entry_price IS NOT NULL OR waiting_price IS NOT NULL"
+            ).fetchall()
+        }
+        auto_ids = {
+            int(r["chat_id"])
+            for r in c.execute(
+                "SELECT chat_id FROM users WHERE plan IN ('pro','diamond') "
+                "AND sub_expires IS NOT NULL AND sub_expires>=?",
+                (today,),
+            ).fetchall()
+        }
+    return trade_ids | auto_ids
+
+
+def db_auto_signal_chat_ids() -> set[int]:
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    with db_connect() as c:
+        return {
+            int(r["chat_id"])
+            for r in c.execute(
+                "SELECT chat_id FROM users WHERE plan IN ('pro','diamond') "
+                "AND sub_expires IS NOT NULL AND sub_expires>=?",
+                (today,),
+            ).fetchall()
+        }
 
 
 def db_delete_trade(chat_id: int, pair: str) -> None:
@@ -723,7 +781,8 @@ def db_utm_stats() -> dict:
 
 class PairState:
     __slots__ = ("entry_price", "running", "waiting_entry_price",
-                 "sl_warning_sent", "last_signal_time", "last_signal_score")
+                 "sl_warning_sent", "last_signal_time", "last_signal_score",
+                 "direction", "sl_price", "tp_price", "waiting_trigger")
 
     def __init__(self) -> None:
         self.entry_price:         float | None = None
@@ -732,6 +791,10 @@ class PairState:
         self.sl_warning_sent:     bool         = False
         self.last_signal_time:    float        = 0.0
         self.last_signal_score:   int          = 0
+        self.direction:           str          = "BUY"
+        self.sl_price:            float | None = None
+        self.tp_price:            float | None = None
+        self.waiting_trigger:     str          = "below"
 
     @property
     def has_trade(self) -> bool:
@@ -749,6 +812,10 @@ class PairState:
             self.sl_warning_sent,
             self.last_signal_time,
             self.last_signal_score,
+            self.direction,
+            self.sl_price,
+            self.tp_price,
+            self.waiting_trigger,
         )
 
     def reset(self, chat_id: int, pair: str) -> None:
@@ -756,6 +823,10 @@ class PairState:
         self.running = False
         self.waiting_entry_price = None
         self.sl_warning_sent = False
+        self.direction = "BUY"
+        self.sl_price = None
+        self.tp_price = None
+        self.waiting_trigger = "below"
         db_delete_trade(chat_id, pair)
 
 
@@ -782,6 +853,10 @@ class UserState:
             ps.sl_warning_sent   = bool(row["sl_warning_sent"])
             ps.last_signal_time  = row["last_signal_time"]
             ps.last_signal_score = row["last_signal_score"]
+            ps.direction         = row["direction"] or "BUY"
+            ps.sl_price          = row["sl_price"]
+            ps.tp_price          = row["tp_price"]
+            ps.waiting_trigger   = row["waiting_trigger"] or "below"
 
 
 USERS: dict[int, UserState] = {}
@@ -1270,6 +1345,42 @@ def _direction(ai: dict, trend: str, tech: dict | None) -> tuple[str, str]:
                     tech.get("rsi_zone")   == "overbought"])
         return ("BUY", "📈") if bull >= bear else ("SELL", "📉")
     return "SELL", "📉"
+
+
+def _valid_level(value) -> float | None:
+    try:
+        level = float(value)
+    except (TypeError, ValueError):
+        return None
+    return level if level > 0 else None
+
+
+def _trade_levels(direction: str, price: float, cfg: dict, ai: dict | None = None) -> tuple[float, float]:
+    ai = ai or {}
+    fallback_sl, fallback_tp = _make_sl_tp(
+        price,
+        "bearish" if direction == "SELL" else "bullish",
+        cfg["sl_pct"],
+        cfg["tp_pct"],
+    )
+    sl = _valid_level(ai.get("stop_loss")) or fallback_sl
+    tp = _valid_level(ai.get("take_profit")) or fallback_tp
+    if direction == "BUY" and not (sl < price < tp):
+        sl, tp = fallback_sl, fallback_tp
+    if direction == "SELL" and not (tp < price < sl):
+        sl, tp = fallback_sl, fallback_tp
+    return float(sl), float(tp)
+
+
+def _trade_pnl_pct(direction: str, entry: float, price: float) -> float:
+    raw = (price - entry) / entry * 100
+    return raw if direction == "BUY" else -raw
+
+
+def _level_hit(direction: str, price: float, level: float, kind: str) -> bool:
+    if direction == "BUY":
+        return price <= level if kind == "sl" else price >= level
+    return price >= level if kind == "sl" else price <= level
 
 
 def full_analysis(price: float, prev: float | None, pair: str) -> dict:
@@ -3125,12 +3236,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         a  = u.pending_analysis or {}
         ai = a.get("ai", {})
         dr, de = _direction(ai, a.get("trend", "flat"), a.get("tech"))
+        sl, tp = _trade_levels(dr, price_val, cfg, ai)
         ps.entry_price     = price_val
         ps.running         = True
         ps.sl_warning_sent = False
+        ps.direction       = dr
+        ps.sl_price        = sl
+        ps.tp_price        = tp
+        ps.waiting_entry_price = None
         ps.persist(cid, pair)
-        sl = ai.get("stop_loss",   round(price_val * (1 - cfg["sl_pct"] / 100), 2))
-        tp = ai.get("take_profit", round(price_val * (1 + cfg["tp_pct"] / 100), 2))
         # Save to signals table for backtesting
         db_save_signal(
             pair, dr, price_val, float(sl), float(tp),
@@ -3152,6 +3266,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await safe_edit(q, "❌ Error.", markup=kb_main(plan, pair))
             return
         ps.waiting_entry_price = opt
+        a  = u.pending_analysis or {}
+        ai = a.get("ai", {})
+        dr, _ = _direction(ai, a.get("trend", "flat"), a.get("tech"))
+        current = get_price(pair)
+        reference = current or a.get("price") or opt
+        sl, tp = _trade_levels(dr, opt, cfg, ai)
+        ps.direction = dr
+        ps.sl_price = sl
+        ps.tp_price = tp
+        ps.waiting_trigger = "above" if opt >= reference else "below"
         ps.persist(cid, pair)
         await safe_edit(q, f"⏳ Waiting for *{fmt_price(opt, pair)}*",
                         markup=kb_main(plan, pair))
@@ -3179,10 +3303,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for pid, pst in u.pairs.items():
             pr = _prices.get(pid)
             if pst.has_trade and pr:
-                ch = (pr - pst.entry_price) / pst.entry_price * 100
+                ch = _trade_pnl_pct(pst.direction, pst.entry_price, pr)
                 lines.append(
                     f"{PAIRS[pid]['emoji']} *{PAIRS[pid]['name']}* "
-                    f"{'🟢' if ch >= 0 else '🔴'} *{ch:+.2f}%*"
+                    f"{pst.direction} {'🟢' if ch >= 0 else '🔴'} *{ch:+.2f}%*"
                 )
         msg = "\n\n".join(lines) if lines else "ℹ️ No active trades"
         await safe_edit(q, f"📊 *Status*\n\n{msg}", markup=kb_main(plan, u.selected_pair))
@@ -3285,8 +3409,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                     # Save to signals table for backtesting
                     ai  = a["ai"]
                     dr, _ = _direction(ai, a["trend"], a.get("tech"))
-                    sl  = ai.get("stop_loss",   round(price * (1 - cfg["sl_pct"] / 100), 2))
-                    tp  = ai.get("take_profit", round(price * (1 + cfg["tp_pct"] / 100), 2))
+                    sl, tp = _trade_levels(dr, price, cfg, ai)
                     db_save_signal(pair, dr, price, float(sl), float(tp),
                                    a["score"], ai.get("sentiment", "neutral"), source="ai")
                     log.info("Channel: analysis %s published (score=%s)", pair, a["score"])
@@ -3309,6 +3432,9 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                 log.error("Article post error: %s", e)
 
         # 4) Per-user trade monitoring + auto-signals
+        for cid in db_monitor_chat_ids():
+            get_user(cid)
+
         for cid, u in list(USERS.items()):
             acc = db_access(cid)
             if not acc["allowed"]:
@@ -3322,30 +3448,48 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                 cfg = PAIRS[pair]
 
                 if ps.has_trade:
-                    ch = (price - ps.entry_price) / ps.entry_price * 100
-                    if ch <= -cfg["sl_pct"]:
+                    direction = ps.direction if ps.direction in ("BUY", "SELL") else "BUY"
+                    ch = _trade_pnl_pct(direction, ps.entry_price, price)
+                    sl = ps.sl_price or _trade_levels(direction, ps.entry_price, cfg)[0]
+                    tp = ps.tp_price or _trade_levels(direction, ps.entry_price, cfg)[1]
+                    if _level_hit(direction, price, sl, "sl"):
                         await safe_send(context.bot, cid,
                             f"❌ *STOP LOSS {cfg['emoji']} {cfg['name']}*\n"
+                            f"Direction: *{direction}*\n"
                             f"Price: *{fmt_price(price, pair)}* | PnL: *{ch:+.2f}%*")
                         ps.reset(cid, pair)
-                    elif ch >= cfg["tp_pct"]:
+                    elif _level_hit(direction, price, tp, "tp"):
                         await safe_send(context.bot, cid,
                             f"✅ *TAKE PROFIT {cfg['emoji']} {cfg['name']}*\n"
+                            f"Direction: *{direction}*\n"
                             f"Price: *{fmt_price(price, pair)}* | PnL: *{ch:+.2f}%*")
                         ps.reset(cid, pair)
                     elif ch <= -cfg["sl_pct"] * 0.75 and not ps.sl_warning_sent:
                         await safe_send(context.bot, cid,
-                            f"⚠️ Approaching SL on {cfg['name']}\nPnL: *{ch:+.2f}%*")
+                            f"⚠️ *Position risk: {cfg['name']}*\n"
+                            f"Direction: *{direction}*\n"
+                            f"Price: *{fmt_price(price, pair)}*\n"
+                            f"PnL: *{ch:+.2f}%*\n"
+                            f"_Market is moving against this position._")
                         ps.sl_warning_sent = True
                         ps.persist(cid, pair)
 
-                if ps.is_waiting and price <= ps.waiting_entry_price:
+                if ps.is_waiting:
+                    waiting_hit = (
+                        price >= ps.waiting_entry_price
+                        if ps.waiting_trigger == "above"
+                        else price <= ps.waiting_entry_price
+                    )
+                else:
+                    waiting_hit = False
+                if waiting_hit:
                     ps.entry_price         = ps.waiting_entry_price
                     ps.running             = True
                     ps.waiting_entry_price = None
                     ps.persist(cid, pair)
                     await safe_send(context.bot, cid,
                         f"🎯 *Level reached! {cfg['emoji']} {cfg['name']}*\n"
+                        f"Direction: *{ps.direction}*\n"
                         f"Entry: *{fmt_price(ps.entry_price, pair)}*")
 
                 if (plan in AUTO_SIGNAL_PLANS
@@ -3690,7 +3834,7 @@ async def _tv_webhook_handler(request) -> "web.Response":
 
     # Notify auto-signal subscribers
     notified = 0
-    for cid, u in list(USERS.items()):
+    for cid in db_auto_signal_chat_ids():
         acc = db_access(cid)
         if acc["plan"] in AUTO_SIGNAL_PLANS:
             try:
@@ -3700,8 +3844,8 @@ async def _tv_webhook_handler(request) -> "web.Response":
                     reply_markup=kb_main(acc["plan"], pair),
                 )
                 notified += 1
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("TV webhook user notify failed (%s): %s", cid, e)
 
     log.info("TV webhook: %s %s @ %s — signal #%d, notified %d Pro users",
              direction, pair, entry, sig_id, notified)
@@ -3782,10 +3926,20 @@ async def _start_webhook_server() -> None:
     app_web.router.add_get("/health", health)
 
     runner = web.AppRunner(app_web)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", TV_WEBHOOK_PORT)
-    await site.start()
-    log.info("✅ TradingView webhook listening on port %d", TV_WEBHOOK_PORT)
+    try:
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", TV_WEBHOOK_PORT)
+        await site.start()
+    except Exception as e:
+        log.error("Webhook server failed to start on port %d: %s", TV_WEBHOOK_PORT, e)
+        await runner.cleanup()
+        return
+    routes = []
+    if tv_enabled:
+        routes.append("/tv")
+    if crypto_enabled:
+        routes.append("/crypto/nowpayments")
+    log.info("✅ Webhook server listening on port %d (%s)", TV_WEBHOOK_PORT, ", ".join(routes))
 
 
 async def cmd_tvinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3877,7 +4031,10 @@ def main() -> None:
     db_init()
     log.info("DB initialised. Starting bot…")
 
-    app = ApplicationBuilder().token(TOKEN).build()
+    async def post_init(application):
+        await _start_webhook_server()
+
+    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
     _APP_REF = app  # store reference for TV webhook handler
 
     app.add_handler(CommandHandler("start",        cmd_start))
@@ -3897,12 +4054,6 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.job_queue.run_repeating(monitor, interval=60, first=15)
-
-    # Start TradingView webhook server
-    async def post_init(application):
-        await _start_webhook_server()
-
-    app.post_init = post_init
 
     log.info("✅ Bot running… Stop with Ctrl+C")
     app.run_polling(drop_pending_updates=True)
