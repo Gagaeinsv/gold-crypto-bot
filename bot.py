@@ -11,9 +11,11 @@ def fix_markdown(text: str) -> str:
 Gold & Crypto AI Signals Bot
 Run: python bot.py
 Dependencies: pip install python-telegram-bot[job-queue] requests groq yfinance pandas pandas-ta python-dotenv
+Env: GROQ_KEY, OPENROUTER_API_KEY (fallback AI + /deepanalysis + chart vision), OPENROUTER_MODEL, optional OPENROUTER_VISION_MODEL
 """
 
 import asyncio
+import base64
 import concurrent.futures
 import csv
 import io
@@ -62,7 +64,13 @@ load_dotenv()
 TOKEN        = os.getenv("TOKEN",        "INSERT_TOKEN")
 NEWS_API     = os.getenv("NEWS_API",     "INSERT_NEWS_API")
 GROQ_KEY     = os.getenv("GROQ_KEY",     "INSERT_GROQ_KEY")
-GEMINI_KEY   = os.getenv("GEMINI_KEY",   "")   # for /deepanalysis and /chart
+# OpenRouter — Groq fallback + /deepanalysis + chart vision (OpenAI-compatible API)
+OPENROUTER_API_KEY    = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL      = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+OPENROUTER_VISION_MODEL = os.getenv("OPENROUTER_VISION_MODEL", "")  # if empty, uses OPENROUTER_MODEL
+OPENROUTER_SITE_URL   = os.getenv("OPENROUTER_SITE_URL", "")   # optional HTTP-Referer for OpenRouter rankings
+OPENROUTER_APP_TITLE  = os.getenv("OPENROUTER_APP_TITLE", "Gold Crypto Trading Bot")
+OPENROUTER_API_URL    = "https://openrouter.ai/api/v1/chat/completions"
 GOLD_API_KEY = os.getenv("GOLD_API_KEY", "")   # goldapi.io — spot price for XAU/XAG
 NOWPAYMENTS_API_KEY   = os.getenv("NOWPAYMENTS_API_KEY", "")
 NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "")
@@ -76,8 +84,7 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "@your_bot")
 GROQ_MODEL   = "llama-3.1-8b-instant"
 GROQ_TIMEOUT = 20
 
-# Deep analysis model (free tier)
-GEMINI_FLASH = "gemini-2.5-flash"
+# Long-form / vision AI is routed through OpenRouter (see OPENROUTER_* above).
 
 TRIAL_DAYS        = 7
 PRICE_BASIC       = 550    # ~$5 net after Telegram 30% fee
@@ -1058,36 +1065,99 @@ def get_technicals(pair: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Groq analysis  (ONE call per full_analysis — never loops)
+#  OpenRouter — Groq fallback (OpenAI-compatible chat completions)
 # ═══════════════════════════════════════════════════════════════════
 
-def _gemini_text(prompt: str, max_tokens: int = 500) -> str:
-    """Generate text via Gemini Flash. Used as Groq fallback."""
-    import google.genai as genai
-    import google.genai.types as gtypes
-    client = genai.Client(api_key=GEMINI_KEY)
-    response = client.models.generate_content(
-        model=GEMINI_FLASH,
-        contents=prompt,
-        config=gtypes.GenerateContentConfig(max_output_tokens=max_tokens),
-    )
-    return response.text
+def _openrouter_headers() -> dict[str, str]:
+    h = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    if OPENROUTER_SITE_URL.strip():
+        h["HTTP-Referer"] = OPENROUTER_SITE_URL.strip()
+    if OPENROUTER_APP_TITLE.strip():
+        h["X-Title"] = OPENROUTER_APP_TITLE.strip()
+    return h
 
 
-def _gemini_json_analysis(prompt: str) -> str:
-    """Ask Gemini for a JSON trading signal. Used as Groq fallback."""
-    import google.genai as genai
-    import google.genai.types as gtypes
-    client = genai.Client(api_key=GEMINI_KEY)
-    response = client.models.generate_content(
-        model=GEMINI_FLASH,
-        contents=prompt,
-        config=gtypes.GenerateContentConfig(
-            max_output_tokens=300,
-            response_mime_type="application/json",
-        ),
+def _openrouter_vision_model() -> str:
+    v = (OPENROUTER_VISION_MODEL or "").strip()
+    return v if v else OPENROUTER_MODEL
+
+
+def _openrouter_chat(
+    messages: list,
+    *,
+    model: str | None = None,
+    max_tokens: int = 1024,
+    temperature: float = 0.35,
+    response_format: dict | None = None,
+) -> str:
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is not configured")
+    use_model = (model or OPENROUTER_MODEL).strip()
+    payload: dict = {
+        "model": use_model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if response_format is not None:
+        payload["response_format"] = response_format
+    r = requests.post(
+        OPENROUTER_API_URL,
+        headers=_openrouter_headers(),
+        json=payload,
+        timeout=120,
     )
-    return response.text
+    try:
+        data = r.json()
+    except Exception:
+        data = {}
+    if r.status_code >= 400:
+        err = data.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message") or str(err)
+        elif isinstance(err, str):
+            msg = err
+        else:
+            msg = (r.text or "")[:400]
+        raise RuntimeError(msg or f"OpenRouter HTTP {r.status_code}")
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError("OpenRouter returned no choices")
+    msg = choices[0].get("message") or {}
+    content = msg.get("content")
+    if content is None:
+        raise RuntimeError("OpenRouter empty response")
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+        content = "".join(parts)
+    text = str(content).strip()
+    if not text:
+        raise RuntimeError("OpenRouter empty response")
+    return text
+
+
+def _openrouter_text(prompt: str, max_tokens: int = 500) -> str:
+    """Generate plain text via OpenRouter. Used as Groq fallback for articles."""
+    return _openrouter_chat(
+        [{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        temperature=0.45,
+    )
+
+
+def _openrouter_json_analysis(prompt: str) -> str:
+    """Ask OpenRouter for a JSON trading signal. Used as Groq fallback."""
+    return _openrouter_chat(
+        [{"role": "user", "content": prompt + "\n\nReply with ONLY valid JSON, no markdown code fences."}],
+        max_tokens=400,
+        temperature=0.25,
+    )
 
 
 def _make_sl_tp(price: float, direction: str, sl_pct: float, tp_pct: float) -> tuple[float, float]:
@@ -1100,6 +1170,10 @@ def _make_sl_tp(price: float, direction: str, sl_pct: float, tp_pct: float) -> t
         tp = round(price * (1 + tp_pct / 100), 2)   # TP above entry for BUY
     return sl, tp
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  Groq analysis  (ONE call per full_analysis — OpenRouter on 429)
+# ═══════════════════════════════════════════════════════════════════
 
 def _normalize_confidence(raw_conf) -> int:
     """Normalize confidence to 0-100 integer. Handles 0.85 → 85 and 85 → 85."""
@@ -1170,8 +1244,8 @@ def groq_analysis(news_text: str, price: float, tech: dict,
             ).choices[0].message.content
         except Exception as groq_err:
             if "429" in str(groq_err) or "rate_limit" in str(groq_err).lower():
-                log.info("Groq rate limit — falling back to Gemini for analysis")
-                raw = _gemini_json_analysis(analysis_prompt)
+                log.info("Groq rate limit — falling back to OpenRouter for analysis")
+                raw = _openrouter_json_analysis(analysis_prompt)
             else:
                 raise
         m = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -1197,7 +1271,7 @@ def groq_analysis(news_text: str, price: float, tech: dict,
                     parsed["take_profit"] = tp
             return {**fallback, **parsed}
     except Exception as e:
-        log.warning("AI analysis failed (Groq+Gemini): %s", e)
+        log.warning("AI analysis failed (Groq+OpenRouter): %s", e)
     return fallback
 
 
@@ -1663,8 +1737,8 @@ def groq_article(topic_type: str, topic: str) -> str:
         ).choices[0].message.content.strip()
     except Exception as groq_err:
         if "429" in str(groq_err) or "rate_limit" in str(groq_err).lower():
-            log.info("Groq rate limit — falling back to Gemini for article")
-            result = _gemini_text(prompt, max_tokens=500)
+            log.info("Groq rate limit — falling back to OpenRouter for article")
+            result = _openrouter_text(prompt, max_tokens=500)
         else:
             raise
     return result
@@ -2478,7 +2552,7 @@ async def cmd_forcepost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Deep Analysis  (Gemini Flash / Pro — admin only)
+#  Deep Analysis  (OpenRouter — long-form report)
 # ═══════════════════════════════════════════════════════════════════
 
 def _get_multi_tf_data(pair: str) -> dict:
@@ -2614,7 +2688,7 @@ def _get_macro_context(pair: str) -> str:
 
 def _build_deep_prompt(pair: str, price: float, tf_data: dict,
                        macro: str, econ: dict) -> str:
-    """Build the comprehensive prompt for Gemini."""
+    """Build the comprehensive prompt for the deep-analysis LLM."""
     cfg = PAIRS[pair]
 
     # Format multi-timeframe data
@@ -2714,11 +2788,8 @@ Respond ONLY in this exact structure. Use the actual numbers from the data above
 Be precise. Use exact prices from the data. No vague statements."""
 
 
-def _gemini_deep_analysis(pair: str, price: float) -> str:
-    """Run deep analysis using Google Gemini Flash (free tier)."""
-    import google.genai as genai
-    import google.genai.types as gtypes
-
+def _openrouter_deep_analysis(pair: str, price: float) -> str:
+    """Run deep analysis using OpenRouter (long-form report)."""
     # Gather all data
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         f_tf    = pool.submit(_get_multi_tf_data, pair)
@@ -2740,15 +2811,11 @@ def _gemini_deep_analysis(pair: str, price: float) -> str:
 
     prompt = _build_deep_prompt(pair, price, tf_data, macro, econ)
 
-    client = genai.Client(api_key=GEMINI_KEY)
-    response = client.models.generate_content(
-        model=GEMINI_FLASH,
-        contents=prompt,
-        config=gtypes.GenerateContentConfig(
-            max_output_tokens=1800,
-        ),
+    return _openrouter_chat(
+        [{"role": "user", "content": prompt}],
+        max_tokens=1800,
+        temperature=0.35,
     )
-    return response.text
 
 
 async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2770,9 +2837,10 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    if not GEMINI_KEY:
+    if not OPENROUTER_API_KEY:
         await update.message.reply_text(
-            "❌ GEMINI\\_KEY not set in .env\n\nGet your key at: aistudio.google.com",
+            "❌ OPENROUTER\\_API\\_KEY not set in .env\n\n"
+            "Get a key at: https://openrouter.ai/keys",
             parse_mode="Markdown",
         )
         return
@@ -2848,7 +2916,7 @@ async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair:
 
     await reply(
         f"🧠 *Deep Analysis* — {cfg['emoji']} {cfg['name']}\n\n"
-        f"Model: `{GEMINI_FLASH}`\n"
+        f"Model: `{OPENROUTER_MODEL}`\n"
         f"⏳ Gathering data from 4 timeframes + macro news…\n\n"
         f"_This takes 30-60 seconds — please wait_",
         parse_mode="Markdown",
@@ -2862,7 +2930,7 @@ async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair:
     try:
         loop   = asyncio.get_event_loop()
         result = await asyncio.wait_for(
-            loop.run_in_executor(None, _gemini_deep_analysis, pair, price),
+            loop.run_in_executor(None, _openrouter_deep_analysis, pair, price),
             timeout=120,
         )
     except asyncio.TimeoutError:
@@ -2888,7 +2956,7 @@ async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair:
     header = (
         f"🧠 *DEEP ANALYSIS — {cfg['emoji']} {cfg['name']}*\n"
         f"💰 Price: *{fmt_price(price, pair)}*  |  "
-        f"Model: `{GEMINI_FLASH}`\n"
+        f"Model: `{OPENROUTER_MODEL}`\n"
         f"{'─' * 30}\n\n"
     )
     full_text = header + result + remaining_note
@@ -2913,16 +2981,16 @@ async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair:
         if i < len(chunks) - 1:
             await asyncio.sleep(0.5)
 
-    log.info("Deep analysis: cid=%s %s model=%s price=%s", cid, pair, GEMINI_FLASH, price)
+    log.info("Deep analysis: cid=%s %s model=%s price=%s", cid, pair, OPENROUTER_MODEL, price)
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Vision Chart Analysis  (Gemini reads screenshot — all users)
+#  Vision Chart Analysis  (OpenRouter multimodal — Diamond)
 # ═══════════════════════════════════════════════════════════════════
 
 async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    User sends a chart screenshot → Gemini Flash analyses it visually.
+    User sends a chart screenshot → vision model analyses it via OpenRouter.
     Usage: send photo with caption /chart or just /chart then send photo
     Available to Diamond plan users only.
     """
@@ -2940,8 +3008,12 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    if not GEMINI_KEY:
-        await update.message.reply_text("❌ Vision analysis not configured.")
+    if not OPENROUTER_API_KEY:
+        await update.message.reply_text(
+            "❌ Chart vision is not configured.\n\n"
+            "Set OPENROUTER_API_KEY (and optionally OPENROUTER_VISION_MODEL) in .env — "
+            "see https://openrouter.ai/keys",
+        )
         return
 
     # Check if message has a photo or image document
@@ -2967,7 +3039,7 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "3. Take a screenshot\n"
             "4. Send the screenshot to this bot\n"
             "   _(caption is optional)_\n\n"
-            "Gemini will analyse the chart and give you:\n"
+            "The AI will analyse the chart and give you:\n"
             "• Trend direction and strength\n"
             "• Key support & resistance levels\n"
             "• Entry, SL and TP suggestion\n"
@@ -2977,7 +3049,8 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     await update.message.reply_text(
-        "🔍 *Analysing your chart…*\n_Gemini is reading the image — 15-30 seconds_",
+        "🔍 *Analysing your chart…*\n"
+        f"_Model `{_openrouter_vision_model()}` — about 15–45 seconds_",
         parse_mode="Markdown",
     )
 
@@ -3014,23 +3087,26 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "Keep it concise. Use prices visible on the chart."
         )
 
-        import google.genai as genai
-        import google.genai.types as gtypes
-        import PIL.Image
-        import io
+        mime = getattr(photo, "mime_type", None) or "image/jpeg"
+        b64 = base64.standard_b64encode(bytes(photo_bytes)).decode("ascii")
+        data_url = f"data:{mime};base64,{b64}"
 
-        client = genai.Client(api_key=GEMINI_KEY)
-        image = PIL.Image.open(io.BytesIO(bytes(photo_bytes)))
-        response = client.models.generate_content(
-            model=GEMINI_FLASH,
-            contents=[prompt, image],
-            config=gtypes.GenerateContentConfig(
-                max_output_tokens=1000,
-            ),
+        result = _openrouter_chat(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }
+            ],
+            model=_openrouter_vision_model(),
+            max_tokens=1000,
+            temperature=0.3,
         )
-        result = response.text
 
-        # Strip ALL markdown characters from Gemini output
+        # Strip common markdown so plain-text Telegram replies stay readable
         result = re.sub(r"\*+", "", result)
         result = re.sub(r"_+",  "", result)
         result = re.sub(r"`+",  "", result)
@@ -3058,7 +3134,7 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             if i < len(parts) - 1:
                 await asyncio.sleep(0.5)
 
-        log.info("Chart analysis: cid=%s plan=%s", cid, acc["plan"])
+        log.info("Chart analysis: cid=%s plan=%s model=%s", cid, acc["plan"], _openrouter_vision_model())
 
     except Exception as e:
         await update.message.reply_text(
