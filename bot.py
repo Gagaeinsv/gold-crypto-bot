@@ -28,7 +28,7 @@ import sqlite3
 import time
 import uuid
 import xml.etree.ElementTree as ET
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from email.utils import parsedate_to_datetime
 
 import requests
@@ -302,7 +302,7 @@ def db_upsert_user(cid: int, username: str = "", fname: str = "") -> None:
     with db_connect() as c:
         row = c.execute("SELECT chat_id FROM users WHERE chat_id=?", (cid,)).fetchone()
         if row is None:
-            trial_ends = (datetime.utcnow() + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d")
+            trial_ends = (datetime.now(UTC) + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d")
             c.execute(
                 "INSERT INTO users(chat_id,username,first_name,plan,trial_ends,last_active) "
                 "VALUES(?,?,?,'trial',?,datetime('now'))",
@@ -321,7 +321,7 @@ def db_access(cid: int) -> dict:
     if row is None:
         return {"allowed": False, "plan": "none", "days_left": 0, "reason": "not_registered"}
 
-    today = datetime.utcnow().date()
+    today = datetime.now(UTC).date()
     plan  = row["plan"]
 
     if cid == ADMIN_ID:
@@ -350,7 +350,7 @@ DEEP_ANALYSIS_DAILY_LIMIT = 3  # per user per day
 
 def db_deepanalysis_count_today(cid: int) -> int:
     """Return how many deep analyses this user has used today (UTC)."""
-    today = datetime.utcnow().date().isoformat()
+    today = datetime.now(UTC).date().isoformat()
     with db_connect() as c:
         row = c.execute(
             "SELECT COUNT(*) FROM deep_analysis_log "
@@ -370,7 +370,7 @@ def db_deepanalysis_log(cid: int, pair: str) -> None:
 
 
 def db_apply_payment(cid: int, stars: int, plan_key: str, months: int, charge_id: str) -> date:
-    today = datetime.utcnow().date()
+    today = datetime.now(UTC).date()
     with db_connect() as c:
         row = c.execute("SELECT sub_expires FROM users WHERE chat_id=?", (cid,)).fetchone()
         base = (
@@ -625,7 +625,7 @@ def db_give_referral_bonus(referrer_id: int, referred_id: int) -> int:
         if not u:
             return 0
 
-        today = datetime.utcnow().date()
+        today = datetime.now(UTC).date()
         if u["plan"] in ("basic", "pro", "diamond") and u["sub_expires"]:
             base = max(datetime.strptime(u["sub_expires"], "%Y-%m-%d").date(), today)
             new_date = base + timedelta(days=REFERRAL_BONUS_DAYS)
@@ -1513,7 +1513,7 @@ _NEWS_KW = ["gold", "xau", "bitcoin", "btc", "crypto", "ethereum",
 
 
 def get_news_rss() -> list[dict]:
-    cutoff  = datetime.utcnow() - timedelta(hours=48)
+    cutoff  = datetime.now(UTC) - timedelta(hours=48)
     results = []
     for source, url in _RSS_FEEDS:
         try:
@@ -1525,7 +1525,11 @@ def get_news_rss() -> list[dict]:
                 summary = (item.findtext("description") or "").strip()[:200]
                 pub_str = item.findtext("pubDate") or ""
                 try:
-                    pub_dt = parsedate_to_datetime(pub_str).replace(tzinfo=None)
+                    pub_dt = parsedate_to_datetime(pub_str)
+                    if pub_dt.tzinfo is None:
+                        pub_dt = pub_dt.replace(tzinfo=UTC)
+                    else:
+                        pub_dt = pub_dt.astimezone(UTC)
                     if pub_dt < cutoff:
                         continue
                 except Exception:
@@ -1542,7 +1546,7 @@ def get_news_for_article(query: str) -> str:
     if items:
         return "\n".join(f"[{i['source']}] {i['title']}. {i['summary']}" for i in items[:5])
     try:
-        from_dt = (datetime.utcnow() - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%S")
+        from_dt = (datetime.now(UTC) - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%S")
         r = requests.get(
             f"https://newsapi.org/v2/everything?q={query.replace(' ', '%20')}"
             f"&from={from_dt}&sortBy=publishedAt&pageSize=5&language=en&apiKey={NEWS_API}",
@@ -2120,6 +2124,18 @@ async def safe_edit(q, text: str, markup=None, **kwargs):
             log.warning("safe_edit: %s", e)
 
 
+async def safe_callback_answer(q, **kwargs) -> None:
+    """Acknowledge a callback query; ignore expired IDs after long blocking work."""
+    try:
+        await q.answer(**kwargs)
+    except BadRequest as e:
+        low = str(e).lower()
+        if "too old" in low or "invalid" in low or "query id" in low:
+            log.debug("Callback query expired, skipping answer: %s", e)
+        else:
+            raise
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Keyboards
 # ═══════════════════════════════════════════════════════════════════
@@ -2449,18 +2465,12 @@ async def cmd_forcepost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("❌ Could not get price.")
         return
 
-    a    = full_analysis(price, _prev_prices.get(pair), pair)
+    a    = await asyncio.to_thread(full_analysis, price, _prev_prices.get(pair), pair)
     text = groq_channel_post(a, post_type)
     try:
         sent = await safe_send_photo(context.bot, CHANNEL_ID, cfg["image"], text)
         if not sent:
             await safe_send(context.bot, CHANNEL_ID, text)
-        db_save_post(pair, post_type, a["score"], a["ai"].get("sentiment", "?"), price, 0)
-        await update.message.reply_text(f"✅ Published! Score={a['score']}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ {e}")
-
-
         db_save_post(pair, post_type, a["score"], a["ai"].get("sentiment", "?"), price, 0)
         await update.message.reply_text(f"✅ Published! Score={a['score']}")
     except Exception as e:
@@ -3122,12 +3132,15 @@ async def cmd_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ═══════════════════════════════════════════════════════════════════
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q    = update.callback_query
+    q = update.callback_query
+    if not q:
+        return
+    await safe_callback_answer(q)
+
     cid  = q.message.chat_id
     u    = get_user(cid)
     acc  = db_access(cid)
     plan = acc["plan"]
-    await q.answer()
 
     # Deep analysis pair selection
     if q.data == "deepanalysis_cancel":
@@ -3136,7 +3149,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if q.data == "chart_ai":
         if acc["plan"] not in ("diamond", "admin") and cid != ADMIN_ID:
-            await q.answer("💠 Diamond plan only", show_alert=True)
+            await safe_edit(
+                q,
+                "💠 *Chart AI* is available on the *Diamond* plan only.\n\n"
+                "Upgrade in *Subscription* to unlock chart screenshot analysis.",
+                markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="back_main")]]),
+            )
             return
         await safe_edit(q,
             "📸 *Chart AI Analysis*\n\n"
@@ -3151,16 +3169,24 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if q.data == "deepanalysis_menu":
         cur_plan = acc["plan"]
         if cur_plan not in ("trial", "diamond", "admin") and cid != ADMIN_ID:
-            await q.answer("Not available on your plan", show_alert=True)
+            await safe_edit(
+                q,
+                "🔒 *Deep Analysis* is not available on your current plan.",
+                markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="back_main")]]),
+            )
             return
         if cid != ADMIN_ID:
             used = db_deepanalysis_count_today(cid)
             limit = 1 if cur_plan == "trial" else DEEP_ANALYSIS_DAILY_LIMIT
             if used >= limit:
-                msg = (f"⏳ Trial limit reached (1/day).\nUpgrade to Diamond for 3/day."
+                msg = (f"⏳ *Trial limit reached* (1/day).\nUpgrade to Diamond for 3/day."
                        if cur_plan == "trial"
-                       else f"⏳ Daily limit reached ({limit}/day). Resets at midnight UTC.")
-                await q.answer(msg, show_alert=True)
+                       else f"⏳ *Daily limit reached* ({limit}/day). Resets at midnight UTC.")
+                await safe_edit(
+                    q,
+                    msg,
+                    markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="back_main")]]),
+                )
                 return
             remaining = f"  ({limit - used} left today)"
         else:
@@ -3268,13 +3294,21 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if q.data.startswith("crypto_pay_"):
         if not (NOWPAYMENTS_API_KEY and PUBLIC_BASE_URL and NOWPAYMENTS_IPN_SECRET):
-            await q.answer("Crypto payments not configured", show_alert=True)
+            await safe_edit(
+                q,
+                "❌ *Crypto payments* are not configured on this bot.",
+                markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="sub_menu")]]),
+            )
             return
         try:
             _, _, plan_key, months_s = q.data.split("_", 3)
             months = int(months_s)
         except Exception:
-            await q.answer("Bad crypto plan option", show_alert=True)
+            await safe_edit(
+                q,
+                "❌ Bad crypto plan option.",
+                markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")]]),
+            )
             return
 
         price_map = {
@@ -3287,7 +3321,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         }
         price_usd = price_map.get((plan_key, months))
         if price_usd is None:
-            await q.answer("Unknown plan", show_alert=True)
+            await safe_edit(
+                q,
+                "❌ Unknown plan selection.",
+                markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")]]),
+            )
             return
 
         await safe_edit(q, "⏳ Creating crypto invoice…")
@@ -3329,7 +3367,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         payment_id = q.data[len("crypto_check_"):]
         row = db_crypto_payment_get(payment_id)
         if not row:
-            await q.answer("Payment not found", show_alert=True)
+            await safe_edit(
+                q,
+                "❌ Payment not found or expired.",
+                markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")]]),
+            )
             return
         await safe_edit(q, "⏳ Checking payment status…")
         try:
@@ -3576,7 +3618,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                 _prev_prices[pair] = _prices[pair]
                 _prices[pair]      = p
 
-        now_utc = datetime.utcnow()
+        now_utc = datetime.now(UTC)
         h = now_utc.hour
 
         # 2) Market analysis posts (with image)
@@ -3587,7 +3629,9 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                 if not price:
                     continue
                 try:
-                    a    = full_analysis(price, _prev_prices.get(pair), pair)
+                    a    = await asyncio.to_thread(
+                        full_analysis, price, _prev_prices.get(pair), pair,
+                    )
                     text = groq_channel_post(a, post_type_for_hour(h))
                     cfg  = PAIRS[pair]
                     sent = await safe_send_photo(context.bot, CHANNEL_ID, cfg["image"], text)
@@ -3616,7 +3660,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                 topic = NEWS_TOPICS[(_article_index // 2) % len(NEWS_TOPICS)]
             _article_index += 1
             try:
-                body = groq_article(topic_type, topic)
+                body = await asyncio.to_thread(groq_article, topic_type, topic)
                 text = format_article_post(topic_type, body)
                 await send_article_with_image(context.bot, CHANNEL_ID, topic_type, topic, text)
                 log.info("Channel: article [%s] published: %s", topic_type, topic[:50])
@@ -3670,7 +3714,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                     if time.time() - ps.last_signal_time > cooldown:
                         prev = _prev_prices.get(pair)
                         if prev:
-                            a = full_analysis(price, prev, pair)
+                            a = await asyncio.to_thread(full_analysis, price, prev, pair)
                             if a["score"] >= score_min and a["score"] > ps.last_signal_score:
                                 priority_tag = " 💠 *Priority*" if plan == "diamond" else ""
                                 text = (build_analysis_text(a)
@@ -3702,7 +3746,7 @@ def db_save_signal(pair: str, direction: str, entry: float,
 
 def db_get_open_signals(days: int = 30) -> list:
     """Get unresolved signals from the last N days."""
-    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
     with db_connect() as c:
         return c.execute(
             "SELECT * FROM signals WHERE outcome IS NULL AND posted_at >= ?",
@@ -3720,7 +3764,7 @@ def db_resolve_signal(sig_id: int, outcome: str, pnl_pct: float) -> None:
 
 def db_backtest_stats(pair: str | None = None, days: int = 30) -> dict:
     """Return win/loss/pending stats for resolved signals."""
-    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
     with db_connect() as c:
         q_base = "FROM signals WHERE posted_at >= ?"
         params: list = [cutoff]
@@ -3815,7 +3859,7 @@ def _resolve_open_signals() -> int:
                 else:
                     pnl_pct = round((entry - last) / entry * 100, 2)
                 # Only mark as expired if older than 24h
-                age_h = (datetime.utcnow() - start).total_seconds() / 3600
+                age_h = (datetime.now(UTC) - start.replace(tzinfo=UTC)).total_seconds() / 3600
                 if age_h >= 24:
                     outcome = "EXPIRED"
 
@@ -4219,7 +4263,7 @@ async def cmd_forcearticle(update, context):
         topic = EDU_TOPICS[(_article_index // 2) % len(EDU_TOPICS)]
     _article_index += 1
     try:
-        body = groq_article(topic_type, topic)
+        body = await asyncio.to_thread(groq_article, topic_type, topic)
         text = format_article_post(topic_type, body)
         await send_article_with_image(context.bot, CHANNEL_ID, topic_type, topic, text)
         await update.message.reply_text(f"Published! Type: {topic_type} Topic: {topic[:60]}")
