@@ -4121,34 +4121,21 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         url = inv.get("invoice_url")
 
         lines = [
-            "₮ *Crypto Payment Created*",
+            "₮ *Рахунок USDT (TRC20)*",
             "",
-            f"Plan: *{plan_label(plan_key)}*  |  Months: *{months}*",
-        ]
-        rq = inv.get("price_usd_requested")
-        iq = inv.get("price_usd_invoiced")
-        try:
-            if rq is not None and iq is not None and round(float(iq) - float(rq), 4) >= 0.03:
-                lines.append(
-                    f"Listed menu *${float(rq):.2f}* → *fiat-order field* NOWPayments *${float(iq):.2f}* "
-                    f"(служить для їхнього обмінника; платіж фіксується в USDT нижче)"
-                )
-        except (TypeError, ValueError):
-            pass
-
-        lines += [
-            f"Currency: *USDT (TRC20)*",
+            f"*План:* {plan_label(plan_key)} × *{months}* міс.",
             "",
-            f"💠 *Що платити:* точно *{amt}* USDT (усі десяткові знаки).",
-            f"💠 *What to pay:* exactly *{amt}* USDT (all decimals).",
-            f"Address: `{addr}`",
+            "*Сплата — рівно ця сума USDT,* скопіюй символ‑в‑символ:",
+            f"`{amt}` *USDT*",
             "",
-            "💡 Сума в *USD (listed / invoiced)* — довідкова; шлюз конвертує під свій курс, тому вона "
-            "може трохи не збігатися побітово з *USDT*, але зарахують саме той *USDT Amount*.",
-            "_After payment confirms, your plan activates automatically._",
+            "*Адреса:*",
+            f"`{addr}`",
+            "",
+            "⚠️ Не округлюй і не діли суму на кілька платежів — інакше автоактивізація не спрацює.",
+            "_Підписка вмикається одразу після підтвердження вашого переказу в блокчейні._",
         ]
         if url:
-            lines += ["", f"Invoice link: `{url}`"]
+            lines += ["", f"*Посилання інвойсу:* `{url}`"]
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Check payment", callback_data=f"crypto_check_{payment_id}")],
             [InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")],
