@@ -11,8 +11,8 @@ def fix_markdown(text: str) -> str:
 Gold & Crypto AI Signals Bot
 Run: python bot.py
 Dependencies: pip install python-telegram-bot[job-queue] requests groq google-genai pillow yfinance pandas pandas-ta python-dotenv
-Env: GROQ_MODEL_NEWS (channel/articles, high daily quota), GROQ_MODEL_SIGNALS (user analysis;
-     legacy GROQ_MODEL overrides signals only). MONITOR_INTERVAL_SEC for scheduler cadence.
+Env: GROQ_MODEL_* ; OpenRouter key pool (`OPENROUTER_API_KEY`, `OPENROUTER_API_KEY_2`, optional `OPENROUTER_API_KEYS`) ;
+     round-robin + automatic failover on 429 ; GEMINI / MONITOR_INTERVAL_SEC / providers — see .env.example.
 """
 
 import asyncio
@@ -28,6 +28,7 @@ import os
 import random
 import re
 import sqlite3
+import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -65,13 +66,37 @@ load_dotenv()
 TOKEN        = os.getenv("TOKEN",        "INSERT_TOKEN")
 NEWS_API     = os.getenv("NEWS_API",     "INSERT_NEWS_API")
 GROQ_KEY     = os.getenv("GROQ_KEY",     "INSERT_GROQ_KEY")
-# OpenRouter — Groq fallback + /deepanalysis + chart vision (OpenAI-compatible API)
-OPENROUTER_API_KEY    = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL      = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+# OpenRouter — Groq fallback + optional deep/chart (OpenAI-compatible API).
+# Multiple keys: round-robin per request; on 429/quota — automatic failover to next key.
+OPENROUTER_API_KEY     = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_API_KEY_2   = os.getenv("OPENROUTER_API_KEY_2", "").strip()
+OPENROUTER_API_KEYS    = os.getenv("OPENROUTER_API_KEYS", "").strip()  # optional comma-separated extra keys
+OPENROUTER_MODEL       = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 OPENROUTER_VISION_MODEL = os.getenv("OPENROUTER_VISION_MODEL", "")  # if empty, uses OPENROUTER_MODEL
-OPENROUTER_SITE_URL   = os.getenv("OPENROUTER_SITE_URL", "")   # optional HTTP-Referer for OpenRouter rankings
-OPENROUTER_APP_TITLE  = os.getenv("OPENROUTER_APP_TITLE", "Gold Crypto Trading Bot")
-OPENROUTER_API_URL    = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_SITE_URL    = os.getenv("OPENROUTER_SITE_URL", "")   # optional HTTP-Referer for OpenRouter rankings
+OPENROUTER_APP_TITLE   = os.getenv("OPENROUTER_APP_TITLE", "Gold Crypto Trading Bot")
+OPENROUTER_API_URL     = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def _openrouter_key_pool() -> list[str]:
+    keys: list[str] = []
+    for k in (OPENROUTER_API_KEY, OPENROUTER_API_KEY_2):
+        if k and k not in keys:
+            keys.append(k)
+    for part in OPENROUTER_API_KEYS.split(","):
+        p = part.strip()
+        if p and p not in keys:
+            keys.append(p)
+    return keys
+
+
+_OPENROUTER_KEYS: list[str] = _openrouter_key_pool()
+_openrouter_rr_lock = threading.Lock()
+_openrouter_rr_i = 0
+
+
+def _openrouter_configured() -> bool:
+    return bool(_OPENROUTER_KEYS)
 # Google Gemini — deep analysis, chart vision, Groq 429 fallback (works alongside OpenRouter)
 GEMINI_KEY   = os.getenv("GEMINI_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -1086,12 +1111,12 @@ def get_technicals(pair: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  OpenRouter — Groq fallback (OpenAI-compatible chat completions)
+#  OpenRouter — Groq fallback (multi-key round-robin + 429 failover)
 # ═══════════════════════════════════════════════════════════════════
 
-def _openrouter_headers() -> dict[str, str]:
+def _openrouter_headers_for(api_key: str) -> dict[str, str]:
     h = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
     if OPENROUTER_SITE_URL.strip():
@@ -1101,49 +1126,35 @@ def _openrouter_headers() -> dict[str, str]:
     return h
 
 
-def _openrouter_vision_model() -> str:
-    v = (OPENROUTER_VISION_MODEL or "").strip()
-    return v if v else OPENROUTER_MODEL
+def _next_openrouter_rr_start() -> int:
+    """Rotate which key is tried first on each request (spread load across accounts)."""
+    n = len(_OPENROUTER_KEYS)
+    if n <= 1:
+        return 0
+    global _openrouter_rr_i
+    with _openrouter_rr_lock:
+        idx = _openrouter_rr_i % n
+        _openrouter_rr_i += 1
+        return idx
 
 
-def _openrouter_chat(
-    messages: list,
-    *,
-    model: str | None = None,
-    max_tokens: int = 1024,
-    temperature: float = 0.35,
-    response_format: dict | None = None,
-) -> str:
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY is not configured")
-    use_model = (model or OPENROUTER_MODEL).strip()
-    payload: dict = {
-        "model": use_model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-    if response_format is not None:
-        payload["response_format"] = response_format
-    r = requests.post(
-        OPENROUTER_API_URL,
-        headers=_openrouter_headers(),
-        json=payload,
-        timeout=120,
-    )
-    try:
-        data = r.json()
-    except Exception:
-        data = {}
-    if r.status_code >= 400:
-        err = data.get("error")
-        if isinstance(err, dict):
-            msg = err.get("message") or str(err)
-        elif isinstance(err, str):
-            msg = err
-        else:
-            msg = (r.text or "")[:400]
-        raise RuntimeError(msg or f"OpenRouter HTTP {r.status_code}")
+def _openrouter_failover_eligible(http_status: int, err_msg: str) -> bool:
+    """Whether to try the next API key (quota / transient), not e.g. invalid JSON body."""
+    if http_status == 400:
+        return False
+    if http_status in (401, 402, 408, 429, 502, 503, 529):
+        return True
+    m = (err_msg or "").lower()
+    if "rate" in m and "limit" in m:
+        return True
+    if "quota" in m or "exceed" in m:
+        return True
+    if "insufficient" in m:
+        return True
+    return False
+
+
+def _parse_openrouter_message_json(data: dict) -> str:
     choices = data.get("choices") or []
     if not choices:
         raise RuntimeError("OpenRouter returned no choices")
@@ -1161,6 +1172,89 @@ def _openrouter_chat(
     if not text:
         raise RuntimeError("OpenRouter empty response")
     return text
+
+
+def _openrouter_post_once(api_key: str, payload: dict) -> tuple[bool, str, int, str]:
+    """
+    Single OpenRouter HTTP call.
+    Returns (success, text_if_ok, http_status, error_message_on_failure).
+    """
+    r = requests.post(
+        OPENROUTER_API_URL,
+        headers=_openrouter_headers_for(api_key),
+        json=payload,
+        timeout=120,
+    )
+    try:
+        data = r.json()
+    except Exception:
+        data = {}
+    sc = r.status_code
+    if sc == 200:
+        try:
+            return True, _parse_openrouter_message_json(data), 200, ""
+        except Exception as e:
+            return False, "", sc, str(e)
+    err_o = data.get("error")
+    if isinstance(err_o, dict):
+        msg = (err_o.get("message") or str(err_o))[:800]
+    elif isinstance(err_o, str):
+        msg = err_o[:800]
+    else:
+        msg = (r.text or "")[:400]
+    return False, "", sc, msg or f"HTTP {sc}"
+
+
+def _openrouter_vision_model() -> str:
+    v = (OPENROUTER_VISION_MODEL or "").strip()
+    return v if v else OPENROUTER_MODEL
+
+
+def _openrouter_chat(
+    messages: list,
+    *,
+    model: str | None = None,
+    max_tokens: int = 1024,
+    temperature: float = 0.35,
+    response_format: dict | None = None,
+) -> str:
+    if not _OPENROUTER_KEYS:
+        raise RuntimeError(
+            "OpenRouter API keys not configured — set OPENROUTER_API_KEY and/or OPENROUTER_API_KEY_2",
+        )
+    use_model = (model or OPENROUTER_MODEL).strip()
+    payload: dict = {
+        "model": use_model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if response_format is not None:
+        payload["response_format"] = response_format
+
+    n = len(_OPENROUTER_KEYS)
+    start = _next_openrouter_rr_start()
+    last_err = ""
+    last_sc = 0
+
+    for attempt in range(n):
+        k_ix = (start + attempt) % n
+        api_key = _OPENROUTER_KEYS[k_ix]
+        ok, text, sc, err = _openrouter_post_once(api_key, payload)
+        if ok:
+            if attempt > 0:
+                log.info("OpenRouter: OK using key #%s after failover/rotation", k_ix)
+            return text
+        last_err, last_sc = err, sc
+        if not _openrouter_failover_eligible(sc, err):
+            raise RuntimeError(err or f"OpenRouter HTTP {sc}")
+        if attempt < n - 1:
+            log.warning(
+                "OpenRouter key #%s HTTP %s — %s; trying next key",
+                k_ix, sc, (err or "")[:160],
+            )
+
+    raise RuntimeError(last_err or f"OpenRouter HTTP {last_sc} (all keys exhausted)")
 
 
 def _openrouter_text(prompt: str, max_tokens: int = 500) -> str:
@@ -1214,7 +1308,7 @@ def _gemini_json_analysis(prompt: str) -> str:
 
 def _groq_fallback_json_analysis(prompt: str) -> str:
     """After Groq 429: try OpenRouter, then Gemini."""
-    if OPENROUTER_API_KEY:
+    if _openrouter_configured():
         try:
             return _openrouter_json_analysis(prompt)
         except Exception as e:
@@ -1222,13 +1316,13 @@ def _groq_fallback_json_analysis(prompt: str) -> str:
     if GEMINI_KEY:
         return _gemini_json_analysis(prompt)
     raise RuntimeError(
-        "Groq rate-limited: set OPENROUTER_API_KEY and/or GEMINI_KEY for fallback AI"
+        "Groq rate-limited: set OpenRouter (`OPENROUTER_API_KEY` / `OPENROUTER_API_KEY_2`) and/or `GEMINI_KEY` for fallback AI"
     )
 
 
 def _groq_fallback_article_text(prompt: str, max_tokens: int = 500) -> str:
     """After Groq 429 on article: try OpenRouter, then Gemini."""
-    if OPENROUTER_API_KEY:
+    if _openrouter_configured():
         try:
             return _openrouter_text(prompt, max_tokens=max_tokens)
         except Exception as e:
@@ -1236,7 +1330,7 @@ def _groq_fallback_article_text(prompt: str, max_tokens: int = 500) -> str:
     if GEMINI_KEY:
         return _gemini_text(prompt, max_tokens=max_tokens)
     raise RuntimeError(
-        "Groq rate-limited: set OPENROUTER_API_KEY and/or GEMINI_KEY for fallback AI"
+        "Groq rate-limited: set OpenRouter (`OPENROUTER_API_KEY` / `OPENROUTER_API_KEY_2`) and/or `GEMINI_KEY` for fallback AI"
     )
 
 
@@ -2886,7 +2980,7 @@ def _resolved_deep_provider() -> str:
         return "gemini"
     if GEMINI_KEY:
         return "gemini"
-    if OPENROUTER_API_KEY:
+    if _openrouter_configured():
         return "openrouter"
     return "none"
 
@@ -2899,11 +2993,16 @@ def _deep_analysis_config_ok() -> tuple[bool, str]:
     w = _resolved_deep_provider()
     if w == "none":
         return False, (
-            "No AI backend for deep analysis. Set `GEMINI_KEY` and/or `OPENROUTER_API_KEY`, "
+            "No AI backend for deep analysis. Set `GEMINI_KEY` and/or OpenRouter keys "
+            "(`OPENROUTER_API_KEY`, `OPENROUTER_API_KEY_2`), "
             "or adjust `DEEP_ANALYSIS_PROVIDER` (gemini | openrouter | auto)."
         )
-    if w == "openrouter" and not OPENROUTER_API_KEY:
-        return False, "`DEEP_ANALYSIS_PROVIDER` uses OpenRouter but `OPENROUTER_API_KEY` is missing."
+    if w == "openrouter" and not _openrouter_configured():
+        return (
+            False,
+            "`DEEP_ANALYSIS_PROVIDER` uses OpenRouter but no OpenRouter keys are set "
+            "(set `OPENROUTER_API_KEY` and optionally `OPENROUTER_API_KEY_2`).",
+        )
     if w == "gemini" and not GEMINI_KEY:
         return False, "`DEEP_ANALYSIS_PROVIDER` uses Gemini but `GEMINI_KEY` is missing."
     return True, ""
@@ -2919,7 +3018,7 @@ def _resolved_chart_provider() -> str:
         return "gemini"
     if GEMINI_KEY:
         return "gemini"
-    if OPENROUTER_API_KEY:
+    if _openrouter_configured():
         return "openrouter"
     return "none"
 
@@ -2927,9 +3026,15 @@ def _resolved_chart_provider() -> str:
 def _chart_vision_config_ok() -> tuple[bool, str]:
     w = _resolved_chart_provider()
     if w == "none":
-        return False, "Set `GEMINI_KEY` or `OPENROUTER_API_KEY` for chart vision (or `CHART_VISION_PROVIDER`)."
-    if w == "openrouter" and not OPENROUTER_API_KEY:
-        return False, "Chart vision uses OpenRouter but `OPENROUTER_API_KEY` is missing."
+        return False, (
+            "Set `GEMINI_KEY` or OpenRouter keys (`OPENROUTER_API_KEY` / `OPENROUTER_API_KEY_2`) "
+            "for chart vision (or `CHART_VISION_PROVIDER`)."
+        )
+    if w == "openrouter" and not _openrouter_configured():
+        return (
+            False,
+            "Chart vision uses OpenRouter but no OpenRouter keys are configured.",
+        )
     if w == "gemini" and not GEMINI_KEY:
         return False, "Chart vision uses Gemini but `GEMINI_KEY` is missing."
     return True, ""
@@ -4572,6 +4677,13 @@ def main() -> None:
         GROQ_MODEL_SIGNALS,
         MONITOR_INTERVAL_SEC,
     )
+    if _openrouter_configured():
+        log.info(
+            "OpenRouter: %d API key(s) — round-robin + auto-failover on quota (429)",
+            len(_OPENROUTER_KEYS),
+        )
+    else:
+        log.info("OpenRouter: not configured (optional; used after Groq 429 with Gemini fallback)")
 
     app = ApplicationBuilder().token(TOKEN).build()
     _APP_REF = app  # store reference for TV webhook handler
