@@ -429,6 +429,8 @@ def db_access(cid: int) -> dict:
 
 
 DEEP_ANALYSIS_DAILY_LIMIT = 3  # per user per day
+# Long structured report (~8 sections). Gemini 2.5 also bills internal reasoning against this cap.
+DEEP_ANALYSIS_MAX_OUTPUT_TOKENS = 8192
 
 def db_deepanalysis_count_today(cid: int) -> int:
     """Return how many deep analyses this user has used today (UTC)."""
@@ -1638,6 +1640,23 @@ def _openrouter_chat(
     raise RuntimeError(last_err or f"OpenRouter HTTP {last_sc} (all keys exhausted)")
 
 
+def _gemini_content_config(max_output_tokens: int, **extra):
+    """
+    Build GenerateContentConfig for text generation.
+
+    Gemini 2.5 Flash enables internal reasoning by default; those tokens share
+    ``max_output_tokens``, which can truncate visible text almost immediately at
+    moderate limits. ``thinking_budget=0`` disables that so the budget applies
+    to user-visible output (see google-genai ThinkingConfig).
+    """
+    import google.genai.types as gtypes
+
+    kwargs = {"max_output_tokens": max_output_tokens, **extra}
+    if getattr(gtypes, "ThinkingConfig", None) is not None:
+        kwargs["thinking_config"] = gtypes.ThinkingConfig(thinking_budget=0)
+    return gtypes.GenerateContentConfig(**kwargs)
+
+
 def _openrouter_text(prompt: str, max_tokens: int = 500) -> str:
     """Generate plain text via OpenRouter. Used as Groq fallback for articles."""
     return _openrouter_chat(
@@ -1659,13 +1678,12 @@ def _openrouter_json_analysis(prompt: str) -> str:
 def _gemini_text(prompt: str, max_tokens: int = 500) -> str:
     """Generate text via Gemini. Used as Groq fallback after OpenRouter."""
     import google.genai as genai
-    import google.genai.types as gtypes
 
     client = genai.Client(api_key=GEMINI_KEY)
     response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
-        config=gtypes.GenerateContentConfig(max_output_tokens=max_tokens),
+        config=_gemini_content_config(max_tokens),
     )
     return response.text
 
@@ -1673,14 +1691,13 @@ def _gemini_text(prompt: str, max_tokens: int = 500) -> str:
 def _gemini_json_analysis(prompt: str) -> str:
     """Ask Gemini for a JSON trading signal. Groq fallback after OpenRouter."""
     import google.genai as genai
-    import google.genai.types as gtypes
 
     client = genai.Client(api_key=GEMINI_KEY)
     response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
-        config=gtypes.GenerateContentConfig(
-            max_output_tokens=300,
+        config=_gemini_content_config(
+            300,
             response_mime_type="application/json",
         ),
     )
@@ -3452,7 +3469,7 @@ def _openrouter_deep_analysis(pair: str, price: float) -> str:
 
     return _openrouter_chat(
         [{"role": "user", "content": prompt}],
-        max_tokens=1800,
+        max_tokens=DEEP_ANALYSIS_MAX_OUTPUT_TOKENS,
         temperature=0.35,
     )
 
@@ -3460,7 +3477,6 @@ def _openrouter_deep_analysis(pair: str, price: float) -> str:
 def _gemini_deep_analysis(pair: str, price: float) -> str:
     """Run deep analysis using Google Gemini (long-form report)."""
     import google.genai as genai
-    import google.genai.types as gtypes
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         f_tf    = pool.submit(_get_multi_tf_data, pair)
@@ -3486,9 +3502,7 @@ def _gemini_deep_analysis(pair: str, price: float) -> str:
     response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
-        config=gtypes.GenerateContentConfig(
-            max_output_tokens=1800,
-        ),
+        config=_gemini_content_config(DEEP_ANALYSIS_MAX_OUTPUT_TOKENS),
     )
     return response.text
 
@@ -3785,7 +3799,6 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
         else:
             import google.genai as genai
-            import google.genai.types as gtypes
             import PIL.Image
 
             client = genai.Client(api_key=GEMINI_KEY)
@@ -3793,9 +3806,7 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             response = client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=[prompt, image],
-                config=gtypes.GenerateContentConfig(
-                    max_output_tokens=1000,
-                ),
+                config=_gemini_content_config(1000),
             )
             result = response.text
 
