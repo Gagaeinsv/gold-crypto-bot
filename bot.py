@@ -150,8 +150,8 @@ USD_PRO_1       = 9.99
 USD_PRO_3       = 25.00
 USD_DIAMOND_1   = 19.99
 USD_DIAMOND_3   = 49.99
-# NOWPayments/crypto-network minimums: only these bundles reliably clear without bogus surcharges.
-CRYPTO_PAY_ALLOWED = frozenset({("basic", 3), ("pro", 3), ("diamond", 1), ("diamond", 3)})
+# NOWPayments: Basic (incl. 3mo crypto) violates fair price vs gateway minimum — crypto only Pro 3mo + Diamond.
+CRYPTO_PAY_ALLOWED = frozenset({("pro", 3), ("diamond", 1), ("diamond", 3)})
 DB_PATH           = "users.db"
 CHANNEL_HOURS_UTC = [6, 12, 18]   # market analysis posts (UTC)
 ARTICLE_HOURS_UTC = [8, 14, 20]   # article posts — separate from analysis
@@ -4023,7 +4023,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("₮ Basic — 3 mo ($12.5)", callback_data="crypto_pay_basic_3")],
             [InlineKeyboardButton("₮ Pro — 3 mo ($25)", callback_data="crypto_pay_pro_3")],
             [InlineKeyboardButton("₮ Diamond — 1 mo ($19.99)", callback_data="crypto_pay_diamond_1")],
             [InlineKeyboardButton("₮ Diamond — 3 mo ($49.99)", callback_data="crypto_pay_diamond_3")],
@@ -4031,16 +4030,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ])
         crypto_menu_intro = (
             "₮ *Pay with Crypto (USDT TRC20)*\n\n"
-            "*UA:* Обери план — отримаєш адресу й точну суму. Доступ активується після підтвердження в мережі.\n"
-            "*EN:* Pick a plan — you get address + exact amount; access unlocks once the network confirms.\n\n"
-            "⚠️ *Чому немає Basic/Pro на 1 міс криптою?*\n"
-            "Платіжний посередник *NOWPayments* і правила мережі задають мінімальну суму платежу. "
-            "Найдешевші місячні плани через криптомережу часто просто технічно не проходять без великої несправедливої доплати "
-            "(це не наш довільний барʼєр, а умови процесинг-партнера). "
-            "Тому *Basic та Pro ми пропонуємо криптою пакунком на 3 місяці*, а нижчі 1 міс — також через "
-            "*⭐ Telegram Stars* головному меню підписки.\n\n"
-            "*Diamond* можна платити криптою і на *1 міс*, і на *3 міс*.\n\n"
-            "📋 Обери варіант нижче."
+            "*UA:* Отримаєш адресу й *точну кількість USDT*. Підписка увімкнеться після підтвердження мережею.\n"
+            "*EN:* You get address + *exact USDT amount*; access unlocks after network confirmation.\n\n"
+            "⚠️ *Чому немає Basic і коротких планів?*\n"
+            "Мінімальні суми *NOWPayments* і мережі означали б для *Basic* криптом значну доплату "
+            "(наприклад ~$13 замість $12.5 — цього ми свідомо не пропонуємо). Усе *Basic / Pro на 1 міс* й пакунок "
+            "*Basic на 3 міс* доступні через ⭐ у *Subscription*.\n\n"
+            "📋 Тут лише:\n• *Pro — 3 місяці*\n• *Diamond — 1 або 3 міс*"
         )
         await safe_edit(
             q,
@@ -4070,14 +4066,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if (plan_key, months) not in CRYPTO_PAY_ALLOWED:
             denied = (
-                "⚠️ *Цей план недоступний криптою*\n\n"
-                "Платіжний посередник *NOWPayments* і мінімуми мережі встановлюють мінімальну суму платежу. "
-                "Короткі дешеві періоди *Basic / Pro на 1 міс* криптом зазвичай не створюються без великої "
-                "необгрунтованої надбавки — це *вимоги партнера-еквайєра*, не «забаганка» сервісу.\n\n"
+                "⚠️ *Цей план оплатити криптою через це меню не можна*\n\n"
+                "Посередник *NOWPayments* і мінімуми мережі роблять криптоплатіж по *Basic* "
+                "(у тому числі пакету на *3 міс*) або дешевим *Pro на 1 міс* практично неможливим "
+                "*без великої надбавки* до цінника — тому ці тарифи криптом ми не показуємо.\n\n"
                 "*Що робити:*\n"
-                "• оплатити ⭐ через *Subscription*\n"
-                "• або обрати *Basic / Pro на 3 місяці* криптою в попередньому меню\n"
-                "• *Diamond* — криптом і на *1 міс*, і на *3 міс* там само."
+                "• *Basic*, *Pro 1 міс* → оплата ⭐ у *Subscription*\n"
+                "• Криптом тут лише *Pro на 3 міс* й *Diamond* (1 або 3 міс).\n\n"
+                "_Якщо підказка зʼявилась після старої кнопки — онови бота на сервері._"
             )
             await safe_edit(
                 q,
@@ -4134,17 +4130,22 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             if rq is not None and iq is not None and round(float(iq) - float(rq), 4) >= 0.03:
                 lines.append(
-                    f"In USD (NOWPayments minimum): listed *${float(rq):.2f}* → invoiced *${float(iq):.2f}*"
+                    f"Listed menu *${float(rq):.2f}* → *fiat-order field* NOWPayments *${float(iq):.2f}* "
+                    f"(служить для їхнього обмінника; платіж фіксується в USDT нижче)"
                 )
         except (TypeError, ValueError):
             pass
 
         lines += [
             f"Currency: *USDT (TRC20)*",
-            f"Amount: *{amt}*",
+            "",
+            f"💠 *Що платити:* точно *{amt}* USDT (усі десяткові знаки).",
+            f"💠 *What to pay:* exactly *{amt}* USDT (all decimals).",
             f"Address: `{addr}`",
             "",
-            "After payment gets confirmed, your plan will activate automatically.",
+            "💡 Сума в *USD (listed / invoiced)* — довідкова; шлюз конвертує під свій курс, тому вона "
+            "може трохи не збігатися побітово з *USDT*, але зарахують саме той *USDT Amount*.",
+            "_After payment confirms, your plan activates automatically._",
         ]
         if url:
             lines += ["", f"Invoice link: `{url}`"]
