@@ -119,6 +119,27 @@ ADMIN_ID     = int(os.getenv("ADMIN_ID", "123456789"))
 CHANNEL_ID   = os.getenv("CHANNEL_ID",  "@your_channel")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "@your_bot")
 
+
+def bot_telegram_url() -> str:
+    """Canonical https://t.me/… link (bare @username in channels is not always clickable)."""
+    u = (BOT_USERNAME or "").strip()
+    if u.startswith("@"):
+        u = u[1:]
+    if not u or u in ("your_bot", ""):
+        u = "your_bot"
+    return f"https://t.me/{u}"
+
+
+def bot_link_markdown() -> str:
+    """Telegram Markdown: explicit link so channel captions stay tappable."""
+    return f"[{BOT_USERNAME}]({bot_telegram_url()})"
+
+
+def bot_link_html() -> str:
+    """HTML <a href> for parse_mode=HTML channel posts."""
+    return f'<a href="{bot_telegram_url()}">{BOT_USERNAME}</a>'
+
+
 # Groq: use a high-quota model for channel + articles vs a stronger model for per-user signals
 # (free tier: 8b ≈ 14k req/day, 70b ≈ 1k req/day — see Groq dashboard).
 GROQ_MODEL_NEWS    = os.getenv("GROQ_MODEL_NEWS", "llama-3.1-8b-instant")
@@ -2102,7 +2123,7 @@ def groq_channel_post(a: dict, post_type: str) -> str:
         "",
         verdict,
         div,
-        f"🤖 {BOT_USERNAME}",
+        f"🤖 {bot_link_markdown()}",
     ]
     return "\n".join(lines)
 
@@ -2287,10 +2308,10 @@ def format_article_post(topic_type: str, body: str) -> str:
     div = "─" * 30
     if topic_type == "edu":
         header = f"📚 *Educational Post*\n{div}"
-        footer = f"\n{div}\n💡 _Learn more → {BOT_USERNAME}_"
+        footer = f"\n{div}\n💡 _Learn more:_ {bot_link_markdown()}"
     else:
         header = f"📰 *Market News*\n{div}"
-        footer = f"\n{div}\n📊 _Signals & analysis → {BOT_USERNAME}_"
+        footer = f"\n{div}\n📊 _Signals & analysis:_ {bot_link_markdown()}"
     return f"{header}\n\n{body}\n{footer}"
 
 
@@ -3859,7 +3880,7 @@ async def cmd_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "Priority signals\n"
         "3 months — $49.99 🔥 (save 17%)\n\n"
         "🎁 <b>First week FREE</b>\n\n"
-        f"👇 Start → {BOT_USERNAME}"
+        f"👇 Start → {bot_link_html()}"
     )
     try:
         msg = await context.bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
@@ -4821,7 +4842,7 @@ async def _tv_webhook_handler(request) -> "web.Response":
         f"📐 R/R: *1:{rr_pct:.1f}*\n\n"
         f"📊 Score: `{score_bar(score)}`  *{score}/100*\n\n"
         f"⚡ _Source: Pine Script strategy_\n\n"
-        f"▶️ Details → {BOT_USERNAME}"
+        f"▶️ Details → {bot_link_markdown()}"
     )
 
     # Get the bot application from global context
