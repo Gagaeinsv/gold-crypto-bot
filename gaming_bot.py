@@ -21,14 +21,11 @@ import sqlite3
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
-from html import escape as html_escape
 from typing import Optional
-from urllib.parse import urlparse, urlencode
 
 import httpx
 from dotenv import load_dotenv
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
-from telegram.constants import ParseMode
+from telegram import Bot
 from telegram.error import TelegramError
 
 # ──────────────────────── Logging ─────────────────────────────────────────────
@@ -53,13 +50,29 @@ GEMINI_KEY      = os.getenv("GEMINI_KEY", "")             # https://aistudio.goo
 ADMIN_ID        = int(os.getenv("ADMIN_ID", "0"))
 
 GEMINI_MODEL    = "gemini-2.5-flash"
-BOT_VERSION     = "1.3.0"   # plain URL in caption (log on start)
+BOT_VERSION     = "1.4.0"   # news-first feed, rate limits, diverse giveaways
 
 DB_PATH         = "gaming_bot.db"
-CHECK_INTERVAL  = 15 * 60          # check sources every 15 minutes
-MIN_POST_GAP    = 30 * 60          # at least 30 min between posts to avoid spam
-FALLBACK_HOURS  = 84               # if no news in 84 h (~3.5 days) → force a post
+CHECK_INTERVAL  = 20 * 60          # check sources every 20 minutes
+MIN_POST_GAP    = 6 * 60 * 60      # min 6 hours between any two posts
+MAX_POSTS_PER_CYCLE = 1            # at most one post per check cycle
+MAX_POSTS_PER_DAY   = 4            # hard daily cap
+MAX_GIVEAWAYS_PER_DAY  = 1
+MAX_GIVEAWAYS_PER_WEEK = 3
+MIN_HOURS_BETWEEN_GIVEAWAYS = 36
+FALLBACK_HOURS  = 84               # if nothing posted in 84 h → allow one post anyway
 MAX_POST_LENGTH = 1024             # Telegram caption limit
+
+# Major stores only for giveaways (skip itch/indiegala flood from aggregators)
+GIVEAWAY_STORE_PRIORITY = (
+    ("epic",   "epicgames.com"),
+    ("steam",  "steampowered.com"),
+    ("gog",    "gog.com"),
+    ("ps",     "playstation.com"),
+    ("xbox",   "xbox.com"),
+    ("nintendo", "nintendo.com"),
+)
+GIVEAWAY_STORE_SKIP = ("itch.io", "indiegala.com", "onstove.com", "gamerpower.com")
 
 # ──────────────────────── RSS News Sources ────────────────────────────────────
 RSS_SOURCES = [
@@ -235,6 +248,136 @@ def hours_since_last_post(conn: sqlite3.Connection) -> float:
     if not last:
         return 9999.0
     return (time.time() - last) / 3600
+
+def count_posts_since(conn: sqlite3.Connection, hours: float, category: Optional[str] = None) -> int:
+    since = time.time() - hours * 3600
+    if category:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM posted WHERE posted_at > ? AND category = ?",
+            (since, category),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM posted WHERE posted_at > ?", (since,)
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+def hours_since_last_category(conn: sqlite3.Connection, category: str) -> float:
+    last = conn.execute(
+        "SELECT MAX(posted_at) FROM posted WHERE category = ?", (category,)
+    ).fetchone()[0]
+    if not last:
+        return 9999.0
+    return (time.time() - last) / 3600
+
+def giveaway_store_key(url: str) -> str:
+    url = (url or "").lower()
+    for key, domain in GIVEAWAY_STORE_PRIORITY:
+        if domain in url:
+            return key
+    return "other"
+
+def recent_giveaway_stores(conn: sqlite3.Connection, days: int = 7) -> set[str]:
+    since = time.time() - days * 86400
+    rows = conn.execute(
+        "SELECT url FROM posted WHERE category = 'giveaway' AND posted_at > ?",
+        (since,),
+    ).fetchall()
+    return {giveaway_store_key(r[0]) for r in rows if r[0]}
+
+def is_quality_giveaway(article: dict) -> bool:
+    """Skip obscure indie-aggregator spam; keep major store deals."""
+    url = (article.get("url") or "").lower()
+    if any(skip in url for skip in GIVEAWAY_STORE_SKIP):
+        return False
+    if any(domain in url for _, domain in GIVEAWAY_STORE_PRIORITY):
+        return True
+    return giveaway_store_key(url) == "other" and "free" in (article.get("title") or "").lower()
+
+def pick_diverse_giveaway(giveaways: list[dict], conn: sqlite3.Connection) -> Optional[dict]:
+    """Pick one giveaway, preferring a store not used in the last week."""
+    recent = recent_giveaway_stores(conn)
+    by_store: dict[str, list[dict]] = {}
+    for g in giveaways:
+        if not is_quality_giveaway(g):
+            continue
+        by_store.setdefault(giveaway_store_key(g.get("url", "")), []).append(g)
+
+    for key, _domain in GIVEAWAY_STORE_PRIORITY:
+        if key in by_store and key not in recent:
+            return by_store[key][0]
+
+    for key, _domain in GIVEAWAY_STORE_PRIORITY:
+        if key in by_store:
+            return by_store[key][0]
+
+    return None
+
+def can_post_giveaway(conn: sqlite3.Connection) -> bool:
+    if count_posts_since(conn, 24, "giveaway") >= MAX_GIVEAWAYS_PER_DAY:
+        return False
+    if count_posts_since(conn, 168, "giveaway") >= MAX_GIVEAWAYS_PER_WEEK:
+        return False
+    if hours_since_last_category(conn, "giveaway") < MIN_HOURS_BETWEEN_GIVEAWAYS:
+        return False
+    return True
+
+def select_articles_for_cycle(articles: list[dict], conn: sqlite3.Connection) -> list[dict]:
+    """
+    News-first scheduling: usually one news item; giveaways rarely, rotated across stores.
+    """
+    if count_posts_since(conn, 24) >= MAX_POSTS_PER_DAY:
+        log.info("Daily post cap reached (%d)", MAX_POSTS_PER_DAY)
+        return []
+
+    news     = [a for a in articles if a.get("category") == "news"]
+    releases = [a for a in articles if a.get("category") == "release"]
+    giveaways = [a for a in articles if a.get("category") == "giveaway"]
+
+    # News and releases: newest first
+    def by_date(a):
+        pd = a.get("pub_date")
+        return pd.timestamp() if pd else 0
+
+    news.sort(key=by_date, reverse=True)
+    releases.sort(key=by_date, reverse=True)
+
+    # Giveaway only after at least 3 news posts since the last giveaway
+    last_gv = conn.execute(
+        "SELECT MAX(posted_at) FROM posted WHERE category = 'giveaway'"
+    ).fetchone()[0]
+    news_after_giveaway = 999
+    if last_gv:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM posted WHERE category = 'news' AND posted_at > ?",
+            (last_gv,),
+        ).fetchone()
+        news_after_giveaway = int(row[0]) if row else 0
+
+    want_giveaway = (
+        can_post_giveaway(conn)
+        and giveaways
+        and news_after_giveaway >= 3
+    )
+
+    if want_giveaway:
+        pick = pick_diverse_giveaway(giveaways, conn)
+        if pick:
+            log.info("Selected giveaway from store: %s", giveaway_store_key(pick.get("url", "")))
+            return [pick]
+
+    if news:
+        return [news[0]]
+    if releases:
+        return [releases[0]]
+
+    # Last resort: giveaway if allowed and nothing else
+    if can_post_giveaway(conn) and giveaways:
+        pick = pick_diverse_giveaway(giveaways, conn)
+        if pick:
+            return [pick]
+
+    return []
 
 # ──────────────────────── Helpers ─────────────────────────────────────────────
 
@@ -540,7 +683,7 @@ async def fetch_gamerpower_giveaways(client: httpx.AsyncClient) -> list[dict]:
 
     giveaways = []
     pending: list[dict] = []
-    for item in items[:20]:
+    for item in items[:12]:
         if item.get("status") != "Active":
             continue
         title    = item.get("title", "")
@@ -621,6 +764,8 @@ async def fetch_epic_free_games(client: httpx.AsyncClient) -> list[dict]:
             continue
 
         title = el.get("title", "")
+        if "mystery" in title.lower():
+            continue
         url   = epic_store_url(el)
         desc  = clean_html(el.get("description", ""))
 
@@ -648,6 +793,8 @@ async def fetch_epic_free_games(client: httpx.AsyncClient) -> list[dict]:
             "pub_date": datetime.now(timezone.utc),
             "image_fallback": "https://store.epicgames.com/static/images/og-epic-games-store.png",
         })
+        if len(games) >= 3:
+            break
     return games
 
 async def fetch_steam_free_games(client: httpx.AsyncClient) -> list[dict]:
@@ -666,7 +813,7 @@ async def fetch_steam_free_games(client: httpx.AsyncClient) -> list[dict]:
 
     games = []
     specials = payload.get("specials", {}).get("items", [])
-    for item in specials[:5]:
+    for item in specials[:3]:
         if item.get("final_price", 1) != 0:
             continue
         title = item.get("name", "")
@@ -905,9 +1052,24 @@ async def send_post(
 
 # ──────────────────────── Dedup & Priority Sort ───────────────────────────────
 
+def _dedup_key(a: dict) -> str:
+    """Collapse same game from GamerPower + Epic/Steam APIs."""
+    url = (a.get("url") or "").lower()
+    m = re.search(r"steampowered\.com/app/(\d+)", url)
+    if m:
+        return f"steam:{m.group(1)}"
+    m = re.search(r"epicgames\.com/(?:uk/)?p/([\w\-]+)", url)
+    if m and m.group(1) not in ("[]",):
+        return f"epic:{m.group(1)}"
+    m = re.search(r"gog\.com/game/([\w\-_]+)", url)
+    if m:
+        return f"gog:{m.group(1)}"
+    title_key = re.sub(r"[^a-zA-Z0-9]", "", (a.get("title") or "")).lower()[:50]
+    return f"{a.get('category')}:{title_key}"
+
 def deduplicate(articles: list[dict], conn: sqlite3.Connection) -> list[dict]:
     seen_hashes = set()
-    seen_titles = set()
+    seen_keys = set()
     result = []
     for a in articles:
         h = make_hash(a.get("url", ""), a.get("title", ""))
@@ -915,25 +1077,13 @@ def deduplicate(articles: list[dict], conn: sqlite3.Connection) -> list[dict]:
             continue
         if h in seen_hashes:
             continue
-        # Fuzzy title dedup — skip nearly identical titles
-        title_key = re.sub(r"[^a-zA-Z0-9А-ЯҐЄІЇа-яґєії]", "", a.get("title", "")).lower()[:60]
-        if title_key and title_key in seen_titles:
+        dkey = _dedup_key(a)
+        if dkey in seen_keys:
             continue
         seen_hashes.add(h)
-        seen_titles.add(title_key)
+        seen_keys.add(dkey)
         result.append(a)
     return result
-
-CATEGORY_PRIORITY = {"giveaway": 0, "release": 1, "news": 2, "update": 3}
-
-def prioritize(articles: list[dict]) -> list[dict]:
-    """Sort articles: giveaways first, then releases, then news. Newest first within category."""
-    def sort_key(a):
-        cat_p = CATEGORY_PRIORITY.get(a.get("category", "news"), 5)
-        pd    = a.get("pub_date")
-        ts    = pd.timestamp() if pd else 0
-        return (cat_p, -ts)
-    return sorted(articles, key=sort_key)
 
 # ──────────────────────── Main Polling Loop ───────────────────────────────────
 
@@ -945,9 +1095,10 @@ async def collect_all_news(client: httpx.AsyncClient) -> list[dict]:
     for source in RSS_SOURCES:
         tasks.append(fetch_rss(client, source))
 
-    # Giveaways (GamerPower resolves to real Steam/Epic/itch links)
+    # Giveaways: aggregator + official store APIs (deduped later)
     tasks.append(fetch_gamerpower_giveaways(client))
-    # Epic/Steam direct APIs often duplicate GamerPower with worse URLs — skip
+    tasks.append(fetch_epic_free_games(client))
+    tasks.append(fetch_steam_free_games(client))
 
     # Upcoming releases
     tasks.append(fetch_rawg_releases(client))
@@ -979,9 +1130,10 @@ async def run_bot():
         log.error("Cannot connect to Telegram: %s", exc)
         return
 
-    # Track last time we actually posted (for the fallback mechanism)
-    last_post_time: float = time.time() - (FALLBACK_HOURS * 3600 / 2)
-
+    log.info(
+        "Limits: %dh between posts, max %d/day, giveaways max %d/day %d/week",
+        MIN_POST_GAP // 3600, MAX_POSTS_PER_DAY, MAX_GIVEAWAYS_PER_DAY, MAX_GIVEAWAYS_PER_WEEK,
+    )
     log.info("Starting polling loop — check interval: %d min", CHECK_INTERVAL // 60)
 
     async with httpx.AsyncClient(headers=_BROWSER_HEADERS, timeout=30) as client:
@@ -990,36 +1142,41 @@ async def run_bot():
                 log.info("Fetching all news sources...")
                 articles = await collect_all_news(client)
                 articles = deduplicate(articles, conn)
-                articles = prioritize(articles)
 
-                log.info("Found %d new articles after dedup", len(articles))
+                log.info(
+                    "Queue after dedup: %d total (%d news, %d giveaway, %d release)",
+                    len(articles),
+                    sum(1 for a in articles if a.get("category") == "news"),
+                    sum(1 for a in articles if a.get("category") == "giveaway"),
+                    sum(1 for a in articles if a.get("category") == "release"),
+                )
 
                 hours_since = hours_since_last_post(conn)
                 is_fallback = hours_since >= FALLBACK_HOURS
-                post_count  = 0
-                max_posts_per_cycle = 5  # don't spam
 
-                for article in articles:
-                    if post_count >= max_posts_per_cycle:
-                        break
+                if hours_since * 3600 < MIN_POST_GAP and not is_fallback:
+                    log.info(
+                        "Skip cycle: %.1f h since last post (min %d h)",
+                        hours_since, MIN_POST_GAP // 3600,
+                    )
+                else:
+                    to_post = select_articles_for_cycle(articles, conn)
+                    if is_fallback and not to_post and articles:
+                        # Guarantee min 2 posts/week — pick best news
+                        news = [a for a in articles if a.get("category") == "news"]
+                        to_post = [news[0] if news else articles[0]]
+                        log.info("Fallback post (nothing new in queue)")
 
-                    # Respect minimum gap between posts (except on fallback)
-                    if post_count > 0 and not is_fallback:
-                        await asyncio.sleep(MIN_POST_GAP)
+                    post_count = 0
+                    for article in to_post[:MAX_POSTS_PER_CYCLE]:
+                        posted = await send_post(bot, article, conn, client)
+                        if posted:
+                            post_count += 1
 
-                    posted = await send_post(bot, article, conn, client)
-                    if posted:
-                        post_count += 1
-                        last_post_time = time.time()
-                        is_fallback = False
-                        # Small delay between consecutive posts in same cycle
-                        if post_count < max_posts_per_cycle:
-                            await asyncio.sleep(5)
+                    if post_count == 0:
+                        log.info("Nothing to post this cycle")
 
-                if post_count == 0 and is_fallback:
-                    log.warning("No new news found — hours since last post: %.1f h", hours_since)
-
-                log.info("Cycle done. Posted: %d. Next check in %d min.", post_count, CHECK_INTERVAL // 60)
+                log.info("Cycle done. Next check in %d min.", CHECK_INTERVAL // 60)
 
             except Exception as exc:
                 log.error("Unexpected error in main loop: %s", exc, exc_info=True)
