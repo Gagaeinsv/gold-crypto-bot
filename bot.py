@@ -11,8 +11,8 @@ def fix_markdown(text: str) -> str:
 Gold & Crypto AI Signals Bot
 Run: python bot.py
 Dependencies: pip install python-telegram-bot[job-queue] requests groq google-genai pillow yfinance pandas pandas-ta python-dotenv
-Env: GROQ_KEY; GEMINI_KEY + GEMINI_MODEL for Gemini; OPENROUTER_* for OpenRouter;
-     optional DEEP_ANALYSIS_PROVIDER / CHART_VISION_PROVIDER: gemini | openrouter | auto
+Env: GROQ_MODEL_NEWS (channel/articles, high daily quota), GROQ_MODEL_SIGNALS (user analysis;
+     legacy GROQ_MODEL overrides signals only). MONITOR_INTERVAL_SEC for scheduler cadence.
 """
 
 import asyncio
@@ -88,7 +88,18 @@ ADMIN_ID     = int(os.getenv("ADMIN_ID", "123456789"))
 CHANNEL_ID   = os.getenv("CHANNEL_ID",  "@your_channel")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "@your_bot")
 
-GROQ_MODEL   = "llama-3.1-8b-instant"
+# Groq: use a high-quota model for channel + articles vs a stronger model for per-user signals
+# (free tier: 8b ≈ 14k req/day, 70b ≈ 1k req/day — see Groq dashboard).
+GROQ_MODEL_NEWS    = os.getenv("GROQ_MODEL_NEWS", "llama-3.1-8b-instant")
+GROQ_MODEL_SIGNALS = os.getenv("GROQ_MODEL_SIGNALS", "llama-3.3-70b-versatile")
+_LEGACY_GROQ_MODEL  = os.getenv("GROQ_MODEL", "").strip()
+if _LEGACY_GROQ_MODEL:
+    log.warning(
+        "GROQ_MODEL is deprecated; set GROQ_MODEL_NEWS (channel/articles) and "
+        "GROQ_MODEL_SIGNALS (user analysis / auto-signals). Using GROQ_MODEL=%s for signals only.",
+        _LEGACY_GROQ_MODEL,
+    )
+    GROQ_MODEL_SIGNALS = _LEGACY_GROQ_MODEL
 GROQ_TIMEOUT = 20
 
 # Long-form deep analysis & chart vision: see DEEP_ANALYSIS_PROVIDER / CHART_VISION_PROVIDER (default: gemini).
@@ -111,6 +122,9 @@ USD_DIAMOND_3   = 49.99
 DB_PATH           = "users.db"
 CHANNEL_HOURS_UTC = [6, 12, 18]   # market analysis posts (UTC)
 ARTICLE_HOURS_UTC = [8, 14, 20]   # article posts — separate from analysis
+# Background job interval (seconds). Channel Groq runs only when the hour hits
+# CHANNEL_HOURS_UTC / ARTICLE_HOURS_UTC — not on every tick.
+MONITOR_INTERVAL_SEC = max(15, int(os.getenv("MONITOR_INTERVAL_SEC", "60")))
 AUTO_COOLDOWN     = 30 * 60        # seconds between auto-signals
 
 PAIRS: dict = {
@@ -1238,7 +1252,7 @@ def _make_sl_tp(price: float, direction: str, sl_pct: float, tp_pct: float) -> t
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Groq analysis  (ONE call per full_analysis — OpenRouter then Gemini on 429)
+#  Groq analysis  (model chosen per call: NEWS vs SIGNALS; then OpenRouter / Gemini on 429)
 # ═══════════════════════════════════════════════════════════════════
 
 def _normalize_confidence(raw_conf) -> int:
@@ -1258,7 +1272,7 @@ def _groq_client():
 
 
 def groq_analysis(news_text: str, price: float, tech: dict,
-                  trend: str, vol: str, pair: str) -> dict:
+                  trend: str, vol: str, pair: str, groq_model: str) -> dict:
     cfg     = PAIRS[pair]
     sl_hint = cfg["sl_pct"]
     tp_hint = cfg["tp_pct"]
@@ -1304,7 +1318,7 @@ def groq_analysis(news_text: str, price: float, tech: dict,
         )
         try:
             raw = _groq_client().chat.completions.create(
-                model=GROQ_MODEL, timeout=GROQ_TIMEOUT,
+                model=groq_model, timeout=GROQ_TIMEOUT,
                 messages=[{"role": "user", "content": analysis_prompt}],
                 temperature=0.3, max_tokens=280,
             ).choices[0].message.content
@@ -1454,10 +1468,14 @@ def _direction(ai: dict, trend: str, tech: dict | None) -> tuple[str, str]:
     return "SELL", "📉"
 
 
-def full_analysis(price: float, prev: float | None, pair: str) -> dict:
+def full_analysis(price: float, prev: float | None, pair: str,
+                  groq_model: str | None = None) -> dict:
     """
     Run all data fetching in parallel using threads.
     Total time = max(slowest request) instead of sum of all requests.
+
+    ``groq_model`` — Groq chat model id. Default: ``GROQ_MODEL_SIGNALS`` (user-facing).
+    Channel / admin broadcast: pass ``GROQ_MODEL_NEWS`` (higher free-tier quota).
     """
     import concurrent.futures as cf
 
@@ -1491,8 +1509,9 @@ def full_analysis(price: float, prev: float | None, pair: str) -> dict:
         except Exception:
             econ = {"has_danger": False, "events": []}
 
+    use_llm = groq_model if groq_model is not None else GROQ_MODEL_SIGNALS
     # Groq call after parallel fetch (needs tech + news)
-    ai    = groq_analysis(news, price, tech, trend, vol, pair)
+    ai    = groq_analysis(news, price, tech, trend, vol, pair, use_llm)
     score = _calc_score(tech, ai, econ, trend, vol)
 
     return dict(pair=pair, price=price, trend=trend, vol=vol,
@@ -1797,7 +1816,7 @@ def groq_article(topic_type: str, topic: str) -> str:
         )
     try:
         result = _groq_client().chat.completions.create(
-            model=GROQ_MODEL, timeout=GROQ_TIMEOUT,
+            model=GROQ_MODEL_NEWS, timeout=GROQ_TIMEOUT,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.5, max_tokens=500,
         ).choices[0].message.content.strip()
@@ -2605,7 +2624,9 @@ async def cmd_forcepost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("❌ Could not get price.")
         return
 
-    a    = await asyncio.to_thread(full_analysis, price, _prev_prices.get(pair), pair)
+    a    = await asyncio.to_thread(
+        full_analysis, price, _prev_prices.get(pair), pair, GROQ_MODEL_NEWS,
+    )
     text = groq_channel_post(a, post_type)
     try:
         sent = await safe_send_photo(context.bot, CHANNEL_ID, cfg["image"], text)
@@ -3731,7 +3752,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             loop = asyncio.get_event_loop()
             a = await asyncio.wait_for(
-                loop.run_in_executor(None, full_analysis, price_val, _prev_prices.get(pair), pair),
+                loop.run_in_executor(
+                    None,
+                    lambda pr=price_val, prev=_prev_prices.get(pair), pk=pair: full_analysis(
+                        pr, prev, pk,
+                    ),
+                ),
                 timeout=45,   # increased: parallel fetch ~15s + groq ~20s
             )
         except asyncio.TimeoutError:
@@ -3883,7 +3909,8 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
         now_utc = datetime.now(UTC)
         h = now_utc.hour
 
-        # 2) Market analysis posts (with image)
+        # 2) Channel market-analysis posts — Groq only in CHANNEL_HOURS_UTC (~few times/day),
+        #    using GROQ_MODEL_NEWS (high daily quota), not every monitor tick.
         if h in CHANNEL_HOURS_UTC and h != _last_channel_post_hour:
             _last_channel_post_hour = h
             for pair in PAIRS:
@@ -3892,7 +3919,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                     continue
                 try:
                     a    = await asyncio.to_thread(
-                        full_analysis, price, _prev_prices.get(pair), pair,
+                        full_analysis, price, _prev_prices.get(pair), pair, GROQ_MODEL_NEWS,
                     )
                     text = groq_channel_post(a, post_type_for_hour(h))
                     cfg  = PAIRS[pair]
@@ -3912,7 +3939,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                 except Exception as e:
                     log.error("Channel post error (%s): %s", pair, e)
 
-        # 3) Article posts (with image)
+        # 3) Educational / news articles — Groq only in ARTICLE_HOURS_UTC, GROQ_MODEL_NEWS via groq_article().
         if h in ARTICLE_HOURS_UTC and h != _last_article_hour:
             _last_article_hour = h
             topic_type = "edu" if _article_index % 2 == 0 else "news"
@@ -3929,7 +3956,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception as e:
                 log.error("Article post error: %s", e)
 
-        # 4) Per-user trade monitoring + auto-signals
+        # 4) Per-user trade monitoring + auto-signals (GROQ_MODEL_SIGNALS via full_analysis default)
         for cid, u in list(USERS.items()):
             acc = db_access(cid)
             if not acc["allowed"]:
@@ -3976,7 +4003,9 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                     if time.time() - ps.last_signal_time > cooldown:
                         prev = _prev_prices.get(pair)
                         if prev:
-                            a = await asyncio.to_thread(full_analysis, price, prev, pair)
+                            a = await asyncio.to_thread(
+                                full_analysis, price, prev, pair,
+                            )
                             if a["score"] >= score_min and a["score"] > ps.last_signal_score:
                                 priority_tag = " 💠 *Priority*" if plan == "diamond" else ""
                                 text = (build_analysis_text(a)
@@ -4537,6 +4566,12 @@ def main() -> None:
     global _APP_REF
     db_init()
     log.info("DB initialised. Starting bot…")
+    log.info(
+        "Groq: channel/articles=%s | user signals=%s | monitor interval=%ss",
+        GROQ_MODEL_NEWS,
+        GROQ_MODEL_SIGNALS,
+        MONITOR_INTERVAL_SEC,
+    )
 
     app = ApplicationBuilder().token(TOKEN).build()
     _APP_REF = app  # store reference for TV webhook handler
@@ -4556,7 +4591,7 @@ def main() -> None:
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
-    app.job_queue.run_repeating(monitor, interval=60, first=15)
+    app.job_queue.run_repeating(monitor, interval=MONITOR_INTERVAL_SEC, first=15)
 
     # Start TradingView webhook server
     async def post_init(application):
