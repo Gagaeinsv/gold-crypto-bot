@@ -53,6 +53,7 @@ GEMINI_KEY      = os.getenv("GEMINI_KEY", "")             # https://aistudio.goo
 ADMIN_ID        = int(os.getenv("ADMIN_ID", "0"))
 
 GEMINI_MODEL    = "gemini-2.5-flash"
+BOT_VERSION     = "1.3.0"   # plain URL in caption (log on start)
 
 DB_PATH         = "gaming_bot.db"
 CHECK_INTERVAL  = 15 * 60          # check sources every 15 minutes
@@ -281,6 +282,29 @@ def normalize_article_url(url: str) -> str:
         return ""
     return url
 
+def normalize_store_url(url: str) -> str:
+    """Fix known-bad store URLs (Epic slugs, locale, GamerPower leftovers)."""
+    url = normalize_article_url(url)
+    if not url:
+        return ""
+    if "gamerpower.com" in url:
+        return ""  # force re-resolve; never post intermediary pages
+    if "/p/[]" in url or url.rstrip("/").endswith("/p"):
+        return "https://store.epicgames.com/uk/free-games"
+    # Epic without /uk/ → Ukrainian store (GamerPower redirects often omit locale)
+    m = re.match(r"(https://store\.epicgames\.com)/p/([\w\-]+)/?$", url, re.I)
+    if m:
+        return f"{m.group(1)}/uk/p/{m.group(2)}"
+    return url
+
+def strip_urls_from_text(text: str) -> str:
+    """Remove URLs from AI/RSS text so users don't click wrong links in the body."""
+    if not text:
+        return ""
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
 def pick_epic_slug(product_slug: object, url_slug: object) -> str:
     """Epic API sometimes returns productSlug as the literal string '[]'."""
     for raw in (product_slug, url_slug):
@@ -303,17 +327,12 @@ def epic_store_url(el: dict) -> str:
         return f"https://store.epicgames.com/uk/p/{slug}"
     return "https://store.epicgames.com/uk/free-games"
 
-def escape_href(url: str) -> str:
-    """Escape URL for Telegram HTML href attribute."""
-    return html_escape(url, quote=True).replace("&", "&amp;")
-
-def build_url_keyboard(url: str, category: str) -> Optional[InlineKeyboardMarkup]:
-    """Telegram button with URL — reliable, unlike HTML <a> in long captions."""
-    url = normalize_article_url(url)
-    if not url:
-        return None
-    label = "🎁 Забрати гру" if category == "giveaway" else "📖 Читати статтю"
-    return InlineKeyboardMarkup([[InlineKeyboardButton(text=label, url=url)]])
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+}
 
 async def resolve_final_url(client: httpx.AsyncClient, url: str) -> str:
     """
@@ -322,23 +341,29 @@ async def resolve_final_url(client: httpx.AsyncClient, url: str) -> str:
     url = normalize_article_url(url)
     if not url:
         return ""
-    if "gamerpower.com/open/" not in url:
-        return url
+    if "gamerpower.com" not in url:
+        return normalize_store_url(url)
+
     try:
-        resp = await client.head(url, follow_redirects=True, timeout=15)
-        final = normalize_article_url(str(resp.url))
-        if final and "gamerpower.com/open/" not in final:
+        resp = await client.get(
+            url, follow_redirects=True, timeout=20, headers=_BROWSER_HEADERS
+        )
+        final = normalize_store_url(str(resp.url))
+        if final and "gamerpower.com" not in final:
             return final
-    except Exception:
-        pass
-    try:
-        resp = await client.get(url, follow_redirects=True, timeout=15)
-        final = normalize_article_url(str(resp.url))
-        if final and "gamerpower.com/open/" not in final:
-            return final
+        # Some pages use HTML/JS redirect — parse store link from body
+        if resp.status_code == 200 and resp.text:
+            for pattern in (
+                r'https://store\.steampowered\.com/app/\d+[^\s"\'<>]*',
+                r'https://store\.epicgames\.com(?:/uk)?/p/[\w\-]+',
+                r'https://[\w\-]+\.itch\.io/[\w\-]+',
+            ):
+                m = re.search(pattern, resp.text)
+                if m:
+                    return normalize_store_url(m.group(0))
     except Exception as exc:
         log.warning("Redirect resolve failed for %s: %s", url, exc)
-    return url
+    return ""
 
 def extract_image_from_rss_entry(entry_xml: ET.Element, ns: dict) -> Optional[str]:
     """Try to extract an image URL from an RSS entry XML element."""
@@ -553,8 +578,11 @@ async def fetch_gamerpower_giveaways(client: httpx.AsyncClient) -> list[dict]:
         )
         for g, final in zip(pending, resolved):
             if isinstance(final, str) and final:
-                g["url"] = final
-            giveaways.append(g)
+                g["url"] = normalize_store_url(final)
+            if g.get("url"):
+                giveaways.append(g)
+            else:
+                log.warning("Giveaway skipped (no store URL): %s", g.get("title", "")[:50])
 
     return giveaways
 
@@ -740,7 +768,7 @@ def _gemini_rewrite(title: str, summary: str, category: str, source: str, url: s
 2. Починай одразу з суті — без вступних фраз типу "Ось новина" або "Привіт".
 3. Обсяг: 2–4 речення (максимум 300 символів тексту без заголовку).
 4. Додавай 1–2 доречних емодзі в тексті — не переборщуй.
-5. НЕ додавай посилань, хештегів, підписів "#реклама" чи будь-яких HTML-тегів — тільки чистий текст.
+5. НЕ додавай посилань (жодних URL), хештегів, підписів "#реклама" чи будь-яких HTML-тегів — тільки чистий текст.
 6. НЕ вигадуй деталей яких немає в оригіналі.
 7. {hint}
 
@@ -773,40 +801,40 @@ def _gemini_rewrite(title: str, summary: str, category: str, source: str, url: s
 
 def format_post(article: dict, ai_body: Optional[str] = None) -> str:
     """
-    Build caption text. URL goes in an inline button (see build_url_keyboard),
-    NOT in HTML — long captions used to truncate mid-href and break links.
+    Plain-text caption with URL on its own line (Telegram auto-linkifies it).
+    No HTML — avoids broken <a> tags; no reliance on inline buttons in channels.
     """
     cat      = article.get("category", "news")
     emoji    = CATEGORY_EMOJI.get(cat, "🎮")
     source   = article.get("source", "")
     title    = article.get("title", "Без назви")
-    summary  = article.get("summary", "")
+    url      = normalize_store_url(article.get("url", ""))
 
     platform = article.get("platform", "")
     plat_em  = PLATFORM_EMOJI.get(platform, "") if platform else ""
 
-    header = f"{emoji}{plat_em} <b>{html_escape(title)}</b>\n\n"
-    footer = f"\n\n📰 <i>Джерело: {html_escape(source)}</i>" if source else ""
-    hint   = "\n\n👇 Посилання — кнопкою нижче" if normalize_article_url(article.get("url", "")) else ""
+    raw_body = ai_body if ai_body else (article.get("summary", "")[:600] if article.get("summary") else "")
+    body     = strip_urls_from_text(raw_body)
 
-    body = html_escape(ai_body) if ai_body else html_escape(summary[:600] if summary else "")
+    link_block = f"\n\n🔗 Посилання:\n{url}" if url else ""
+    src_block  = f"\n\n📰 Джерело: {source}" if source else ""
+    header     = f"{emoji}{plat_em} {title}\n\n"
 
-    # Reserve space for header, footer, hint — never truncate the button URL
-    budget = MAX_POST_LENGTH - len(header) - len(footer) - len(hint) - 4
-    if len(body) > budget > 0:
+    budget = MAX_POST_LENGTH - len(header) - len(link_block) - len(src_block) - 4
+    if body and budget > 20 and len(body) > budget:
         body = body[: budget - 3].rstrip() + "..."
 
-    return header + body + hint + footer
+    text = header + (body + link_block + src_block if body else link_block.lstrip() + src_block)
+    return text[:MAX_POST_LENGTH]
 
 # ──────────────────────── Telegram Poster ─────────────────────────────────────
 
 async def finalize_article_url(client: httpx.AsyncClient, article: dict) -> None:
     """Ensure article URL is the final store/article page before posting."""
-    url = normalize_article_url(article.get("url", ""))
-    if not url:
-        return
-    if "gamerpower.com/open/" in url:
-        url = await resolve_final_url(client, url)
+    url = normalize_store_url(article.get("url", ""))
+    if not url or "gamerpower.com" in url:
+        resolved = await resolve_final_url(client, article.get("url", "") or url)
+        url = normalize_store_url(resolved)
     article["url"] = url
 
 async def send_post(
@@ -819,9 +847,13 @@ async def send_post(
     if client:
         await finalize_article_url(client, article)
 
-    url   = normalize_article_url(article.get("url", ""))
+    url   = normalize_store_url(article.get("url", ""))
     title = article.get("title", "")
-    h     = make_hash(url, title)
+    if not url:
+        log.warning("Skip post without valid URL: %s", title[:60])
+        return False
+
+    h = make_hash(url, title)
     if is_posted(conn, h):
         return False
 
@@ -844,20 +876,19 @@ async def send_post(
         except Exception as exc:
             log.warning("Gemini executor error: %s", exc)
 
-    caption  = format_post(article, ai_body=ai_body)
-    image    = article.get("image") or article.get("image_fallback") or ""
-    keyboard = build_url_keyboard(url, article.get("category", "news"))
-    send_kw  = {"chat_id": CHANNEL_ID, "parse_mode": ParseMode.HTML, "reply_markup": keyboard}
+    if ai_body:
+        ai_body = strip_urls_from_text(ai_body)
+
+    caption = format_post(article, ai_body=ai_body)
+    image   = article.get("image") or article.get("image_fallback") or ""
+    # Plain text + raw URL line — most reliable in Telegram channels
+    send_kw = {"chat_id": CHANNEL_ID}
 
     try:
         if image:
             await bot.send_photo(photo=image, caption=caption, **send_kw)
         else:
-            await bot.send_message(
-                text=caption,
-                disable_web_page_preview=True,
-                **send_kw,
-            )
+            await bot.send_message(text=caption, disable_web_page_preview=True, **send_kw)
         mark_posted(conn, h, title, url, article.get("category", "news"), article.get("source", ""))
         log.info("Posted: [%s] %s | link: %s", article.get("category"), title[:60], url[:100])
         return True
@@ -865,11 +896,7 @@ async def send_post(
         log.error("Telegram error posting '%s': %s", title[:60], exc)
         if image:
             try:
-                await bot.send_message(
-                    text=caption,
-                    disable_web_page_preview=True,
-                    **send_kw,
-                )
+                await bot.send_message(text=caption, disable_web_page_preview=True, **send_kw)
                 mark_posted(conn, h, title, url, article.get("category", "news"), article.get("source", ""))
                 return True
             except TelegramError as exc2:
@@ -918,10 +945,9 @@ async def collect_all_news(client: httpx.AsyncClient) -> list[dict]:
     for source in RSS_SOURCES:
         tasks.append(fetch_rss(client, source))
 
-    # Giveaways
+    # Giveaways (GamerPower resolves to real Steam/Epic/itch links)
     tasks.append(fetch_gamerpower_giveaways(client))
-    tasks.append(fetch_epic_free_games(client))
-    tasks.append(fetch_steam_free_games(client))
+    # Epic/Steam direct APIs often duplicate GamerPower with worse URLs — skip
 
     # Upcoming releases
     tasks.append(fetch_rawg_releases(client))
@@ -948,7 +974,7 @@ async def run_bot():
 
     try:
         me = await bot.get_me()
-        log.info("Bot started: @%s | Channel: %s", me.username, CHANNEL_ID)
+        log.info("Bot started v%s: @%s | Channel: %s", BOT_VERSION, me.username, CHANNEL_ID)
     except TelegramError as exc:
         log.error("Cannot connect to Telegram: %s", exc)
         return
@@ -958,10 +984,7 @@ async def run_bot():
 
     log.info("Starting polling loop — check interval: %d min", CHECK_INTERVAL // 60)
 
-    async with httpx.AsyncClient(
-        headers={"User-Agent": "GamingNewsBot/1.0 (Telegram Channel Bot)"},
-        timeout=30,
-    ) as client:
+    async with httpx.AsyncClient(headers=_BROWSER_HEADERS, timeout=30) as client:
         while True:
             try:
                 log.info("Fetching all news sources...")
