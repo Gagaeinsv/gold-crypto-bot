@@ -429,8 +429,11 @@ def db_access(cid: int) -> dict:
 
 
 DEEP_ANALYSIS_DAILY_LIMIT = 3  # per user per day
-# Long structured report (~8 sections). Gemini 2.5 also bills internal reasoning against this cap.
-DEEP_ANALYSIS_MAX_OUTPUT_TOKENS = 8192
+# gemini-2.5-flash output limit per https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash
+# Thinking/reasoning can share this budget unless disabled — use max headroom for long reports.
+DEEP_ANALYSIS_MAX_OUTPUT_TOKENS_GEMINI = 65536
+# Completion limits vary by OpenRouter upstream model — stay below common hard caps.
+DEEP_ANALYSIS_MAX_OUTPUT_TOKENS_OPENROUTER = 16384
 
 def db_deepanalysis_count_today(cid: int) -> int:
     """Return how many deep analyses this user has used today (UTC)."""
@@ -1653,8 +1656,57 @@ def _gemini_content_config(max_output_tokens: int, **extra):
 
     kwargs = {"max_output_tokens": max_output_tokens, **extra}
     if getattr(gtypes, "ThinkingConfig", None) is not None:
-        kwargs["thinking_config"] = gtypes.ThinkingConfig(thinking_budget=0)
+        tc_kw: dict = {
+            "thinking_budget": 0,
+            "include_thoughts": False,
+        }
+        tl = getattr(gtypes, "ThinkingLevel", None)
+        if tl is not None and hasattr(tl, "MINIMAL"):
+            tc_kw["thinking_level"] = tl.MINIMAL
+        kwargs["thinking_config"] = gtypes.ThinkingConfig(**tc_kw)
     return gtypes.GenerateContentConfig(**kwargs)
+
+
+def _gemini_response_visible_text(response) -> str:
+    """
+    Return full assistant text for Telegram / JSON parsing.
+
+    Gemini 2.5 may emit reasoning in separate content parts marked ``thought``;
+    the SDK ``response.text`` accessor can truncate or omit continuation text.
+    We merge all non-thought text parts first, then fall back to ``response.text``.
+    """
+    import google.genai.types as gtypes
+
+    cand = response.candidates[0] if response.candidates else None
+    if cand and cand.finish_reason:
+        bad = cand.finish_reason not in (
+            gtypes.FinishReason.STOP,
+            gtypes.FinishReason.MAX_TOKENS,
+            gtypes.FinishReason.FINISH_REASON_UNSPECIFIED,
+        )
+        if cand.finish_reason == gtypes.FinishReason.MAX_TOKENS:
+            log.warning(
+                "Gemini stopped with MAX_TOKENS — model output may be incomplete "
+                "(increase max_output_tokens)."
+            )
+        elif bad:
+            log.warning("Gemini finish_reason=%s", cand.finish_reason)
+
+    chunks: list[str] = []
+    if cand and cand.content and cand.content.parts:
+        for part in cand.content.parts:
+            if getattr(part, "thought", None) is True:
+                continue
+            t = getattr(part, "text", None)
+            if t:
+                chunks.append(t)
+    joined = "".join(chunks).strip()
+    if joined:
+        return joined
+    try:
+        return (response.text or "").strip()
+    except Exception:
+        return ""
 
 
 def _openrouter_text(prompt: str, max_tokens: int = 500) -> str:
@@ -1685,7 +1737,7 @@ def _gemini_text(prompt: str, max_tokens: int = 500) -> str:
         contents=prompt,
         config=_gemini_content_config(max_tokens),
     )
-    return response.text
+    return _gemini_response_visible_text(response)
 
 
 def _gemini_json_analysis(prompt: str) -> str:
@@ -1701,7 +1753,7 @@ def _gemini_json_analysis(prompt: str) -> str:
             response_mime_type="application/json",
         ),
     )
-    return response.text
+    return _gemini_response_visible_text(response)
 
 
 def _groq_fallback_json_analysis(prompt: str) -> str:
@@ -3469,7 +3521,7 @@ def _openrouter_deep_analysis(pair: str, price: float) -> str:
 
     return _openrouter_chat(
         [{"role": "user", "content": prompt}],
-        max_tokens=DEEP_ANALYSIS_MAX_OUTPUT_TOKENS,
+        max_tokens=DEEP_ANALYSIS_MAX_OUTPUT_TOKENS_OPENROUTER,
         temperature=0.35,
     )
 
@@ -3502,9 +3554,9 @@ def _gemini_deep_analysis(pair: str, price: float) -> str:
     response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
-        config=_gemini_content_config(DEEP_ANALYSIS_MAX_OUTPUT_TOKENS),
+        config=_gemini_content_config(DEEP_ANALYSIS_MAX_OUTPUT_TOKENS_GEMINI),
     )
-    return response.text
+    return _gemini_response_visible_text(response)
 
 
 def _deep_analysis_llm_call(pair: str, price: float) -> str:
@@ -3808,7 +3860,7 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 contents=[prompt, image],
                 config=_gemini_content_config(1000),
             )
-            result = response.text
+            result = _gemini_response_visible_text(response)
 
         # Strip common markdown so plain-text Telegram replies stay readable
         result = re.sub(r"\*+", "", result)
