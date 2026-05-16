@@ -636,7 +636,11 @@ def nowp_price_usd_above_crypto_minimum(price_usd: float) -> float:
     """
     floor = round(float(price_usd), 8)
     fallback_min = float(os.getenv("NOWPAYMENTS_MIN_PAY_CRYPTO_FALLBACK", "6"))
-    margin = float(os.getenv("NOWPAYMENTS_MIN_PAY_MARGIN", "1.04"))
+    margin = float(os.getenv("NOWPAYMENTS_MIN_PAY_MARGIN", "1.12"))
+    # Extra absolute headroom **in pay_currency units** atop `min_crypto * margin` (estimate-vs-payment slack).
+    abs_pad_crypto = max(0.0, float(os.getenv("NOWP_MIN_PAY_CRYPTO_ABS_PAD", "0.75")))
+    # If NOWPayments/dashboard shows a larger floor than `/min-amount` returns for your merchant, raise it here (e.g. 13–20 for USDT TRC20).
+    hard_floor = float(os.getenv("NOWP_MIN_PAY_CRYPTO_HARD_FLOOR", "0") or "0")
     step_usd = float(os.getenv("NOWPAYMENTS_MIN_TOPUP_STEP_USD", "0.1"))
     ceiling_usd = floor + float(os.getenv("NOWPAYMENTS_MIN_TOPUP_CEILING_USD", "120"))
     max_steps = max(50, int(os.getenv("NOWPAYMENTS_MIN_TOPUP_MAX_STEPS", "400")))
@@ -649,7 +653,17 @@ def nowp_price_usd_above_crypto_minimum(price_usd: float) -> float:
             fallback_min,
         )
 
-    threshold = float(min_crypto) * margin
+    min_crypto_eff = float(min_crypto)
+    if hard_floor > 0:
+        if min_crypto_eff + 1e-9 < hard_floor:
+            log.info(
+                "NOWPayments: applying NOWP_MIN_PAY_CRYPTO_HARD_FLOOR=%.8f (was effective min_crypto≈ %.8f)",
+                hard_floor,
+                min_crypto_eff,
+            )
+        min_crypto_eff = max(min_crypto_eff, hard_floor)
+
+    threshold = min_crypto_eff * margin + abs_pad_crypto
 
     usd_eff = floor
     for step_i in range(max_steps):
@@ -667,7 +681,7 @@ def nowp_price_usd_above_crypto_minimum(price_usd: float) -> float:
             continue
 
         if estimated >= threshold:
-            cushion_usd = max(0.0, float(os.getenv("NOWP_ESTIMATE_CUSHION_USD", "0.35")))
+            cushion_usd = max(0.0, float(os.getenv("NOWP_ESTIMATE_CUSHION_USD", "1.05")))
             usd_final = round(usd_eff + cushion_usd, 10)
             if usd_eff > floor or cushion_usd > 0:
                 log.info(
@@ -677,7 +691,7 @@ def nowp_price_usd_above_crypto_minimum(price_usd: float) -> float:
                     usd_eff,
                     cushion_usd,
                     usd_final,
-                    min_crypto,
+                    min_crypto_eff,
                     NOWPAYMENTS_PAY_CURRENCY,
                     estimated,
                 )
@@ -734,8 +748,9 @@ def nowp_create_payment(chat_id: int, plan: str, months: int, price_usd: float) 
     initial_usd = round(nowp_price_usd_above_crypto_minimum(requested_usd), 10)
     price_try = float(initial_usd)
 
-    pad_usd = float(os.getenv("NOWP_AMOUNT_MINIMAL_ERR_PAD_USD", "0.50"))
-    max_pay_retries = max(2, int(os.getenv("NOWP_AMOUNT_MINIMAL_ERR_MAX_RETRIES", "5")))
+    pad_base = float(os.getenv("NOWP_AMOUNT_MINIMAL_ERR_PAD_USD", "1.0"))
+    pad_ramp = float(os.getenv("NOWP_AMOUNT_MINIMAL_ERR_PAD_RAMP_USD", "0.12"))
+    max_pay_retries = max(5, int(os.getenv("NOWP_AMOUNT_MINIMAL_ERR_MAX_RETRIES", "32")))
     last_detail = ""
     data: dict | None = None
 
@@ -794,8 +809,13 @@ def nowp_create_payment(chat_id: int, plan: str, months: int, price_usd: float) 
             pay_attempt + 1 < max_pay_retries
             and ("AMOUNTMINIMAL" in last_detail.upper() or " LESS THAN MINIMAL" in last_detail.upper())
         ):
-            price_try = round(float(price_try) + pad_usd, 10)
-            log.warning("NOWPayments: raising invoice toward %.8f USD (AMOUNTMINIMALERROR retry)", price_try)
+            bump = pad_base + pad_ramp * float(pay_attempt)
+            price_try = round(float(price_try) + bump, 10)
+            log.warning(
+                "NOWPayments: AMOUNTMINIMALERROR → +%.4f USD (ramp bump) retry toward %.8f USD",
+                bump,
+                price_try,
+            )
             continue
 
         raise RuntimeError(f"NOWPayments error ({r.status_code}): {last_detail}")
