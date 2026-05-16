@@ -10,10 +10,13 @@ def fix_markdown(text: str) -> str:
 """
 Gold & Crypto AI Signals Bot
 Run: python bot.py
-Dependencies: pip install python-telegram-bot[job-queue] requests groq yfinance pandas pandas-ta python-dotenv
+Dependencies: pip install python-telegram-bot[job-queue] requests groq google-genai pillow yfinance pandas pandas-ta python-dotenv
+Env: GROQ_MODEL_* ; OpenRouter key pool (`OPENROUTER_API_KEY`, `OPENROUTER_API_KEY_2`, optional `OPENROUTER_API_KEYS`) ;
+     round-robin + automatic failover on 429 ; GEMINI / MONITOR_INTERVAL_SEC / providers — see .env.example.
 """
 
 import asyncio
+import base64
 import concurrent.futures
 import csv
 import io
@@ -25,10 +28,11 @@ import os
 import random
 import re
 import sqlite3
+import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from email.utils import parsedate_to_datetime
 
 import requests
@@ -62,22 +66,74 @@ load_dotenv()
 TOKEN        = os.getenv("TOKEN",        "INSERT_TOKEN")
 NEWS_API     = os.getenv("NEWS_API",     "INSERT_NEWS_API")
 GROQ_KEY     = os.getenv("GROQ_KEY",     "INSERT_GROQ_KEY")
-GEMINI_KEY   = os.getenv("GEMINI_KEY",   "")   # for /deepanalysis and /chart
+# OpenRouter — Groq fallback + optional deep/chart (OpenAI-compatible API).
+# Multiple keys: round-robin per request; on 429/quota — automatic failover to next key.
+OPENROUTER_API_KEY     = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_API_KEY_2   = os.getenv("OPENROUTER_API_KEY_2", "").strip()
+OPENROUTER_API_KEYS    = os.getenv("OPENROUTER_API_KEYS", "").strip()  # optional comma-separated extra keys
+OPENROUTER_MODEL       = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+OPENROUTER_VISION_MODEL = os.getenv("OPENROUTER_VISION_MODEL", "")  # if empty, uses OPENROUTER_MODEL
+OPENROUTER_SITE_URL    = os.getenv("OPENROUTER_SITE_URL", "")   # optional HTTP-Referer for OpenRouter rankings
+OPENROUTER_APP_TITLE   = os.getenv("OPENROUTER_APP_TITLE", "Gold Crypto Trading Bot")
+OPENROUTER_API_URL     = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def _openrouter_key_pool() -> list[str]:
+    keys: list[str] = []
+    for k in (OPENROUTER_API_KEY, OPENROUTER_API_KEY_2):
+        if k and k not in keys:
+            keys.append(k)
+    for part in OPENROUTER_API_KEYS.split(","):
+        p = part.strip()
+        if p and p not in keys:
+            keys.append(p)
+    return keys
+
+
+_OPENROUTER_KEYS: list[str] = _openrouter_key_pool()
+_openrouter_rr_lock = threading.Lock()
+_openrouter_rr_i = 0
+
+
+def _openrouter_configured() -> bool:
+    return bool(_OPENROUTER_KEYS)
+# Google Gemini — deep analysis, chart vision, Groq 429 fallback (works alongside OpenRouter)
+GEMINI_KEY   = os.getenv("GEMINI_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# gemini | openrouter | auto  (auto prefers Gemini when GEMINI_KEY is set)
+DEEP_ANALYSIS_PROVIDER = os.getenv("DEEP_ANALYSIS_PROVIDER", "gemini").strip().lower()
+CHART_VISION_PROVIDER  = os.getenv("CHART_VISION_PROVIDER", "gemini").strip().lower()
 GOLD_API_KEY = os.getenv("GOLD_API_KEY", "")   # goldapi.io — spot price for XAU/XAG
 NOWPAYMENTS_API_KEY   = os.getenv("NOWPAYMENTS_API_KEY", "")
 NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "")
-# Public base URL of your server, used for NOWPayments IPN callback.
-# Example: https://yourdomain.com  (or http://YOUR_SERVER_IP:8080 if you expose the port)
+NOWPAYMENTS_PAY_CURRENCY = (os.getenv("NOWPAYMENTS_PAY_CURRENCY", "usdttrc20").strip().lower() or "usdttrc20")
+# Public base URL of your server, used for NOWPayments IPN callback (must resolve for their servers).
+# NOWPayments often rejects http:// callbacks with HTTP 400; use HTTPS behind nginx/Caddy/Certbot.
 PUBLIC_BASE_URL       = os.getenv("PUBLIC_BASE_URL", "")
+if NOWPAYMENTS_API_KEY and PUBLIC_BASE_URL.strip() and PUBLIC_BASE_URL.lower().startswith("http://"):
+    log.warning(
+        "NOWPayments: PUBLIC_BASE_URL uses http:// — the API commonly rejects non-HTTPS ipn_callback_url "
+        "(400 Bad Request). Use https:// behind a reverse proxy (port 443) and update PUBLIC_BASE_URL."
+    )
 ADMIN_ID     = int(os.getenv("ADMIN_ID", "123456789"))
 CHANNEL_ID   = os.getenv("CHANNEL_ID",  "@your_channel")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "@your_bot")
 
-GROQ_MODEL   = "llama-3.1-8b-instant"
+# Groq: use a high-quota model for channel + articles vs a stronger model for per-user signals
+# (free tier: 8b ≈ 14k req/day, 70b ≈ 1k req/day — see Groq dashboard).
+GROQ_MODEL_NEWS    = os.getenv("GROQ_MODEL_NEWS", "llama-3.1-8b-instant")
+GROQ_MODEL_SIGNALS = os.getenv("GROQ_MODEL_SIGNALS", "llama-3.3-70b-versatile")
+_LEGACY_GROQ_MODEL  = os.getenv("GROQ_MODEL", "").strip()
+if _LEGACY_GROQ_MODEL:
+    log.warning(
+        "GROQ_MODEL is deprecated; set GROQ_MODEL_NEWS (channel/articles) and "
+        "GROQ_MODEL_SIGNALS (user analysis / auto-signals). Using GROQ_MODEL=%s for signals only.",
+        _LEGACY_GROQ_MODEL,
+    )
+    GROQ_MODEL_SIGNALS = _LEGACY_GROQ_MODEL
 GROQ_TIMEOUT = 20
 
-# Deep analysis model (free tier)
-GEMINI_FLASH = "gemini-2.5-flash"
+# Long-form deep analysis & chart vision: see DEEP_ANALYSIS_PROVIDER / CHART_VISION_PROVIDER (default: gemini).
 
 TRIAL_DAYS        = 7
 PRICE_BASIC       = 550    # ~$5 net after Telegram 30% fee
@@ -97,6 +153,9 @@ USD_DIAMOND_3   = 49.99
 DB_PATH           = "users.db"
 CHANNEL_HOURS_UTC = [6, 12, 18]   # market analysis posts (UTC)
 ARTICLE_HOURS_UTC = [8, 14, 20]   # article posts — separate from analysis
+# Background job interval (seconds). Channel Groq runs only when the hour hits
+# CHANNEL_HOURS_UTC / ARTICLE_HOURS_UTC — not on every tick.
+MONITOR_INTERVAL_SEC = max(15, int(os.getenv("MONITOR_INTERVAL_SEC", "60")))
 AUTO_COOLDOWN     = 30 * 60        # seconds between auto-signals
 
 PAIRS: dict = {
@@ -302,7 +361,7 @@ def db_upsert_user(cid: int, username: str = "", fname: str = "") -> None:
     with db_connect() as c:
         row = c.execute("SELECT chat_id FROM users WHERE chat_id=?", (cid,)).fetchone()
         if row is None:
-            trial_ends = (datetime.utcnow() + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d")
+            trial_ends = (datetime.now(UTC) + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d")
             c.execute(
                 "INSERT INTO users(chat_id,username,first_name,plan,trial_ends,last_active) "
                 "VALUES(?,?,?,'trial',?,datetime('now'))",
@@ -321,7 +380,7 @@ def db_access(cid: int) -> dict:
     if row is None:
         return {"allowed": False, "plan": "none", "days_left": 0, "reason": "not_registered"}
 
-    today = datetime.utcnow().date()
+    today = datetime.now(UTC).date()
     plan  = row["plan"]
 
     if cid == ADMIN_ID:
@@ -350,7 +409,7 @@ DEEP_ANALYSIS_DAILY_LIMIT = 3  # per user per day
 
 def db_deepanalysis_count_today(cid: int) -> int:
     """Return how many deep analyses this user has used today (UTC)."""
-    today = datetime.utcnow().date().isoformat()
+    today = datetime.now(UTC).date().isoformat()
     with db_connect() as c:
         row = c.execute(
             "SELECT COUNT(*) FROM deep_analysis_log "
@@ -370,7 +429,7 @@ def db_deepanalysis_log(cid: int, pair: str) -> None:
 
 
 def db_apply_payment(cid: int, stars: int, plan_key: str, months: int, charge_id: str) -> date:
-    today = datetime.utcnow().date()
+    today = datetime.now(UTC).date()
     with db_connect() as c:
         row = c.execute("SELECT sub_expires FROM users WHERE chat_id=?", (cid,)).fetchone()
         base = (
@@ -404,7 +463,28 @@ def db_payment_exists(charge_id: str) -> bool:
 # ── NOWPayments (crypto) payment helpers ──────────────────────────
 
 NOWPAYMENTS_BASE = "https://api.nowpayments.io/v1"
-NOWPAYMENTS_PAY_CURRENCY = "usdttrc20"
+
+
+def _nowp_response_error_detail(r: requests.Response) -> str:
+    """Best-effort body summary for NOWPayments HTTP errors."""
+    txt = ""
+    try:
+        j = r.json()
+        if isinstance(j, dict):
+            parts: list[str] = []
+            for key in ("message", "code", "error"):
+                v = j.get(key)
+                if v not in (None, ""):
+                    parts.append(str(v))
+            if parts:
+                return " ".join(parts)
+            txt = json.dumps(j, ensure_ascii=False)
+    except Exception:
+        txt = (r.text or "").strip()
+    if not txt.strip():
+        return f"HTTP {r.status_code}"
+    txt = txt.strip()
+    return txt[:800] + ("…" if len(txt) > 800 else "")
 
 
 def _nowp_headers() -> dict:
@@ -463,7 +543,10 @@ def nowp_create_payment(chat_id: int, plan: str, months: int, price_usd: float) 
         "ipn_callback_url": f"{PUBLIC_BASE_URL.rstrip('/')}/nowpayments",
     }
     r = requests.post(f"{NOWPAYMENTS_BASE}/payment", headers=_nowp_headers(), json=payload, timeout=12)
-    r.raise_for_status()
+    if not r.ok:
+        detail = _nowp_response_error_detail(r)
+        log.warning("NOWPayments POST /payment failed: status=%s body=%s", r.status_code, detail)
+        raise RuntimeError(f"NOWPayments error ({r.status_code}): {detail}")
     data = r.json()
     payment_id = str(data.get("payment_id") or "")
     if not payment_id:
@@ -498,7 +581,10 @@ def nowp_get_payment(payment_id: str) -> dict:
     if not NOWPAYMENTS_API_KEY:
         raise RuntimeError("NOWPAYMENTS_API_KEY not set")
     r = requests.get(f"{NOWPAYMENTS_BASE}/payment/{payment_id}", headers=_nowp_headers(), timeout=12)
-    r.raise_for_status()
+    if not r.ok:
+        detail = _nowp_response_error_detail(r)
+        log.warning("NOWPayments GET /payment/%s failed: status=%s body=%s", payment_id, r.status_code, detail)
+        raise RuntimeError(f"NOWPayments error ({r.status_code}): {detail}")
     return r.json()
 
 
@@ -625,7 +711,7 @@ def db_give_referral_bonus(referrer_id: int, referred_id: int) -> int:
         if not u:
             return 0
 
-        today = datetime.utcnow().date()
+        today = datetime.now(UTC).date()
         if u["plan"] in ("basic", "pro", "diamond") and u["sub_expires"]:
             base = max(datetime.strptime(u["sub_expires"], "%Y-%m-%d").date(), today)
             new_date = base + timedelta(days=REFERRAL_BONUS_DAYS)
@@ -1058,16 +1144,178 @@ def get_technicals(pair: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Groq analysis  (ONE call per full_analysis — never loops)
+#  OpenRouter — Groq fallback (multi-key round-robin + 429 failover)
 # ═══════════════════════════════════════════════════════════════════
 
+def _openrouter_headers_for(api_key: str) -> dict[str, str]:
+    h = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if OPENROUTER_SITE_URL.strip():
+        h["HTTP-Referer"] = OPENROUTER_SITE_URL.strip()
+    if OPENROUTER_APP_TITLE.strip():
+        h["X-Title"] = OPENROUTER_APP_TITLE.strip()
+    return h
+
+
+def _next_openrouter_rr_start() -> int:
+    """Rotate which key is tried first on each request (spread load across accounts)."""
+    n = len(_OPENROUTER_KEYS)
+    if n <= 1:
+        return 0
+    global _openrouter_rr_i
+    with _openrouter_rr_lock:
+        idx = _openrouter_rr_i % n
+        _openrouter_rr_i += 1
+        return idx
+
+
+def _openrouter_failover_eligible(http_status: int, err_msg: str) -> bool:
+    """Whether to try the next API key (quota / transient), not e.g. invalid JSON body."""
+    if http_status == 400:
+        return False
+    if http_status in (401, 402, 408, 429, 502, 503, 529):
+        return True
+    m = (err_msg or "").lower()
+    if "rate" in m and "limit" in m:
+        return True
+    if "quota" in m or "exceed" in m:
+        return True
+    if "insufficient" in m:
+        return True
+    return False
+
+
+def _parse_openrouter_message_json(data: dict) -> str:
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError("OpenRouter returned no choices")
+    msg = choices[0].get("message") or {}
+    content = msg.get("content")
+    if content is None:
+        raise RuntimeError("OpenRouter empty response")
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+        content = "".join(parts)
+    text = str(content).strip()
+    if not text:
+        raise RuntimeError("OpenRouter empty response")
+    return text
+
+
+def _openrouter_post_once(api_key: str, payload: dict) -> tuple[bool, str, int, str]:
+    """
+    Single OpenRouter HTTP call.
+    Returns (success, text_if_ok, http_status, error_message_on_failure).
+    """
+    r = requests.post(
+        OPENROUTER_API_URL,
+        headers=_openrouter_headers_for(api_key),
+        json=payload,
+        timeout=120,
+    )
+    try:
+        data = r.json()
+    except Exception:
+        data = {}
+    sc = r.status_code
+    if sc == 200:
+        try:
+            return True, _parse_openrouter_message_json(data), 200, ""
+        except Exception as e:
+            return False, "", sc, str(e)
+    err_o = data.get("error")
+    if isinstance(err_o, dict):
+        msg = (err_o.get("message") or str(err_o))[:800]
+    elif isinstance(err_o, str):
+        msg = err_o[:800]
+    else:
+        msg = (r.text or "")[:400]
+    return False, "", sc, msg or f"HTTP {sc}"
+
+
+def _openrouter_vision_model() -> str:
+    v = (OPENROUTER_VISION_MODEL or "").strip()
+    return v if v else OPENROUTER_MODEL
+
+
+def _openrouter_chat(
+    messages: list,
+    *,
+    model: str | None = None,
+    max_tokens: int = 1024,
+    temperature: float = 0.35,
+    response_format: dict | None = None,
+) -> str:
+    if not _OPENROUTER_KEYS:
+        raise RuntimeError(
+            "OpenRouter API keys not configured — set OPENROUTER_API_KEY and/or OPENROUTER_API_KEY_2",
+        )
+    use_model = (model or OPENROUTER_MODEL).strip()
+    payload: dict = {
+        "model": use_model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if response_format is not None:
+        payload["response_format"] = response_format
+
+    n = len(_OPENROUTER_KEYS)
+    start = _next_openrouter_rr_start()
+    last_err = ""
+    last_sc = 0
+
+    for attempt in range(n):
+        k_ix = (start + attempt) % n
+        api_key = _OPENROUTER_KEYS[k_ix]
+        ok, text, sc, err = _openrouter_post_once(api_key, payload)
+        if ok:
+            if attempt > 0:
+                log.info("OpenRouter: OK using key #%s after failover/rotation", k_ix)
+            return text
+        last_err, last_sc = err, sc
+        if not _openrouter_failover_eligible(sc, err):
+            raise RuntimeError(err or f"OpenRouter HTTP {sc}")
+        if attempt < n - 1:
+            log.warning(
+                "OpenRouter key #%s HTTP %s — %s; trying next key",
+                k_ix, sc, (err or "")[:160],
+            )
+
+    raise RuntimeError(last_err or f"OpenRouter HTTP {last_sc} (all keys exhausted)")
+
+
+def _openrouter_text(prompt: str, max_tokens: int = 500) -> str:
+    """Generate plain text via OpenRouter. Used as Groq fallback for articles."""
+    return _openrouter_chat(
+        [{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        temperature=0.45,
+    )
+
+
+def _openrouter_json_analysis(prompt: str) -> str:
+    """Ask OpenRouter for a JSON trading signal. Used as Groq fallback."""
+    return _openrouter_chat(
+        [{"role": "user", "content": prompt + "\n\nReply with ONLY valid JSON, no markdown code fences."}],
+        max_tokens=400,
+        temperature=0.25,
+    )
+
+
 def _gemini_text(prompt: str, max_tokens: int = 500) -> str:
-    """Generate text via Gemini Flash. Used as Groq fallback."""
+    """Generate text via Gemini. Used as Groq fallback after OpenRouter."""
     import google.genai as genai
     import google.genai.types as gtypes
+
     client = genai.Client(api_key=GEMINI_KEY)
     response = client.models.generate_content(
-        model=GEMINI_FLASH,
+        model=GEMINI_MODEL,
         contents=prompt,
         config=gtypes.GenerateContentConfig(max_output_tokens=max_tokens),
     )
@@ -1075,12 +1323,13 @@ def _gemini_text(prompt: str, max_tokens: int = 500) -> str:
 
 
 def _gemini_json_analysis(prompt: str) -> str:
-    """Ask Gemini for a JSON trading signal. Used as Groq fallback."""
+    """Ask Gemini for a JSON trading signal. Groq fallback after OpenRouter."""
     import google.genai as genai
     import google.genai.types as gtypes
+
     client = genai.Client(api_key=GEMINI_KEY)
     response = client.models.generate_content(
-        model=GEMINI_FLASH,
+        model=GEMINI_MODEL,
         contents=prompt,
         config=gtypes.GenerateContentConfig(
             max_output_tokens=300,
@@ -1088,6 +1337,34 @@ def _gemini_json_analysis(prompt: str) -> str:
         ),
     )
     return response.text
+
+
+def _groq_fallback_json_analysis(prompt: str) -> str:
+    """After Groq 429: try OpenRouter, then Gemini."""
+    if _openrouter_configured():
+        try:
+            return _openrouter_json_analysis(prompt)
+        except Exception as e:
+            log.warning("OpenRouter JSON fallback failed: %s", e)
+    if GEMINI_KEY:
+        return _gemini_json_analysis(prompt)
+    raise RuntimeError(
+        "Groq rate-limited: set OpenRouter (`OPENROUTER_API_KEY` / `OPENROUTER_API_KEY_2`) and/or `GEMINI_KEY` for fallback AI"
+    )
+
+
+def _groq_fallback_article_text(prompt: str, max_tokens: int = 500) -> str:
+    """After Groq 429 on article: try OpenRouter, then Gemini."""
+    if _openrouter_configured():
+        try:
+            return _openrouter_text(prompt, max_tokens=max_tokens)
+        except Exception as e:
+            log.warning("OpenRouter article fallback failed: %s", e)
+    if GEMINI_KEY:
+        return _gemini_text(prompt, max_tokens=max_tokens)
+    raise RuntimeError(
+        "Groq rate-limited: set OpenRouter (`OPENROUTER_API_KEY` / `OPENROUTER_API_KEY_2`) and/or `GEMINI_KEY` for fallback AI"
+    )
 
 
 def _make_sl_tp(price: float, direction: str, sl_pct: float, tp_pct: float) -> tuple[float, float]:
@@ -1100,6 +1377,10 @@ def _make_sl_tp(price: float, direction: str, sl_pct: float, tp_pct: float) -> t
         tp = round(price * (1 + tp_pct / 100), 2)   # TP above entry for BUY
     return sl, tp
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  Groq analysis  (model chosen per call: NEWS vs SIGNALS; then OpenRouter / Gemini on 429)
+# ═══════════════════════════════════════════════════════════════════
 
 def _normalize_confidence(raw_conf) -> int:
     """Normalize confidence to 0-100 integer. Handles 0.85 → 85 and 85 → 85."""
@@ -1118,7 +1399,7 @@ def _groq_client():
 
 
 def groq_analysis(news_text: str, price: float, tech: dict,
-                  trend: str, vol: str, pair: str) -> dict:
+                  trend: str, vol: str, pair: str, groq_model: str) -> dict:
     cfg     = PAIRS[pair]
     sl_hint = cfg["sl_pct"]
     tp_hint = cfg["tp_pct"]
@@ -1164,14 +1445,14 @@ def groq_analysis(news_text: str, price: float, tech: dict,
         )
         try:
             raw = _groq_client().chat.completions.create(
-                model=GROQ_MODEL, timeout=GROQ_TIMEOUT,
+                model=groq_model, timeout=GROQ_TIMEOUT,
                 messages=[{"role": "user", "content": analysis_prompt}],
                 temperature=0.3, max_tokens=280,
             ).choices[0].message.content
         except Exception as groq_err:
             if "429" in str(groq_err) or "rate_limit" in str(groq_err).lower():
-                log.info("Groq rate limit — falling back to Gemini for analysis")
-                raw = _gemini_json_analysis(analysis_prompt)
+                log.info("Groq rate limit — trying OpenRouter then Gemini for analysis")
+                raw = _groq_fallback_json_analysis(analysis_prompt)
             else:
                 raise
         m = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -1197,7 +1478,7 @@ def groq_analysis(news_text: str, price: float, tech: dict,
                     parsed["take_profit"] = tp
             return {**fallback, **parsed}
     except Exception as e:
-        log.warning("AI analysis failed (Groq+Gemini): %s", e)
+        log.warning("AI analysis failed (Groq+OpenRouter+Gemini): %s", e)
     return fallback
 
 
@@ -1314,10 +1595,14 @@ def _direction(ai: dict, trend: str, tech: dict | None) -> tuple[str, str]:
     return "SELL", "📉"
 
 
-def full_analysis(price: float, prev: float | None, pair: str) -> dict:
+def full_analysis(price: float, prev: float | None, pair: str,
+                  groq_model: str | None = None) -> dict:
     """
     Run all data fetching in parallel using threads.
     Total time = max(slowest request) instead of sum of all requests.
+
+    ``groq_model`` — Groq chat model id. Default: ``GROQ_MODEL_SIGNALS`` (user-facing).
+    Channel / admin broadcast: pass ``GROQ_MODEL_NEWS`` (higher free-tier quota).
     """
     import concurrent.futures as cf
 
@@ -1351,8 +1636,9 @@ def full_analysis(price: float, prev: float | None, pair: str) -> dict:
         except Exception:
             econ = {"has_danger": False, "events": []}
 
+    use_llm = groq_model if groq_model is not None else GROQ_MODEL_SIGNALS
     # Groq call after parallel fetch (needs tech + news)
-    ai    = groq_analysis(news, price, tech, trend, vol, pair)
+    ai    = groq_analysis(news, price, tech, trend, vol, pair, use_llm)
     score = _calc_score(tech, ai, econ, trend, vol)
 
     return dict(pair=pair, price=price, trend=trend, vol=vol,
@@ -1513,7 +1799,7 @@ _NEWS_KW = ["gold", "xau", "bitcoin", "btc", "crypto", "ethereum",
 
 
 def get_news_rss() -> list[dict]:
-    cutoff  = datetime.utcnow() - timedelta(hours=48)
+    cutoff  = datetime.now(UTC) - timedelta(hours=48)
     results = []
     for source, url in _RSS_FEEDS:
         try:
@@ -1525,7 +1811,11 @@ def get_news_rss() -> list[dict]:
                 summary = (item.findtext("description") or "").strip()[:200]
                 pub_str = item.findtext("pubDate") or ""
                 try:
-                    pub_dt = parsedate_to_datetime(pub_str).replace(tzinfo=None)
+                    pub_dt = parsedate_to_datetime(pub_str)
+                    if pub_dt.tzinfo is None:
+                        pub_dt = pub_dt.replace(tzinfo=UTC)
+                    else:
+                        pub_dt = pub_dt.astimezone(UTC)
                     if pub_dt < cutoff:
                         continue
                 except Exception:
@@ -1542,7 +1832,7 @@ def get_news_for_article(query: str) -> str:
     if items:
         return "\n".join(f"[{i['source']}] {i['title']}. {i['summary']}" for i in items[:5])
     try:
-        from_dt = (datetime.utcnow() - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%S")
+        from_dt = (datetime.now(UTC) - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%S")
         r = requests.get(
             f"https://newsapi.org/v2/everything?q={query.replace(' ', '%20')}"
             f"&from={from_dt}&sortBy=publishedAt&pageSize=5&language=en&apiKey={NEWS_API}",
@@ -1653,14 +1943,14 @@ def groq_article(topic_type: str, topic: str) -> str:
         )
     try:
         result = _groq_client().chat.completions.create(
-            model=GROQ_MODEL, timeout=GROQ_TIMEOUT,
+            model=GROQ_MODEL_NEWS, timeout=GROQ_TIMEOUT,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.5, max_tokens=500,
         ).choices[0].message.content.strip()
     except Exception as groq_err:
         if "429" in str(groq_err) or "rate_limit" in str(groq_err).lower():
-            log.info("Groq rate limit — falling back to Gemini for article")
-            result = _gemini_text(prompt, max_tokens=500)
+            log.info("Groq rate limit — trying OpenRouter then Gemini for article")
+            result = _groq_fallback_article_text(prompt, max_tokens=500)
         else:
             raise
     return result
@@ -2120,6 +2410,18 @@ async def safe_edit(q, text: str, markup=None, **kwargs):
             log.warning("safe_edit: %s", e)
 
 
+async def safe_callback_answer(q, **kwargs) -> None:
+    """Acknowledge a callback query; ignore expired IDs after long blocking work."""
+    try:
+        await q.answer(**kwargs)
+    except BadRequest as e:
+        low = str(e).lower()
+        if "too old" in low or "invalid" in low or "query id" in low:
+            log.debug("Callback query expired, skipping answer: %s", e)
+        else:
+            raise
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Keyboards
 # ═══════════════════════════════════════════════════════════════════
@@ -2449,7 +2751,9 @@ async def cmd_forcepost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("❌ Could not get price.")
         return
 
-    a    = full_analysis(price, _prev_prices.get(pair), pair)
+    a    = await asyncio.to_thread(
+        full_analysis, price, _prev_prices.get(pair), pair, GROQ_MODEL_NEWS,
+    )
     text = groq_channel_post(a, post_type)
     try:
         sent = await safe_send_photo(context.bot, CHANNEL_ID, cfg["image"], text)
@@ -2461,14 +2765,8 @@ async def cmd_forcepost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"❌ {e}")
 
 
-        db_save_post(pair, post_type, a["score"], a["ai"].get("sentiment", "?"), price, 0)
-        await update.message.reply_text(f"✅ Published! Score={a['score']}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ {e}")
-
-
 # ═══════════════════════════════════════════════════════════════════
-#  Deep Analysis  (Gemini Flash / Pro — admin only)
+#  Deep Analysis  (Gemini or OpenRouter — see DEEP_ANALYSIS_PROVIDER)
 # ═══════════════════════════════════════════════════════════════════
 
 def _get_multi_tf_data(pair: str) -> dict:
@@ -2604,7 +2902,7 @@ def _get_macro_context(pair: str) -> str:
 
 def _build_deep_prompt(pair: str, price: float, tf_data: dict,
                        macro: str, econ: dict) -> str:
-    """Build the comprehensive prompt for Gemini."""
+    """Build the comprehensive prompt for the deep-analysis LLM."""
     cfg = PAIRS[pair]
 
     # Format multi-timeframe data
@@ -2704,12 +3002,118 @@ Respond ONLY in this exact structure. Use the actual numbers from the data above
 Be precise. Use exact prices from the data. No vague statements."""
 
 
+def _resolved_deep_provider() -> str:
+    """Which backend runs /deepanalysis: gemini | openrouter | none (auto picks first available)."""
+    p = (DEEP_ANALYSIS_PROVIDER or "gemini").strip().lower()
+    if p not in ("gemini", "openrouter", "auto"):
+        p = "gemini"
+    if p == "openrouter":
+        return "openrouter"
+    if p == "gemini":
+        return "gemini"
+    if GEMINI_KEY:
+        return "gemini"
+    if _openrouter_configured():
+        return "openrouter"
+    return "none"
+
+
+def _deep_analysis_model_label() -> str:
+    return OPENROUTER_MODEL if _resolved_deep_provider() == "openrouter" else GEMINI_MODEL
+
+
+def _deep_analysis_config_ok() -> tuple[bool, str]:
+    w = _resolved_deep_provider()
+    if w == "none":
+        return False, (
+            "No AI backend for deep analysis. Set `GEMINI_KEY` and/or OpenRouter keys "
+            "(`OPENROUTER_API_KEY`, `OPENROUTER_API_KEY_2`), "
+            "or adjust `DEEP_ANALYSIS_PROVIDER` (gemini | openrouter | auto)."
+        )
+    if w == "openrouter" and not _openrouter_configured():
+        return (
+            False,
+            "`DEEP_ANALYSIS_PROVIDER` uses OpenRouter but no OpenRouter keys are set "
+            "(set `OPENROUTER_API_KEY` and optionally `OPENROUTER_API_KEY_2`).",
+        )
+    if w == "gemini" and not GEMINI_KEY:
+        return False, "`DEEP_ANALYSIS_PROVIDER` uses Gemini but `GEMINI_KEY` is missing."
+    return True, ""
+
+
+def _resolved_chart_provider() -> str:
+    p = (CHART_VISION_PROVIDER or "gemini").strip().lower()
+    if p not in ("gemini", "openrouter", "auto"):
+        p = "gemini"
+    if p == "openrouter":
+        return "openrouter"
+    if p == "gemini":
+        return "gemini"
+    if GEMINI_KEY:
+        return "gemini"
+    if _openrouter_configured():
+        return "openrouter"
+    return "none"
+
+
+def _chart_vision_config_ok() -> tuple[bool, str]:
+    w = _resolved_chart_provider()
+    if w == "none":
+        return False, (
+            "Set `GEMINI_KEY` or OpenRouter keys (`OPENROUTER_API_KEY` / `OPENROUTER_API_KEY_2`) "
+            "for chart vision (or `CHART_VISION_PROVIDER`)."
+        )
+    if w == "openrouter" and not _openrouter_configured():
+        return (
+            False,
+            "Chart vision uses OpenRouter but no OpenRouter keys are configured.",
+        )
+    if w == "gemini" and not GEMINI_KEY:
+        return False, "Chart vision uses Gemini but `GEMINI_KEY` is missing."
+    return True, ""
+
+
+def _chart_model_label() -> str:
+    if _resolved_chart_provider() == "openrouter":
+        return _openrouter_vision_model()
+    return GEMINI_MODEL
+
+
+def _openrouter_deep_analysis(pair: str, price: float) -> str:
+    """Run deep analysis using OpenRouter (long-form report)."""
+    # Gather all data
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        f_tf    = pool.submit(_get_multi_tf_data, pair)
+        f_macro = pool.submit(_get_macro_context, pair)
+        f_econ  = pool.submit(_check_econ_calendar)
+        try:
+            tf_data = f_tf.result(timeout=25)
+        except Exception as e:
+            log.warning("Multi-TF timeout: %s", e)
+            tf_data = {}
+        try:
+            macro = f_macro.result(timeout=10)
+        except Exception:
+            macro = ""
+        try:
+            econ = f_econ.result(timeout=6)
+        except Exception:
+            econ = {"has_danger": False, "events": []}
+
+    prompt = _build_deep_prompt(pair, price, tf_data, macro, econ)
+
+    return _openrouter_chat(
+        [{"role": "user", "content": prompt}],
+        max_tokens=1800,
+        temperature=0.35,
+    )
+
+
 def _gemini_deep_analysis(pair: str, price: float) -> str:
-    """Run deep analysis using Google Gemini Flash (free tier)."""
+    """Run deep analysis using Google Gemini (long-form report)."""
     import google.genai as genai
     import google.genai.types as gtypes
 
-    # Gather all data
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         f_tf    = pool.submit(_get_multi_tf_data, pair)
         f_macro = pool.submit(_get_macro_context, pair)
@@ -2732,13 +3136,22 @@ def _gemini_deep_analysis(pair: str, price: float) -> str:
 
     client = genai.Client(api_key=GEMINI_KEY)
     response = client.models.generate_content(
-        model=GEMINI_FLASH,
+        model=GEMINI_MODEL,
         contents=prompt,
         config=gtypes.GenerateContentConfig(
             max_output_tokens=1800,
         ),
     )
     return response.text
+
+
+def _deep_analysis_llm_call(pair: str, price: float) -> str:
+    w = _resolved_deep_provider()
+    if w == "none":
+        raise RuntimeError("No deep-analysis backend configured")
+    if w == "openrouter":
+        return _openrouter_deep_analysis(pair, price)
+    return _gemini_deep_analysis(pair, price)
 
 
 async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2760,11 +3173,9 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    if not GEMINI_KEY:
-        await update.message.reply_text(
-            "❌ GEMINI\\_KEY not set in .env\n\nGet your key at: aistudio.google.com",
-            parse_mode="Markdown",
-        )
+    ok, err = _deep_analysis_config_ok()
+    if not ok:
+        await update.message.reply_text(f"❌ {err}", parse_mode="Markdown")
         return
 
     # Check daily limit
@@ -2838,7 +3249,7 @@ async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair:
 
     await reply(
         f"🧠 *Deep Analysis* — {cfg['emoji']} {cfg['name']}\n\n"
-        f"Model: `{GEMINI_FLASH}`\n"
+        f"Model: `{_deep_analysis_model_label()}`\n"
         f"⏳ Gathering data from 4 timeframes + macro news…\n\n"
         f"_This takes 30-60 seconds — please wait_",
         parse_mode="Markdown",
@@ -2852,7 +3263,7 @@ async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair:
     try:
         loop   = asyncio.get_event_loop()
         result = await asyncio.wait_for(
-            loop.run_in_executor(None, _gemini_deep_analysis, pair, price),
+            loop.run_in_executor(None, _deep_analysis_llm_call, pair, price),
             timeout=120,
         )
     except asyncio.TimeoutError:
@@ -2878,7 +3289,7 @@ async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair:
     header = (
         f"🧠 *DEEP ANALYSIS — {cfg['emoji']} {cfg['name']}*\n"
         f"💰 Price: *{fmt_price(price, pair)}*  |  "
-        f"Model: `{GEMINI_FLASH}`\n"
+        f"Model: `{_deep_analysis_model_label()}`\n"
         f"{'─' * 30}\n\n"
     )
     full_text = header + result + remaining_note
@@ -2903,16 +3314,16 @@ async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair:
         if i < len(chunks) - 1:
             await asyncio.sleep(0.5)
 
-    log.info("Deep analysis: cid=%s %s model=%s price=%s", cid, pair, GEMINI_FLASH, price)
+    log.info("Deep analysis: cid=%s %s model=%s price=%s", cid, pair, _deep_analysis_model_label(), price)
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Vision Chart Analysis  (Gemini reads screenshot — all users)
+#  Vision Chart Analysis  (Gemini or OpenRouter — see CHART_VISION_PROVIDER)
 # ═══════════════════════════════════════════════════════════════════
 
 async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    User sends a chart screenshot → Gemini Flash analyses it visually.
+    User sends a chart screenshot → Gemini or OpenRouter (multimodal).
     Usage: send photo with caption /chart or just /chart then send photo
     Available to Diamond plan users only.
     """
@@ -2928,10 +3339,6 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "Tap /start → 💳 Subscription",
             parse_mode="Markdown",
         )
-        return
-
-    if not GEMINI_KEY:
-        await update.message.reply_text("❌ Vision analysis not configured.")
         return
 
     # Check if message has a photo or image document
@@ -2957,7 +3364,7 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "3. Take a screenshot\n"
             "4. Send the screenshot to this bot\n"
             "   _(caption is optional)_\n\n"
-            "Gemini will analyse the chart and give you:\n"
+            "The AI will analyse the chart and give you:\n"
             "• Trend direction and strength\n"
             "• Key support & resistance levels\n"
             "• Entry, SL and TP suggestion\n"
@@ -2966,8 +3373,14 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
+    ok, err = _chart_vision_config_ok()
+    if not ok:
+        await update.message.reply_text(f"❌ {err}", parse_mode="Markdown")
+        return
+
     await update.message.reply_text(
-        "🔍 *Analysing your chart…*\n_Gemini is reading the image — 15-30 seconds_",
+        "🔍 *Analysing your chart…*\n"
+        f"_Model `{_chart_model_label()}` — about 15–45 seconds_",
         parse_mode="Markdown",
     )
 
@@ -3004,23 +3417,41 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "Keep it concise. Use prices visible on the chart."
         )
 
-        import google.genai as genai
-        import google.genai.types as gtypes
-        import PIL.Image
-        import io
+        if _resolved_chart_provider() == "openrouter":
+            mime = getattr(photo, "mime_type", None) or "image/jpeg"
+            b64 = base64.standard_b64encode(bytes(photo_bytes)).decode("ascii")
+            data_url = f"data:{mime};base64,{b64}"
+            result = _openrouter_chat(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                        ],
+                    }
+                ],
+                model=_openrouter_vision_model(),
+                max_tokens=1000,
+                temperature=0.3,
+            )
+        else:
+            import google.genai as genai
+            import google.genai.types as gtypes
+            import PIL.Image
 
-        client = genai.Client(api_key=GEMINI_KEY)
-        image = PIL.Image.open(io.BytesIO(bytes(photo_bytes)))
-        response = client.models.generate_content(
-            model=GEMINI_FLASH,
-            contents=[prompt, image],
-            config=gtypes.GenerateContentConfig(
-                max_output_tokens=1000,
-            ),
-        )
-        result = response.text
+            client = genai.Client(api_key=GEMINI_KEY)
+            image = PIL.Image.open(io.BytesIO(bytes(photo_bytes)))
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[prompt, image],
+                config=gtypes.GenerateContentConfig(
+                    max_output_tokens=1000,
+                ),
+            )
+            result = response.text
 
-        # Strip ALL markdown characters from Gemini output
+        # Strip common markdown so plain-text Telegram replies stay readable
         result = re.sub(r"\*+", "", result)
         result = re.sub(r"_+",  "", result)
         result = re.sub(r"`+",  "", result)
@@ -3048,7 +3479,7 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             if i < len(parts) - 1:
                 await asyncio.sleep(0.5)
 
-        log.info("Chart analysis: cid=%s plan=%s", cid, acc["plan"])
+        log.info("Chart analysis: cid=%s plan=%s model=%s", cid, acc["plan"], _chart_model_label())
 
     except Exception as e:
         await update.message.reply_text(
@@ -3122,12 +3553,15 @@ async def cmd_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ═══════════════════════════════════════════════════════════════════
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q    = update.callback_query
+    q = update.callback_query
+    if not q:
+        return
+    await safe_callback_answer(q)
+
     cid  = q.message.chat_id
     u    = get_user(cid)
     acc  = db_access(cid)
     plan = acc["plan"]
-    await q.answer()
 
     # Deep analysis pair selection
     if q.data == "deepanalysis_cancel":
@@ -3136,7 +3570,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if q.data == "chart_ai":
         if acc["plan"] not in ("diamond", "admin") and cid != ADMIN_ID:
-            await q.answer("💠 Diamond plan only", show_alert=True)
+            await safe_edit(
+                q,
+                "💠 *Chart AI* is available on the *Diamond* plan only.\n\n"
+                "Upgrade in *Subscription* to unlock chart screenshot analysis.",
+                markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="back_main")]]),
+            )
             return
         await safe_edit(q,
             "📸 *Chart AI Analysis*\n\n"
@@ -3151,16 +3590,24 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if q.data == "deepanalysis_menu":
         cur_plan = acc["plan"]
         if cur_plan not in ("trial", "diamond", "admin") and cid != ADMIN_ID:
-            await q.answer("Not available on your plan", show_alert=True)
+            await safe_edit(
+                q,
+                "🔒 *Deep Analysis* is not available on your current plan.",
+                markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="back_main")]]),
+            )
             return
         if cid != ADMIN_ID:
             used = db_deepanalysis_count_today(cid)
             limit = 1 if cur_plan == "trial" else DEEP_ANALYSIS_DAILY_LIMIT
             if used >= limit:
-                msg = (f"⏳ Trial limit reached (1/day).\nUpgrade to Diamond for 3/day."
+                msg = (f"⏳ *Trial limit reached* (1/day).\nUpgrade to Diamond for 3/day."
                        if cur_plan == "trial"
-                       else f"⏳ Daily limit reached ({limit}/day). Resets at midnight UTC.")
-                await q.answer(msg, show_alert=True)
+                       else f"⏳ *Daily limit reached* ({limit}/day). Resets at midnight UTC.")
+                await safe_edit(
+                    q,
+                    msg,
+                    markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="back_main")]]),
+                )
                 return
             remaining = f"  ({limit - used} left today)"
         else:
@@ -3268,13 +3715,21 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if q.data.startswith("crypto_pay_"):
         if not (NOWPAYMENTS_API_KEY and PUBLIC_BASE_URL and NOWPAYMENTS_IPN_SECRET):
-            await q.answer("Crypto payments not configured", show_alert=True)
+            await safe_edit(
+                q,
+                "❌ *Crypto payments* are not configured on this bot.",
+                markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="sub_menu")]]),
+            )
             return
         try:
             _, _, plan_key, months_s = q.data.split("_", 3)
             months = int(months_s)
         except Exception:
-            await q.answer("Bad crypto plan option", show_alert=True)
+            await safe_edit(
+                q,
+                "❌ Bad crypto plan option.",
+                markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")]]),
+            )
             return
 
         price_map = {
@@ -3287,7 +3742,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         }
         price_usd = price_map.get((plan_key, months))
         if price_usd is None:
-            await q.answer("Unknown plan", show_alert=True)
+            await safe_edit(
+                q,
+                "❌ Unknown plan selection.",
+                markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")]]),
+            )
             return
 
         await safe_edit(q, "⏳ Creating crypto invoice…")
@@ -3296,7 +3755,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as e:
             await safe_edit(
                 q,
-                f"❌ Could not create payment: {str(e)[:160]}",
+                f"❌ Could not create payment:\n{str(e)[:380]}",
                 markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")]]),
             )
             return
@@ -3329,7 +3788,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         payment_id = q.data[len("crypto_check_"):]
         row = db_crypto_payment_get(payment_id)
         if not row:
-            await q.answer("Payment not found", show_alert=True)
+            await safe_edit(
+                q,
+                "❌ Payment not found or expired.",
+                markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")]]),
+            )
             return
         await safe_edit(q, "⏳ Checking payment status…")
         try:
@@ -3427,7 +3890,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             loop = asyncio.get_event_loop()
             a = await asyncio.wait_for(
-                loop.run_in_executor(None, full_analysis, price_val, _prev_prices.get(pair), pair),
+                loop.run_in_executor(
+                    None,
+                    lambda pr=price_val, prev=_prev_prices.get(pair), pk=pair: full_analysis(
+                        pr, prev, pk,
+                    ),
+                ),
                 timeout=45,   # increased: parallel fetch ~15s + groq ~20s
             )
         except asyncio.TimeoutError:
@@ -3576,10 +4044,11 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                 _prev_prices[pair] = _prices[pair]
                 _prices[pair]      = p
 
-        now_utc = datetime.utcnow()
+        now_utc = datetime.now(UTC)
         h = now_utc.hour
 
-        # 2) Market analysis posts (with image)
+        # 2) Channel market-analysis posts — Groq only in CHANNEL_HOURS_UTC (~few times/day),
+        #    using GROQ_MODEL_NEWS (high daily quota), not every monitor tick.
         if h in CHANNEL_HOURS_UTC and h != _last_channel_post_hour:
             _last_channel_post_hour = h
             for pair in PAIRS:
@@ -3587,7 +4056,9 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                 if not price:
                     continue
                 try:
-                    a    = full_analysis(price, _prev_prices.get(pair), pair)
+                    a    = await asyncio.to_thread(
+                        full_analysis, price, _prev_prices.get(pair), pair, GROQ_MODEL_NEWS,
+                    )
                     text = groq_channel_post(a, post_type_for_hour(h))
                     cfg  = PAIRS[pair]
                     sent = await safe_send_photo(context.bot, CHANNEL_ID, cfg["image"], text)
@@ -3606,7 +4077,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                 except Exception as e:
                     log.error("Channel post error (%s): %s", pair, e)
 
-        # 3) Article posts (with image)
+        # 3) Educational / news articles — Groq only in ARTICLE_HOURS_UTC, GROQ_MODEL_NEWS via groq_article().
         if h in ARTICLE_HOURS_UTC and h != _last_article_hour:
             _last_article_hour = h
             topic_type = "edu" if _article_index % 2 == 0 else "news"
@@ -3616,14 +4087,14 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                 topic = NEWS_TOPICS[(_article_index // 2) % len(NEWS_TOPICS)]
             _article_index += 1
             try:
-                body = groq_article(topic_type, topic)
+                body = await asyncio.to_thread(groq_article, topic_type, topic)
                 text = format_article_post(topic_type, body)
                 await send_article_with_image(context.bot, CHANNEL_ID, topic_type, topic, text)
                 log.info("Channel: article [%s] published: %s", topic_type, topic[:50])
             except Exception as e:
                 log.error("Article post error: %s", e)
 
-        # 4) Per-user trade monitoring + auto-signals
+        # 4) Per-user trade monitoring + auto-signals (GROQ_MODEL_SIGNALS via full_analysis default)
         for cid, u in list(USERS.items()):
             acc = db_access(cid)
             if not acc["allowed"]:
@@ -3670,7 +4141,9 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                     if time.time() - ps.last_signal_time > cooldown:
                         prev = _prev_prices.get(pair)
                         if prev:
-                            a = full_analysis(price, prev, pair)
+                            a = await asyncio.to_thread(
+                                full_analysis, price, prev, pair,
+                            )
                             if a["score"] >= score_min and a["score"] > ps.last_signal_score:
                                 priority_tag = " 💠 *Priority*" if plan == "diamond" else ""
                                 text = (build_analysis_text(a)
@@ -3702,7 +4175,7 @@ def db_save_signal(pair: str, direction: str, entry: float,
 
 def db_get_open_signals(days: int = 30) -> list:
     """Get unresolved signals from the last N days."""
-    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
     with db_connect() as c:
         return c.execute(
             "SELECT * FROM signals WHERE outcome IS NULL AND posted_at >= ?",
@@ -3720,7 +4193,7 @@ def db_resolve_signal(sig_id: int, outcome: str, pnl_pct: float) -> None:
 
 def db_backtest_stats(pair: str | None = None, days: int = 30) -> dict:
     """Return win/loss/pending stats for resolved signals."""
-    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
     with db_connect() as c:
         q_base = "FROM signals WHERE posted_at >= ?"
         params: list = [cutoff]
@@ -3815,7 +4288,7 @@ def _resolve_open_signals() -> int:
                 else:
                     pnl_pct = round((entry - last) / entry * 100, 2)
                 # Only mark as expired if older than 24h
-                age_h = (datetime.utcnow() - start).total_seconds() / 3600
+                age_h = (datetime.now(UTC) - start.replace(tzinfo=UTC)).total_seconds() / 3600
                 if age_h >= 24:
                     outcome = "EXPIRED"
 
@@ -4219,7 +4692,7 @@ async def cmd_forcearticle(update, context):
         topic = EDU_TOPICS[(_article_index // 2) % len(EDU_TOPICS)]
     _article_index += 1
     try:
-        body = groq_article(topic_type, topic)
+        body = await asyncio.to_thread(groq_article, topic_type, topic)
         text = format_article_post(topic_type, body)
         await send_article_with_image(context.bot, CHANNEL_ID, topic_type, topic, text)
         await update.message.reply_text(f"Published! Type: {topic_type} Topic: {topic[:60]}")
@@ -4231,6 +4704,19 @@ def main() -> None:
     global _APP_REF
     db_init()
     log.info("DB initialised. Starting bot…")
+    log.info(
+        "Groq: channel/articles=%s | user signals=%s | monitor interval=%ss",
+        GROQ_MODEL_NEWS,
+        GROQ_MODEL_SIGNALS,
+        MONITOR_INTERVAL_SEC,
+    )
+    if _openrouter_configured():
+        log.info(
+            "OpenRouter: %d API key(s) — round-robin + auto-failover on quota (429)",
+            len(_OPENROUTER_KEYS),
+        )
+    else:
+        log.info("OpenRouter: not configured (optional; used after Groq 429 with Gemini fallback)")
 
     app = ApplicationBuilder().token(TOKEN).build()
     _APP_REF = app  # store reference for TV webhook handler
@@ -4250,7 +4736,7 @@ def main() -> None:
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
-    app.job_queue.run_repeating(monitor, interval=60, first=15)
+    app.job_queue.run_repeating(monitor, interval=MONITOR_INTERVAL_SEC, first=15)
 
     # Start TradingView webhook server
     async def post_init(application):
