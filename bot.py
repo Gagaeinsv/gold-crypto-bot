@@ -100,6 +100,9 @@ def _openrouter_configured() -> bool:
 # Google Gemini — deep analysis, chart vision, Groq 429 fallback (works alongside OpenRouter)
 GEMINI_KEY   = os.getenv("GEMINI_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# If set — used only for /deepanalysis (long report). Fallback: GEMINI_MODEL.
+# Hint: gemini-2.5-flash-lite is often stabler for exhaustive multi-section text.
+GEMINI_DEEP_ANALYSIS_MODEL = (os.getenv("GEMINI_DEEP_ANALYSIS_MODEL") or "").strip() or GEMINI_MODEL
 # gemini | openrouter | auto  (auto prefers Gemini when GEMINI_KEY is set)
 DEEP_ANALYSIS_PROVIDER = os.getenv("DEEP_ANALYSIS_PROVIDER", "gemini").strip().lower()
 CHART_VISION_PROVIDER  = os.getenv("CHART_VISION_PROVIDER", "gemini").strip().lower()
@@ -434,6 +437,19 @@ DEEP_ANALYSIS_DAILY_LIMIT = 3  # per user per day
 DEEP_ANALYSIS_MAX_OUTPUT_TOKENS_GEMINI = 65536
 # Completion limits vary by OpenRouter upstream model — stay below common hard caps.
 DEEP_ANALYSIS_MAX_OUTPUT_TOKENS_OPENROUTER = 16384
+DEEP_ANALYSIS_MAX_ROUNDS = 4
+DEEP_ANALYSIS_ASYNC_TIMEOUT_SEC = 300
+_DEEP_ANALYSIS_CONTINUE_MSG = (
+    "STOP: Your last answer did NOT finish the full report.\n\n"
+    "Continue from exactly the last character printed — finish the unfinished "
+    "sentence/bullet first, then every remaining numbered section.\n\n"
+    "Rules:\n"
+    "- Keep the SAME template (sections 1 through 8 with the SAME headings).\n"
+    "- Do NOT repeat blocks that already look complete unless you fix a typo.\n"
+    "- MUST end inside section \"8. FINAL VERDICT\" with a line starting with "
+    "\"Risk per trade:\" including a numeric % suggestion (e.g. 1–2%).\n"
+)
+
 
 def db_deepanalysis_count_today(cid: int) -> int:
     """Return how many deep analyses this user has used today (UTC)."""
@@ -3317,6 +3333,16 @@ def _get_macro_context(pair: str) -> str:
     return "\n".join(results[:8]) if results else "No macro news available"
 
 
+def _deep_analysis_report_complete(text: str) -> bool:
+    """Heuristic — models often STOP early even when not out of tokens."""
+    s = (text or "").strip()
+    idx = s.rfind("8.")
+    if idx < 0:
+        return False
+    tail = s[idx:].lower()
+    return ("final verdict" in tail) and ("risk per trade" in tail)
+
+
 def _build_deep_prompt(pair: str, price: float, tf_data: dict,
                        macro: str, econ: dict) -> str:
     """Build the comprehensive prompt for the deep-analysis LLM."""
@@ -3416,6 +3442,13 @@ Respond ONLY in this exact structure. Use the actual numbers from the data above
    Entry timing: [immediate / on pullback to X / on breakout above X]
    Risk per trade: [suggested % of capital, e.g. 1–2%]
 
+═══════════════════════════════════════════════════════
+CRITICAL RULES (non-negotiable)
+- Produce ALL sections numbered 1 through 8 in one cohesive report (no omission).
+- Do not stop inside section 1 or 2; continue until section 8 is fully written.
+- The last substantive line MUST be Risk per trade: [...] inside section 8.
+═══════════════════════════════════════════════════════
+
 Be precise. Use exact prices from the data. No vague statements."""
 
 
@@ -3436,7 +3469,7 @@ def _resolved_deep_provider() -> str:
 
 
 def _deep_analysis_model_label() -> str:
-    return OPENROUTER_MODEL if _resolved_deep_provider() == "openrouter" else GEMINI_MODEL
+    return OPENROUTER_MODEL if _resolved_deep_provider() == "openrouter" else GEMINI_DEEP_ANALYSIS_MODEL
 
 
 def _deep_analysis_config_ok() -> tuple[bool, str]:
@@ -3519,11 +3552,46 @@ def _openrouter_deep_analysis(pair: str, price: float) -> str:
 
     prompt = _build_deep_prompt(pair, price, tf_data, macro, econ)
 
-    return _openrouter_chat(
-        [{"role": "user", "content": prompt}],
-        max_tokens=DEEP_ANALYSIS_MAX_OUTPUT_TOKENS_OPENROUTER,
-        temperature=0.35,
-    )
+    messages: list = [{"role": "user", "content": prompt}]
+    accumulated = ""
+    last_piece = ""
+
+    for rnd in range(DEEP_ANALYSIS_MAX_ROUNDS):
+        last_piece = _openrouter_chat(
+            messages,
+            max_tokens=DEEP_ANALYSIS_MAX_OUTPUT_TOKENS_OPENROUTER,
+            temperature=0.25,
+        )
+        accumulated = (
+            accumulated.rstrip() + "\n\n" + last_piece.strip()
+            if rnd
+            else last_piece
+        ).strip()
+
+        log.info(
+            "Deep analysis OpenRouter round %s len=%s complete=%s",
+            rnd + 1,
+            len(accumulated),
+            _deep_analysis_report_complete(accumulated),
+        )
+
+        if _deep_analysis_report_complete(accumulated):
+            return accumulated
+
+        if rnd >= DEEP_ANALYSIS_MAX_ROUNDS - 1:
+            log.warning(
+                "Deep analysis OpenRouter: report still incomplete after %s rounds "
+                "(len=%s trailing=%r)",
+                DEEP_ANALYSIS_MAX_ROUNDS,
+                len(accumulated),
+                accumulated[-320:],
+            )
+            break
+
+        messages.append({"role": "assistant", "content": last_piece})
+        messages.append({"role": "user", "content": _DEEP_ANALYSIS_CONTINUE_MSG})
+
+    return accumulated
 
 
 def _gemini_deep_analysis(pair: str, price: float) -> str:
@@ -3550,13 +3618,75 @@ def _gemini_deep_analysis(pair: str, price: float) -> str:
 
     prompt = _build_deep_prompt(pair, price, tf_data, macro, econ)
 
+    import google.genai.types as gtypes
+
     client = genai.Client(api_key=GEMINI_KEY)
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=_gemini_content_config(DEEP_ANALYSIS_MAX_OUTPUT_TOKENS_GEMINI),
+    model = GEMINI_DEEP_ANALYSIS_MODEL
+    cfg = _gemini_content_config(
+        DEEP_ANALYSIS_MAX_OUTPUT_TOKENS_GEMINI,
+        temperature=0.25,
     )
-    return _gemini_response_visible_text(response)
+
+    usr = lambda t: gtypes.Content(
+        role="user",
+        parts=[gtypes.Part.from_text(text=t)],
+    )
+    mdl = lambda t: gtypes.Content(
+        role="model",
+        parts=[gtypes.Part.from_text(text=t)],
+    )
+
+    history = [usr(prompt)]
+    accumulated = ""
+    last_piece = ""
+
+    for rnd in range(DEEP_ANALYSIS_MAX_ROUNDS):
+        response = client.models.generate_content(
+            model=model,
+            contents=history,
+            config=cfg,
+        )
+        last_piece = _gemini_response_visible_text(response).strip()
+        accumulated = (
+            accumulated.rstrip() + "\n\n" + last_piece
+            if rnd
+            else last_piece
+        ).strip()
+
+        log.info(
+            "Deep analysis Gemini round %s model=%s len=%s complete=%s",
+            rnd + 1,
+            model,
+            len(accumulated),
+            _deep_analysis_report_complete(accumulated),
+        )
+
+        if _deep_analysis_report_complete(accumulated):
+            return accumulated
+
+        if rnd >= DEEP_ANALYSIS_MAX_ROUNDS - 1:
+            log.warning(
+                "Deep analysis Gemini (%s): report still incomplete after %s rounds "
+                "(len=%s trailing=%r)",
+                model,
+                DEEP_ANALYSIS_MAX_ROUNDS,
+                len(accumulated),
+                accumulated[-320:],
+            )
+            break
+
+        if not last_piece:
+            log.warning(
+                "Deep analysis Gemini (%s): empty model text at round %s",
+                model,
+                rnd + 1,
+            )
+            break
+
+        history.append(mdl(last_piece))
+        history.append(usr(_DEEP_ANALYSIS_CONTINUE_MSG))
+
+    return accumulated
 
 
 def _deep_analysis_llm_call(pair: str, price: float) -> str:
@@ -3665,7 +3795,7 @@ async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair:
         f"🧠 *Deep Analysis* — {cfg['emoji']} {cfg['name']}\n\n"
         f"Model: `{_deep_analysis_model_label()}`\n"
         f"⏳ Gathering data from 4 timeframes + macro news…\n\n"
-        f"_This takes 30-60 seconds — please wait_",
+        f"_This may take ~1–3 minutes (multi-step AI) — please wait_",
         parse_mode="Markdown",
     )
 
@@ -3678,10 +3808,13 @@ async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair:
         loop   = asyncio.get_event_loop()
         result = await asyncio.wait_for(
             loop.run_in_executor(None, _deep_analysis_llm_call, pair, price),
-            timeout=120,
+            timeout=DEEP_ANALYSIS_ASYNC_TIMEOUT_SEC,
         )
     except asyncio.TimeoutError:
-        await reply("⏱ Analysis timed out (120s). Please try again.", parse_mode="Markdown")
+        await reply(
+            f"⏱ Analysis timed out ({DEEP_ANALYSIS_ASYNC_TIMEOUT_SEC}s). Please try again.",
+            parse_mode="Markdown",
+        )
         return
     except Exception as e:
         await reply(f"❌ Error: {str(e)[:200]}")
