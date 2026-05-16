@@ -642,7 +642,7 @@ def nowp_crypto_invoice_ceiling_usd(list_price_usd: float) -> float | None:
         return None
 
     lst = max(0.0, float(list_price_usd))
-    abs_extra = max(0.0, float(os.getenv("NOWP_CRYPTO_MAX_SURCHARGE_ABS_USD", "6")))
+    abs_extra = max(0.0, float(os.getenv("NOWP_CRYPTO_MAX_SURCHARGE_ABS_USD", "14")))
     pct = max(0.0, float(os.getenv("NOWP_CRYPTO_MAX_SURCHARGE_PCT", "35")))
     ceil_usd = round(lst + max(abs_extra, lst * pct / 100.0), 2)
     log.debug(
