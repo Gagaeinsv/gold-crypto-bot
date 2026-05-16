@@ -21,6 +21,7 @@ import sqlite3
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from html import escape as html_escape
 from typing import Optional
 from urllib.parse import urlparse, urlencode
 
@@ -267,6 +268,62 @@ def is_gaming_related(title: str, description: str = "") -> bool:
     combined = (title + " " + description).lower()
     return any(kw in combined for kw in GAMING_KEYWORDS)
 
+_INVALID_SLUGS = frozenset({"[]", "{}", "null", "none", "undefined"})
+
+def normalize_article_url(url: str) -> str:
+    """Return a clean http(s) URL or empty string."""
+    if not url:
+        return ""
+    url = url.strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    if not url.startswith(("http://", "https://")):
+        return ""
+    return url
+
+def pick_epic_slug(product_slug: object, url_slug: object) -> str:
+    """Epic API sometimes returns productSlug as the literal string '[]'."""
+    for raw in (product_slug, url_slug):
+        if raw is None:
+            continue
+        slug = str(raw).strip().lower()
+        if not slug or slug in _INVALID_SLUGS:
+            continue
+        if re.fullmatch(r"[\w\-]+", slug):
+            return slug
+    return ""
+
+def epic_store_url(el: dict) -> str:
+    slug = pick_epic_slug(el.get("productSlug"), el.get("urlSlug"))
+    if slug:
+        return f"https://store.epicgames.com/uk/p/{slug}"
+    return "https://store.epicgames.com/uk/free-games"
+
+async def resolve_final_url(client: httpx.AsyncClient, url: str) -> str:
+    """
+    Follow redirects so GamerPower /open/... links become direct Steam/Epic/etc. URLs.
+    """
+    url = normalize_article_url(url)
+    if not url:
+        return ""
+    if "gamerpower.com/open/" not in url:
+        return url
+    try:
+        resp = await client.head(url, follow_redirects=True, timeout=15)
+        final = normalize_article_url(str(resp.url))
+        if final and "gamerpower.com/open/" not in final:
+            return final
+    except Exception:
+        pass
+    try:
+        resp = await client.get(url, follow_redirects=True, timeout=15)
+        final = normalize_article_url(str(resp.url))
+        if final and "gamerpower.com/open/" not in final:
+            return final
+    except Exception as exc:
+        log.warning("Redirect resolve failed for %s: %s", url, exc)
+    return url
+
 def extract_image_from_rss_entry(entry_xml: ET.Element, ns: dict) -> Optional[str]:
     """Try to extract an image URL from an RSS entry XML element."""
     # Check media:content
@@ -374,7 +431,7 @@ async def fetch_rss(client: httpx.AsyncClient, source: dict) -> list[dict]:
                 link_el = entry.find("{http://www.w3.org/2005/Atom}link[@rel='alternate']")
                 if link_el is None:
                     link_el = entry.find("{http://www.w3.org/2005/Atom}link")
-                url = link_el.get("href", "") if link_el is not None else ""
+                url = normalize_article_url(link_el.get("href", "") if link_el is not None else "")
                 summary = clean_html(atom_text("summary") or atom_text("content"))
                 pub_date = parse_rss_date(atom_text("published") or atom_text("updated"))
                 img = extract_image_from_rss_entry(entry, ns)
@@ -394,7 +451,11 @@ async def fetch_rss(client: httpx.AsyncClient, source: dict) -> list[dict]:
                     return el.text.strip() if el is not None and el.text else ""
 
                 title   = rss_text("title")
-                url     = rss_text("link") or rss_text("guid")
+                url     = normalize_article_url(rss_text("link"))
+                if not url:
+                    guid = rss_text("guid")
+                    if guid.startswith("http"):
+                        url = normalize_article_url(guid)
                 summary = clean_html(rss_text("description"))
                 pub_str = rss_text("pubDate") or rss_text("dc:date")
                 pub_date = parse_rss_date(pub_str)
@@ -437,12 +498,15 @@ async def fetch_gamerpower_giveaways(client: httpx.AsyncClient) -> list[dict]:
         return []
 
     giveaways = []
+    pending: list[dict] = []
     for item in items[:20]:
         if item.get("status") != "Active":
             continue
         title    = item.get("title", "")
         desc     = clean_html(item.get("description", ""))
-        url      = item.get("open_giveaway_url") or item.get("giveaway_url", "")
+        url      = normalize_article_url(
+            item.get("open_giveaway_url") or item.get("giveaway_url") or ""
+        )
         image    = item.get("image", "")
         platform = item.get("platforms", "PC")
         worth    = item.get("worth", "")
@@ -453,7 +517,7 @@ async def fetch_gamerpower_giveaways(client: httpx.AsyncClient) -> list[dict]:
 
         summary = f"{desc[:300]}{worth_str}{end_str}" if desc else f"{worth_str}{end_str}"
 
-        giveaways.append({
+        pending.append({
             "title":    title,
             "url":      url,
             "summary":  summary,
@@ -464,6 +528,18 @@ async def fetch_gamerpower_giveaways(client: httpx.AsyncClient) -> list[dict]:
             "pub_date": datetime.now(timezone.utc),
             "image_fallback": "https://www.gamerpower.com/images/gamerpower-logo.png",
         })
+
+    # Resolve GamerPower redirect pages → direct Steam / Epic / itch.io links
+    if pending:
+        resolved = await asyncio.gather(
+            *[resolve_final_url(client, g["url"]) for g in pending],
+            return_exceptions=True,
+        )
+        for g, final in zip(pending, resolved):
+            if isinstance(final, str) and final:
+                g["url"] = final
+            giveaways.append(g)
+
     return giveaways
 
 async def fetch_epic_free_games(client: httpx.AsyncClient) -> list[dict]:
@@ -501,8 +577,7 @@ async def fetch_epic_free_games(client: httpx.AsyncClient) -> list[dict]:
             continue
 
         title = el.get("title", "")
-        slug  = el.get("productSlug") or el.get("urlSlug") or ""
-        url   = f"https://store.epicgames.com/uk/p/{slug}" if slug else "https://store.epicgames.com/uk/free-games"
+        url   = epic_store_url(el)
         desc  = clean_html(el.get("description", ""))
 
         image = ""
@@ -693,20 +768,22 @@ def format_post(article: dict, ai_body: Optional[str] = None) -> str:
     plat_em  = PLATFORM_EMOJI.get(platform, "") if platform else ""
 
     lines = []
-    lines.append(f"{emoji}{plat_em} <b>{title}</b>")
+    lines.append(f"{emoji}{plat_em} <b>{html_escape(title)}</b>")
     lines.append("")
 
     if ai_body:
-        lines.append(ai_body)
+        lines.append(html_escape(ai_body))
     elif summary:
-        lines.append(summary[:600])
+        lines.append(html_escape(summary[:600]))
 
+    url = normalize_article_url(url)
     if url:
         lines.append("")
-        lines.append(f"🔗 <a href='{url}'>Читати повністю</a>")
+        link_label = "Забрати гру" if cat == "giveaway" else "Читати повністю"
+        lines.append(f'🔗 <a href="{html_escape(url, quote=True)}">{link_label}</a>')
 
     if source:
-        lines.append(f"\n📰 <i>Джерело: {source}</i>")
+        lines.append(f"\n📰 <i>Джерело: {html_escape(source)}</i>")
 
     text = "\n".join(lines)
     return truncate(text, 1024)
