@@ -11,8 +11,7 @@ def fix_markdown(text: str) -> str:
 Gold & Crypto AI Signals Bot
 Run: python bot.py
 Dependencies: pip install python-telegram-bot[job-queue] requests groq google-genai pillow yfinance pandas pandas-ta python-dotenv
-Env: Groq/OpenRouter pools/Gemini; `AI_ROUTE_*` per workload (signals, articles, deep, chart);
-     OpenRouter `OPENROUTER_KEYS_LIGHT`/`HEAVY` + rollover; Gemini — see .env.example.
+Env: Groq/OpenRouter pools/Gemini; `AI_ROUTE_*`; OpenRouter pools; Gemini `GEMINI_DISABLE_THINKING` (see .env.example).
 """
 
 import asyncio
@@ -160,6 +159,87 @@ except ValueError:
     _cv_out_cap = 4096
 # Chart screenshot multimodal replies; tight limits cut off before SL/TP/verdict sections.
 CHART_VISION_MAX_OUTPUT_TOKENS = max(1024, min(_cv_out_cap, 65536))
+
+
+def _gemini_thinking_kw() -> dict:
+    """Gemini 2.5 can spend max_output_tokens on internal reasoning; visible text truncates early."""
+    import google.genai.types as gtypes
+
+    v = os.getenv("GEMINI_DISABLE_THINKING", "1").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return {}
+    return {"thinking_config": gtypes.ThinkingConfig(thinking_budget=0)}
+
+
+def _gemini_candidate_visible_text(candidate) -> str:
+    chunks: list[str] = []
+    content = getattr(candidate, "content", None)
+    for part in getattr(content, "parts", None) or []:
+        t = getattr(part, "text", None)
+        if isinstance(t, str) and t.strip():
+            chunks.append(t)
+    return "".join(chunks).strip()
+
+
+def _gemini_response_visible_text(response, *, context: str) -> str:
+    """Safely extract user-visible text (handles blocked prompts and quirky responses)."""
+    import google.genai.types as gtypes
+
+    fb = getattr(response, "prompt_feedback", None)
+    block_reason = getattr(fb, "block_reason", None) if fb else None
+    if block_reason:
+        raise RuntimeError(
+            f"Gemini blocked the request [{context}]: {block_reason}",
+        )
+
+    extracted: list[str] = []
+    try:
+        t = response.text  # raises if mixed/blocked/no parts depending on SDK
+        if isinstance(t, str) and t.strip():
+            extracted.append(t.strip())
+    except Exception as e:
+        log.info("Gemini %s: response.text not used (%s)", context, str(e)[:200])
+
+    if not extracted:
+        for cand in getattr(response, "candidates", None) or []:
+            s = _gemini_candidate_visible_text(cand)
+            if s:
+                extracted.append(s)
+
+    out = extracted[0] if len(extracted) == 1 else "\n".join(extracted).strip()
+
+    fr = None
+    cands = getattr(response, "candidates", None) or []
+    if cands:
+        fr = getattr(cands[0], "finish_reason", None)
+        if fr == gtypes.FinishReason.MAX_TOKENS:
+            suffix = ""
+            if context == "deep_analysis":
+                suffix = (
+                    " — raise DEEP_ANALYSIS_MAX_OUTPUT_TOKENS "
+                    "or ensure GEMINI_DISABLE_THINKING=1 (thinking eats output quota)"
+                )
+            elif context == "chart_vision":
+                suffix = (
+                    " — raise CHART_VISION_MAX_OUTPUT_TOKENS "
+                    "or ensure GEMINI_DISABLE_THINKING=1"
+                )
+            log.warning("Gemini %s hit MAX_TOKENS%s", context, suffix)
+        unsafe = frozenset(
+            {
+                gtypes.FinishReason.SAFETY,
+                gtypes.FinishReason.PROHIBITED_CONTENT,
+                gtypes.FinishReason.RECITATION,
+            }
+        )
+        if fr in unsafe and not out.strip():
+            raise RuntimeError(f"Gemini refused output [{context}]: finish_reason={fr}")
+
+    if not out.strip():
+        raise RuntimeError(f"Gemini returned empty visible text [{context}] finish_reason={fr}")
+    return out
+
+
 # gemini | openrouter | auto  (auto prefers Gemini when GEMINI_KEY is set)
 DEEP_ANALYSIS_PROVIDER = os.getenv("DEEP_ANALYSIS_PROVIDER", "gemini").strip().lower()
 CHART_VISION_PROVIDER  = os.getenv("CHART_VISION_PROVIDER", "gemini").strip().lower()
@@ -1773,9 +1853,12 @@ def _gemini_text(prompt: str, max_tokens: int = 500) -> str:
     response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
-        config=gtypes.GenerateContentConfig(max_output_tokens=max_tokens),
+        config=gtypes.GenerateContentConfig(
+            max_output_tokens=max_tokens,
+            **_gemini_thinking_kw(),
+        ),
     )
-    return response.text
+    return _gemini_response_visible_text(response, context="gemini_text")
 
 
 def _gemini_json_analysis(prompt: str) -> str:
@@ -1790,9 +1873,10 @@ def _gemini_json_analysis(prompt: str) -> str:
         config=gtypes.GenerateContentConfig(
             max_output_tokens=300,
             response_mime_type="application/json",
+            **_gemini_thinking_kw(),
         ),
     )
-    return response.text
+    return _gemini_response_visible_text(response, context="signal_json_gemini")
 
 
 _AI_ROUTE_BACKEND_TOKENS = frozenset({
@@ -3663,18 +3747,10 @@ def _chart_vision_via_gemini(photo_bytes: bytes, prompt: str) -> str:
         contents=[prompt, image],
         config=gtypes.GenerateContentConfig(
             max_output_tokens=CHART_VISION_MAX_OUTPUT_TOKENS,
+            **_gemini_thinking_kw(),
         ),
     )
-    cands = getattr(response, "candidates", None) or []
-    if cands:
-        fr = getattr(cands[0], "finish_reason", None)
-        if fr == gtypes.FinishReason.MAX_TOKENS:
-            log.warning(
-                "Gemini chart vision hit MAX_TOKENS at max_output_tokens=%s — "
-                "increase CHART_VISION_MAX_OUTPUT_TOKENS if analysis cuts off.",
-                CHART_VISION_MAX_OUTPUT_TOKENS,
-            )
-    return response.text
+    return _gemini_response_visible_text(response, context="chart_vision")
 
 
 def _chart_vision_via_openrouter(
@@ -3789,18 +3865,10 @@ def _gemini_deep_analysis(pair: str, price: float) -> str:
         contents=prompt,
         config=gtypes.GenerateContentConfig(
             max_output_tokens=DEEP_ANALYSIS_MAX_OUTPUT_TOKENS,
+            **_gemini_thinking_kw(),
         ),
     )
-    cands = getattr(response, "candidates", None) or []
-    if cands:
-        fr = getattr(cands[0], "finish_reason", None)
-        if fr == gtypes.FinishReason.MAX_TOKENS:
-            log.warning(
-                "Gemini deep analysis hit MAX_TOKENS at max_output_tokens=%s — "
-                "increase DEEP_ANALYSIS_MAX_OUTPUT_TOKENS if the report cuts off.",
-                DEEP_ANALYSIS_MAX_OUTPUT_TOKENS,
-            )
-    return response.text
+    return _gemini_response_visible_text(response, context="deep_analysis")
 
 
 def _deep_analysis_llm_call(pair: str, price: float) -> str:
