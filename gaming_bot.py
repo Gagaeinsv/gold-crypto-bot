@@ -27,7 +27,7 @@ from urllib.parse import urlparse, urlencode
 
 import httpx
 from dotenv import load_dotenv
-from telegram import Bot, InputMediaPhoto
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 
@@ -294,10 +294,26 @@ def pick_epic_slug(product_slug: object, url_slug: object) -> str:
     return ""
 
 def epic_store_url(el: dict) -> str:
+    title = (el.get("title") or "").lower()
+    # Mystery-game slugs from Epic API often point to invalid promo pages
+    if "mystery" in title:
+        return "https://store.epicgames.com/uk/free-games"
     slug = pick_epic_slug(el.get("productSlug"), el.get("urlSlug"))
     if slug:
         return f"https://store.epicgames.com/uk/p/{slug}"
     return "https://store.epicgames.com/uk/free-games"
+
+def escape_href(url: str) -> str:
+    """Escape URL for Telegram HTML href attribute."""
+    return html_escape(url, quote=True).replace("&", "&amp;")
+
+def build_url_keyboard(url: str, category: str) -> Optional[InlineKeyboardMarkup]:
+    """Telegram button with URL — reliable, unlike HTML <a> in long captions."""
+    url = normalize_article_url(url)
+    if not url:
+        return None
+    label = "🎁 Забрати гру" if category == "giveaway" else "📖 Читати статтю"
+    return InlineKeyboardMarkup([[InlineKeyboardButton(text=label, url=url)]])
 
 async def resolve_final_url(client: httpx.AsyncClient, url: str) -> str:
     """
@@ -756,43 +772,56 @@ def _gemini_rewrite(title: str, summary: str, category: str, source: str, url: s
 # ──────────────────────── Message Formatter ───────────────────────────────────
 
 def format_post(article: dict, ai_body: Optional[str] = None) -> str:
+    """
+    Build caption text. URL goes in an inline button (see build_url_keyboard),
+    NOT in HTML — long captions used to truncate mid-href and break links.
+    """
     cat      = article.get("category", "news")
     emoji    = CATEGORY_EMOJI.get(cat, "🎮")
     source   = article.get("source", "")
     title    = article.get("title", "Без назви")
     summary  = article.get("summary", "")
-    url      = article.get("url", "")
 
-    # Platform emoji for giveaways
     platform = article.get("platform", "")
     plat_em  = PLATFORM_EMOJI.get(platform, "") if platform else ""
 
-    lines = []
-    lines.append(f"{emoji}{plat_em} <b>{html_escape(title)}</b>")
-    lines.append("")
+    header = f"{emoji}{plat_em} <b>{html_escape(title)}</b>\n\n"
+    footer = f"\n\n📰 <i>Джерело: {html_escape(source)}</i>" if source else ""
+    hint   = "\n\n👇 Посилання — кнопкою нижче" if normalize_article_url(article.get("url", "")) else ""
 
-    if ai_body:
-        lines.append(html_escape(ai_body))
-    elif summary:
-        lines.append(html_escape(summary[:600]))
+    body = html_escape(ai_body) if ai_body else html_escape(summary[:600] if summary else "")
 
-    url = normalize_article_url(url)
-    if url:
-        lines.append("")
-        link_label = "Забрати гру" if cat == "giveaway" else "Читати повністю"
-        lines.append(f'🔗 <a href="{html_escape(url, quote=True)}">{link_label}</a>')
+    # Reserve space for header, footer, hint — never truncate the button URL
+    budget = MAX_POST_LENGTH - len(header) - len(footer) - len(hint) - 4
+    if len(body) > budget > 0:
+        body = body[: budget - 3].rstrip() + "..."
 
-    if source:
-        lines.append(f"\n📰 <i>Джерело: {html_escape(source)}</i>")
-
-    text = "\n".join(lines)
-    return truncate(text, 1024)
+    return header + body + hint + footer
 
 # ──────────────────────── Telegram Poster ─────────────────────────────────────
 
-async def send_post(bot: Bot, article: dict, conn: sqlite3.Connection) -> bool:
+async def finalize_article_url(client: httpx.AsyncClient, article: dict) -> None:
+    """Ensure article URL is the final store/article page before posting."""
+    url = normalize_article_url(article.get("url", ""))
+    if not url:
+        return
+    if "gamerpower.com/open/" in url:
+        url = await resolve_final_url(client, url)
+    article["url"] = url
+
+async def send_post(
+    bot: Bot,
+    article: dict,
+    conn: sqlite3.Connection,
+    client: Optional[httpx.AsyncClient] = None,
+) -> bool:
     """Send a single article as a Telegram post. Returns True on success."""
-    h = make_hash(article.get("url", ""), article.get("title", ""))
+    if client:
+        await finalize_article_url(client, article)
+
+    url   = normalize_article_url(article.get("url", ""))
+    title = article.get("title", "")
+    h     = make_hash(url, title)
     if is_posted(conn, h):
         return False
 
@@ -804,51 +833,42 @@ async def send_post(bot: Bot, article: dict, conn: sqlite3.Connection) -> bool:
             ai_body = await loop.run_in_executor(
                 None,
                 _gemini_rewrite,
-                article.get("title", ""),
+                title,
                 article.get("summary", ""),
                 article.get("category", "news"),
                 article.get("source", ""),
-                article.get("url", ""),
+                url,
             )
             if ai_body:
-                log.info("Gemini rewrote: %s", article.get("title", "")[:60])
+                log.info("Gemini rewrote: %s", title[:60])
         except Exception as exc:
             log.warning("Gemini executor error: %s", exc)
 
-    caption = format_post(article, ai_body=ai_body)
-    image   = article.get("image") or article.get("image_fallback") or ""
-    url     = article.get("url", "")
-    title   = article.get("title", "")
+    caption  = format_post(article, ai_body=ai_body)
+    image    = article.get("image") or article.get("image_fallback") or ""
+    keyboard = build_url_keyboard(url, article.get("category", "news"))
+    send_kw  = {"chat_id": CHANNEL_ID, "parse_mode": ParseMode.HTML, "reply_markup": keyboard}
 
     try:
         if image:
-            await bot.send_photo(
-                chat_id    = CHANNEL_ID,
-                photo      = image,
-                caption    = caption,
-                parse_mode = ParseMode.HTML,
-            )
+            await bot.send_photo(photo=image, caption=caption, **send_kw)
         else:
-            # No image — send as text with a link preview
             await bot.send_message(
-                chat_id             = CHANNEL_ID,
-                text                = caption,
-                parse_mode          = ParseMode.HTML,
-                disable_web_page_preview = False,
+                text=caption,
+                disable_web_page_preview=True,
+                **send_kw,
             )
         mark_posted(conn, h, title, url, article.get("category", "news"), article.get("source", ""))
-        log.info("Posted: [%s] %s", article.get("category"), title[:80])
+        log.info("Posted: [%s] %s | link: %s", article.get("category"), title[:60], url[:100])
         return True
     except TelegramError as exc:
         log.error("Telegram error posting '%s': %s", title[:60], exc)
-        # If image caused error — retry as text-only
         if image:
             try:
                 await bot.send_message(
-                    chat_id    = CHANNEL_ID,
-                    text       = caption,
-                    parse_mode = ParseMode.HTML,
-                    disable_web_page_preview=False,
+                    text=caption,
+                    disable_web_page_preview=True,
+                    **send_kw,
                 )
                 mark_posted(conn, h, title, url, article.get("category", "news"), article.get("source", ""))
                 return True
@@ -964,7 +984,7 @@ async def run_bot():
                     if post_count > 0 and not is_fallback:
                         await asyncio.sleep(MIN_POST_GAP)
 
-                    posted = await send_post(bot, article, conn)
+                    posted = await send_post(bot, article, conn, client)
                     if posted:
                         post_count += 1
                         last_post_time = time.time()
