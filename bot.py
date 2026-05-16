@@ -494,6 +494,138 @@ def _nowp_headers() -> dict:
     }
 
 
+def _nowp_first_float(d: dict, keys: tuple[str, ...]) -> float | None:
+    """First parsable numeric among common NOWPayments JSON field names."""
+    for key in keys:
+        raw = d.get(key)
+        if raw is None:
+            continue
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _nowp_http_get_body(path_relative: str, params: dict) -> dict | None:
+    """GET `/v1/{path_relative}` → JSON dict or None on transport / HTTP error."""
+    url = f"{NOWPAYMENTS_BASE}/{path_relative.lstrip('/')}"
+    try:
+        r = requests.get(url, headers=_nowp_headers(), params=params, timeout=12)
+    except requests.RequestException as e:
+        log.warning("NOWPayments GET %s transport error: %s", path_relative, e)
+        return None
+    try:
+        body = r.json()
+    except ValueError:
+        log.warning(
+            "NOWPayments GET %s non-JSON HTTP %s: %s",
+            path_relative,
+            r.status_code,
+            (r.text or "")[:220],
+        )
+        return None
+    if not isinstance(body, dict):
+        return None
+    if not r.ok or body.get("status") is False:
+        detail_parts = []
+        for k in ("message", "code", "error"):
+            v = body.get(k)
+            if v not in (None, ""):
+                detail_parts.append(str(v))
+        detail = " ".join(detail_parts) if detail_parts else f"HTTP {r.status_code}"
+        log.warning(
+            "NOWPayments GET %s refused: HTTP %s %s",
+            path_relative,
+            r.status_code,
+            detail[:300],
+        )
+        return None
+    return body
+
+
+def nowp_minimum_pay_crypto() -> float | None:
+    """Minimum payout size in **`pay_currency`** (from `/min-amount`)."""
+    j = _nowp_http_get_body(
+        "min-amount",
+        {"currency_from": "usd", "currency_to": NOWPAYMENTS_PAY_CURRENCY},
+    )
+    if not j:
+        return None
+    return _nowp_first_float(j, ("min_amount", "minAmount"))
+
+
+def nowp_estimate_pay_crypto_for_usd(price_usd: float) -> float | None:
+    """Estimate how much **`pay_currency`** user pays for a USD-denominated list price."""
+    j = _nowp_http_get_body(
+        "estimate",
+        {
+            "amount": round(float(price_usd), 10),
+            "currency_from": "usd",
+            "currency_to": NOWPAYMENTS_PAY_CURRENCY,
+        },
+    )
+    if not j:
+        return None
+    return _nowp_first_float(j, ("estimated_amount", "estimatedAmount"))
+
+
+def nowp_price_usd_above_crypto_minimum(price_usd: float) -> float:
+    """
+    Raise fiat list price slightly if NOWPayments rejects low crypto totals (AMOUNTMINIMALERROR).
+    """
+    floor = round(float(price_usd), 8)
+    fallback_min = float(os.getenv("NOWPAYMENTS_MIN_PAY_CRYPTO_FALLBACK", "6"))
+    margin = float(os.getenv("NOWPAYMENTS_MIN_PAY_MARGIN", "1.005"))
+    step_usd = float(os.getenv("NOWPAYMENTS_MIN_TOPUP_STEP_USD", "0.1"))
+    ceiling_usd = floor + float(os.getenv("NOWPAYMENTS_MIN_TOPUP_CEILING_USD", "120"))
+    max_steps = max(50, int(os.getenv("NOWPAYMENTS_MIN_TOPUP_MAX_STEPS", "400")))
+
+    parsed_min = nowp_minimum_pay_crypto()
+    min_crypto = parsed_min if (parsed_min is not None and parsed_min > 0) else fallback_min
+    if parsed_min is None or parsed_min <= 0:
+        log.warning(
+            "NOWPayments: min-amount API missing/bad — using NOWPAYMENTS_MIN_PAY_CRYPTO_FALLBACK=%s",
+            fallback_min,
+        )
+
+    threshold = float(min_crypto) * margin
+
+    usd_eff = floor
+    for step_i in range(max_steps):
+        if usd_eff > ceiling_usd:
+            raise RuntimeError(
+                "NOWPayments: invoiced USD climbed above ceiling while sizing crypto minimum "
+                f"({usd_eff:.4f} > {ceiling_usd:.4f}); check pay_currency or API."
+            )
+
+        estimated = nowp_estimate_pay_crypto_for_usd(usd_eff)
+        if estimated is None:
+            usd_eff = round(usd_eff + max(step_usd * 10, 0.5), 6)
+            if step_i + 1 == max_steps:
+                raise RuntimeError("NOWPayments: estimate API unreachable; cannot size invoice.")
+            continue
+
+        if estimated >= threshold:
+            if usd_eff > floor:
+                log.info(
+                    "NOWPayments: raised invoice %.4f USD → %.6f USD (min pay ≈ %.8f %s, est_pay ≈ %.10f)",
+                    floor,
+                    usd_eff,
+                    min_crypto,
+                    NOWPAYMENTS_PAY_CURRENCY,
+                    estimated,
+                )
+            return usd_eff
+
+        usd_eff = round(usd_eff + step_usd, 8)
+
+    raise RuntimeError(
+        f"NOWPayments: exceeded {max_steps} sizing steps starting from {floor:.8f} USD; "
+        "try another NOWPAYMENTS_PAY_CURRENCY or increase ceiling env."
+    )
+
+
 def db_crypto_payment_upsert(
     payment_id: str,
     chat_id: int,
@@ -533,21 +665,61 @@ def nowp_create_payment(chat_id: int, plan: str, months: int, price_usd: float) 
     if not PUBLIC_BASE_URL:
         raise RuntimeError("PUBLIC_BASE_URL not set")
 
-    order_id = f"tg_{chat_id}_{plan}_{months}_{uuid.uuid4().hex[:10]}"
-    payload = {
-        "price_amount": float(price_usd),
-        "price_currency": "usd",
-        "pay_currency": NOWPAYMENTS_PAY_CURRENCY,
-        "order_id": order_id,
-        "order_description": f"Telegram subscription: {plan} x{months}mo (chat {chat_id})",
-        "ipn_callback_url": f"{PUBLIC_BASE_URL.rstrip('/')}/nowpayments",
-    }
-    r = requests.post(f"{NOWPAYMENTS_BASE}/payment", headers=_nowp_headers(), json=payload, timeout=12)
-    if not r.ok:
-        detail = _nowp_response_error_detail(r)
-        log.warning("NOWPayments POST /payment failed: status=%s body=%s", r.status_code, detail)
-        raise RuntimeError(f"NOWPayments error ({r.status_code}): {detail}")
-    data = r.json()
+    requested_usd = float(price_usd)
+    initial_usd = round(nowp_price_usd_above_crypto_minimum(requested_usd), 10)
+    price_try = float(initial_usd)
+
+    pad_usd = float(os.getenv("NOWP_AMOUNT_MINIMAL_ERR_PAD_USD", "0.25"))
+    max_pay_retries = max(2, int(os.getenv("NOWP_AMOUNT_MINIMAL_ERR_MAX_RETRIES", "5")))
+    last_detail = ""
+    data: dict | None = None
+
+    for pay_attempt in range(max_pay_retries):
+        order_id = f"tg_{chat_id}_{plan}_{months}_{uuid.uuid4().hex[:10]}"
+        invoiced_vs_list = abs(price_try - requested_usd) > 5e-3 or abs(price_try - initial_usd) > 5e-3
+        payload = {
+            "price_amount": float(price_try),
+            "price_currency": "usd",
+            "pay_currency": NOWPAYMENTS_PAY_CURRENCY,
+            "order_id": order_id,
+            "order_description": (
+                f"Telegram subscription: {plan} x{months}mo (chat {chat_id}); "
+                f"list ${requested_usd:.2f}; invoiced ${price_try:.2f} USD equiv"
+                if invoiced_vs_list
+                else f"Telegram subscription: {plan} x{months}mo (chat {chat_id})"
+            ),
+            "ipn_callback_url": f"{PUBLIC_BASE_URL.rstrip('/')}/nowpayments",
+        }
+
+        r = requests.post(f"{NOWPAYMENTS_BASE}/payment", headers=_nowp_headers(), json=payload, timeout=12)
+        if r.ok:
+            try:
+                data = r.json()
+            except ValueError:
+                raise RuntimeError("NOWPayments: payment response was not JSON")
+            break
+
+        last_detail = _nowp_response_error_detail(r)
+        log.warning(
+            "NOWPayments POST /payment attempt %s failed: status=%s body=%s",
+            pay_attempt + 1,
+            r.status_code,
+            last_detail,
+        )
+        if (
+            pay_attempt + 1 < max_pay_retries
+            and ("AMOUNTMINIMAL" in last_detail.upper() or " LESS THAN MINIMAL" in last_detail.upper())
+        ):
+            price_try = round(float(price_try) + pad_usd, 10)
+            log.warning("NOWPayments: raising invoice toward %.8f USD (AMOUNTMINIMALERROR retry)", price_try)
+            continue
+
+        raise RuntimeError(f"NOWPayments error ({r.status_code}): {last_detail}")
+
+    if data is None:
+        raise RuntimeError(last_detail or "NOWPayments payment create failed unexpectedly")
+
+    price_amount = round(float(price_try), 10)
     payment_id = str(data.get("payment_id") or "")
     if not payment_id:
         raise RuntimeError(f"NOWPayments create payment failed: {data}")
@@ -561,7 +733,7 @@ def nowp_create_payment(chat_id: int, plan: str, months: int, price_usd: float) 
         chat_id=chat_id,
         plan=plan,
         months=months,
-        price_usd=float(price_usd),
+        price_usd=float(price_amount),
         pay_currency=NOWPAYMENTS_PAY_CURRENCY,
         pay_amount=float(pay_amount) if pay_amount else None,
         pay_address=str(pay_address) if pay_address else None,
@@ -574,6 +746,8 @@ def nowp_create_payment(chat_id: int, plan: str, months: int, price_usd: float) 
         "pay_currency": NOWPAYMENTS_PAY_CURRENCY,
         "invoice_url": invoice_url,
         "raw": data,
+        "price_usd_requested": requested_usd,
+        "price_usd_invoiced": float(price_amount),
     }
 
 
@@ -3769,6 +3943,18 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "₮ *Crypto Payment Created*",
             "",
             f"Plan: *{plan_label(plan_key)}*  |  Months: *{months}*",
+        ]
+        rq = inv.get("price_usd_requested")
+        iq = inv.get("price_usd_invoiced")
+        try:
+            if rq is not None and iq is not None and round(float(iq) - float(rq), 4) >= 0.03:
+                lines.append(
+                    f"In USD (NOWPayments minimum): listed *${float(rq):.2f}* → invoiced *${float(iq):.2f}*"
+                )
+        except (TypeError, ValueError):
+            pass
+
+        lines += [
             f"Currency: *USDT (TRC20)*",
             f"Amount: *{amt}*",
             f"Address: `{addr}`",
