@@ -630,15 +630,50 @@ def nowp_estimate_pay_crypto_for_usd(price_usd: float) -> float | None:
     return estimate
 
 
+def nowp_crypto_invoice_ceiling_usd(list_price_usd: float) -> float | None:
+    """
+    HARD cap above list price shown in Telegram so NOWPayments probing cannot explode totals.
+    Set NOWP_CRYPTO_DISABLE_INVOICE_CAP=1 on your own risk.
+    effective_invoice <= list_price + max(ABS, list_price * pct/100).
+    """
+    if os.getenv("NOWP_CRYPTO_DISABLE_INVOICE_CAP", "").strip().lower() in ("1", "true", "yes", "on"):
+        return None
+
+    lst = max(0.0, float(list_price_usd))
+    abs_extra = max(0.0, float(os.getenv("NOWP_CRYPTO_MAX_SURCHARGE_ABS_USD", "6")))
+    pct = max(0.0, float(os.getenv("NOWP_CRYPTO_MAX_SURCHARGE_PCT", "35")))
+    ceil_usd = round(lst + max(abs_extra, lst * pct / 100.0), 2)
+    log.debug(
+        "NOWPayments: invoice cap list=$%.4f ceiling=$%.4f (+max($%.4f flat, %.3f%%))",
+        lst,
+        ceil_usd,
+        abs_extra,
+        pct,
+    )
+    return ceil_usd
+
+
+def _nowp_invoice_cap_blocked_message(list_price_usd: float, cap: float | None) -> str:
+    cap_txt = "—"
+    if cap is not None:
+        cap_txt = f"${cap:.2f}"
+    return (
+        "NOWPayments вимагає мінімуму вище допустимого націнування до цінника в меню. "
+        f"Тариф ${float(list_price_usd):.2f}; дозволена верхня межа інвойса — {cap_txt}. "
+        "Спробуй оплату ⭐ або звернися до підтримки / адміна щодо криптомінімумів."
+    )
+
+
 def nowp_price_usd_above_crypto_minimum(price_usd: float) -> float:
     """
     Raise fiat list price slightly if NOWPayments rejects low crypto totals (AMOUNTMINIMALERROR).
     """
     floor = round(float(price_usd), 8)
+    invoice_cap = nowp_crypto_invoice_ceiling_usd(floor)
     fallback_min = float(os.getenv("NOWPAYMENTS_MIN_PAY_CRYPTO_FALLBACK", "6"))
-    margin = float(os.getenv("NOWPAYMENTS_MIN_PAY_MARGIN", "1.12"))
-    # Extra absolute headroom **in pay_currency units** atop `min_crypto * margin` (estimate-vs-payment slack).
-    abs_pad_crypto = max(0.0, float(os.getenv("NOWP_MIN_PAY_CRYPTO_ABS_PAD", "0.75")))
+    margin = float(os.getenv("NOWPAYMENTS_MIN_PAY_MARGIN", "1.035"))
+    # Extra absolute headroom **in pay_currency units** atop `min_crypto * margin`.
+    abs_pad_crypto = max(0.0, float(os.getenv("NOWP_MIN_PAY_CRYPTO_ABS_PAD", "0.2")))
     # If NOWPayments/dashboard shows a larger floor than `/min-amount` returns for your merchant, raise it here (e.g. 13–20 for USDT TRC20).
     hard_floor = float(os.getenv("NOWP_MIN_PAY_CRYPTO_HARD_FLOOR", "0") or "0")
     step_usd = float(os.getenv("NOWPAYMENTS_MIN_TOPUP_STEP_USD", "0.1"))
@@ -667,6 +702,8 @@ def nowp_price_usd_above_crypto_minimum(price_usd: float) -> float:
 
     usd_eff = floor
     for step_i in range(max_steps):
+        if invoice_cap is not None and usd_eff > invoice_cap:
+            raise RuntimeError(_nowp_invoice_cap_blocked_message(floor, invoice_cap))
         if usd_eff > ceiling_usd:
             raise RuntimeError(
                 "NOWPayments: invoiced USD climbed above ceiling while sizing crypto minimum "
@@ -675,14 +712,17 @@ def nowp_price_usd_above_crypto_minimum(price_usd: float) -> float:
 
         estimated = nowp_estimate_pay_crypto_for_usd(usd_eff)
         if estimated is None:
-            usd_eff = round(usd_eff + max(step_usd * 10, 0.5), 6)
+            bump_fail = round(max(step_usd * 3.0, 0.18), 6)
+            usd_eff = round(usd_eff + bump_fail, 6)
             if step_i + 1 == max_steps:
                 raise RuntimeError("NOWPayments: estimate API unreachable; cannot size invoice.")
             continue
 
         if estimated >= threshold:
-            cushion_usd = max(0.0, float(os.getenv("NOWP_ESTIMATE_CUSHION_USD", "1.05")))
+            cushion_usd = max(0.0, float(os.getenv("NOWP_ESTIMATE_CUSHION_USD", "0.55")))
             usd_final = round(usd_eff + cushion_usd, 10)
+            if invoice_cap is not None and usd_final > invoice_cap + 1e-9:
+                raise RuntimeError(_nowp_invoice_cap_blocked_message(floor, invoice_cap))
             if usd_eff > floor or cushion_usd > 0:
                 log.info(
                     "NOWPayments: invoice sizing list=%.4f USD → fiat_try=%.6f + cushion=%.4f → final=%.8f USD "
@@ -745,12 +785,16 @@ def nowp_create_payment(chat_id: int, plan: str, months: int, price_usd: float) 
         raise RuntimeError("PUBLIC_BASE_URL not set")
 
     requested_usd = float(price_usd)
+    invoice_ceiling = nowp_crypto_invoice_ceiling_usd(requested_usd)
+
     initial_usd = round(nowp_price_usd_above_crypto_minimum(requested_usd), 10)
     price_try = float(initial_usd)
+    if invoice_ceiling is not None and price_try > invoice_ceiling + 1e-9:
+        raise RuntimeError(_nowp_invoice_cap_blocked_message(requested_usd, invoice_ceiling))
 
-    pad_base = float(os.getenv("NOWP_AMOUNT_MINIMAL_ERR_PAD_USD", "1.0"))
-    pad_ramp = float(os.getenv("NOWP_AMOUNT_MINIMAL_ERR_PAD_RAMP_USD", "0.12"))
-    max_pay_retries = max(5, int(os.getenv("NOWP_AMOUNT_MINIMAL_ERR_MAX_RETRIES", "32")))
+    pad_base = float(os.getenv("NOWP_AMOUNT_MINIMAL_ERR_PAD_USD", "0.35"))
+    pad_ramp = float(os.getenv("NOWP_AMOUNT_MINIMAL_ERR_PAD_RAMP_USD", "0.05"))
+    max_pay_retries = max(5, int(os.getenv("NOWP_AMOUNT_MINIMAL_ERR_MAX_RETRIES", "20")))
     last_detail = ""
     data: dict | None = None
 
@@ -810,9 +854,12 @@ def nowp_create_payment(chat_id: int, plan: str, months: int, price_usd: float) 
             and ("AMOUNTMINIMAL" in last_detail.upper() or " LESS THAN MINIMAL" in last_detail.upper())
         ):
             bump = pad_base + pad_ramp * float(pay_attempt)
-            price_try = round(float(price_try) + bump, 10)
+            nxt_try = round(float(price_try) + bump, 10)
+            if invoice_ceiling is not None and nxt_try > invoice_ceiling + 1e-9:
+                raise RuntimeError(_nowp_invoice_cap_blocked_message(requested_usd, invoice_ceiling))
+            price_try = nxt_try
             log.warning(
-                "NOWPayments: AMOUNTMINIMALERROR → +%.4f USD (ramp bump) retry toward %.8f USD",
+                "NOWPayments: AMOUNTMINIMALERROR → +%.4f USD retry toward %.8f USD",
                 bump,
                 price_try,
             )
