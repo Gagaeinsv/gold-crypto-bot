@@ -154,6 +154,12 @@ except ValueError:
     _deep_out_cap = 8192
 # Long Deep Analysis replies need a high ceiling; ~1800 output tokens truncates mid-paragraph (MAX_TOKENS).
 DEEP_ANALYSIS_MAX_OUTPUT_TOKENS = max(2048, min(_deep_out_cap, 65536))
+try:
+    _cv_out_cap = int(os.getenv("CHART_VISION_MAX_OUTPUT_TOKENS", "4096").strip())
+except ValueError:
+    _cv_out_cap = 4096
+# Chart screenshot multimodal replies; tight limits cut off before SL/TP/verdict sections.
+CHART_VISION_MAX_OUTPUT_TOKENS = max(1024, min(_cv_out_cap, 65536))
 # gemini | openrouter | auto  (auto prefers Gemini when GEMINI_KEY is set)
 DEEP_ANALYSIS_PROVIDER = os.getenv("DEEP_ANALYSIS_PROVIDER", "gemini").strip().lower()
 CHART_VISION_PROVIDER  = os.getenv("CHART_VISION_PROVIDER", "gemini").strip().lower()
@@ -3655,8 +3661,19 @@ def _chart_vision_via_gemini(photo_bytes: bytes, prompt: str) -> str:
     response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=[prompt, image],
-        config=gtypes.GenerateContentConfig(max_output_tokens=1000),
+        config=gtypes.GenerateContentConfig(
+            max_output_tokens=CHART_VISION_MAX_OUTPUT_TOKENS,
+        ),
     )
+    cands = getattr(response, "candidates", None) or []
+    if cands:
+        fr = getattr(cands[0], "finish_reason", None)
+        if fr == gtypes.FinishReason.MAX_TOKENS:
+            log.warning(
+                "Gemini chart vision hit MAX_TOKENS at max_output_tokens=%s — "
+                "increase CHART_VISION_MAX_OUTPUT_TOKENS if analysis cuts off.",
+                CHART_VISION_MAX_OUTPUT_TOKENS,
+            )
     return response.text
 
 
@@ -3680,7 +3697,7 @@ def _chart_vision_via_openrouter(
             }
         ],
         model=_openrouter_vision_model(),
-        max_tokens=1000,
+        max_tokens=CHART_VISION_MAX_OUTPUT_TOKENS,
         temperature=0.3,
         key_scope=key_scope,
     )
