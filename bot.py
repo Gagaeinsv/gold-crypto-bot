@@ -76,6 +76,11 @@ OPENROUTER_VISION_MODEL = os.getenv("OPENROUTER_VISION_MODEL", "")  # if empty, 
 OPENROUTER_SITE_URL    = os.getenv("OPENROUTER_SITE_URL", "")   # optional HTTP-Referer for OpenRouter rankings
 OPENROUTER_APP_TITLE   = os.getenv("OPENROUTER_APP_TITLE", "Gold Crypto Trading Bot")
 OPENROUTER_API_URL     = "https://openrouter.ai/api/v1/chat/completions"
+try:
+    _or402_hold = int(os.getenv("OPENROUTER_402_CREDIT_HOLD_SEC", "3600"))
+except ValueError:
+    _or402_hold = 3600
+OPENROUTER_402_CREDIT_HOLD_SEC = max(60, _or402_hold)
 
 
 def _openrouter_key_pool() -> list[str]:
@@ -93,6 +98,8 @@ def _openrouter_key_pool() -> list[str]:
 _OPENROUTER_KEYS: list[str] = _openrouter_key_pool()
 _openrouter_rr_lock = threading.Lock()
 _openrouter_rr_i = 0
+# Key index → time.monotonic() until OpenRouter skips it first (402 insufficient credits/balance).
+_OPENROUTER_CREDIT_HOLD_UNTIL: dict[int, float] = {}
 
 
 def _openrouter_configured() -> bool:
@@ -1519,6 +1526,38 @@ def _next_openrouter_rr_start() -> int:
         return idx
 
 
+def _openrouter_payment_starved_error(http_status: int, err_msg: str) -> bool:
+    """402 from OpenRouter when the account can't pay for requested max_tokens / usage."""
+    if http_status != 402:
+        return False
+    m = (err_msg or "").lower()
+    return ("credit" in m) or ("afford" in m) or ("balance" in m) or ("billing" in m)
+
+
+def _openrouter_hold_key_starved(ix: int) -> None:
+    until = time.monotonic() + OPENROUTER_402_CREDIT_HOLD_SEC
+    with _openrouter_rr_lock:
+        _OPENROUTER_CREDIT_HOLD_UNTIL[ix] = until
+    log.warning(
+        "OpenRouter key #%s on credit hold for ~%ss (HTTP 402). Other keys are tried first.",
+        ix,
+        OPENROUTER_402_CREDIT_HOLD_SEC,
+    )
+
+
+def _openrouter_key_try_order(rr_start: int) -> list[int]:
+    """Prefer keys not on credit hold, stay near round-robin order among healthy keys."""
+    n = len(_OPENROUTER_KEYS)
+    if n <= 1:
+        return [0]
+    now = time.monotonic()
+    ring = [(rr_start + i) % n for i in range(n)]
+    healthy = [i for i in ring if _OPENROUTER_CREDIT_HOLD_UNTIL.get(i, 0.0) <= now]
+    if healthy:
+        return healthy + [i for i in ring if i not in healthy]
+    return ring
+
+
 def _openrouter_failover_eligible(http_status: int, err_msg: str) -> bool:
     """Whether to try the next API key (quota / transient), not e.g. invalid JSON body."""
     if http_status == 400:
@@ -1614,12 +1653,12 @@ def _openrouter_chat(
         payload["response_format"] = response_format
 
     n = len(_OPENROUTER_KEYS)
-    start = _next_openrouter_rr_start()
+    rr_start = _next_openrouter_rr_start()
+    key_order = _openrouter_key_try_order(rr_start)
     last_err = ""
     last_sc = 0
 
-    for attempt in range(n):
-        k_ix = (start + attempt) % n
+    for attempt, k_ix in enumerate(key_order):
         api_key = _OPENROUTER_KEYS[k_ix]
         ok, text, sc, err = _openrouter_post_once(api_key, payload)
         if ok:
@@ -1627,6 +1666,8 @@ def _openrouter_chat(
                 log.info("OpenRouter: OK using key #%s after failover/rotation", k_ix)
             return text
         last_err, last_sc = err, sc
+        if sc == 402 and _openrouter_payment_starved_error(sc, err):
+            _openrouter_hold_key_starved(k_ix)
         if not _openrouter_failover_eligible(sc, err):
             raise RuntimeError(err or f"OpenRouter HTTP {sc}")
         if attempt < n - 1:
