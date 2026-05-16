@@ -106,9 +106,15 @@ CHART_VISION_PROVIDER  = os.getenv("CHART_VISION_PROVIDER", "gemini").strip().lo
 GOLD_API_KEY = os.getenv("GOLD_API_KEY", "")   # goldapi.io — spot price for XAU/XAG
 NOWPAYMENTS_API_KEY   = os.getenv("NOWPAYMENTS_API_KEY", "")
 NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "")
-# Public base URL of your server, used for NOWPayments IPN callback.
-# Example: https://yourdomain.com  (or http://YOUR_SERVER_IP:8080 if you expose the port)
+NOWPAYMENTS_PAY_CURRENCY = (os.getenv("NOWPAYMENTS_PAY_CURRENCY", "usdttrc20").strip().lower() or "usdttrc20")
+# Public base URL of your server, used for NOWPayments IPN callback (must resolve for their servers).
+# NOWPayments often rejects http:// callbacks with HTTP 400; use HTTPS behind nginx/Caddy/Certbot.
 PUBLIC_BASE_URL       = os.getenv("PUBLIC_BASE_URL", "")
+if NOWPAYMENTS_API_KEY and PUBLIC_BASE_URL.strip() and PUBLIC_BASE_URL.lower().startswith("http://"):
+    log.warning(
+        "NOWPayments: PUBLIC_BASE_URL uses http:// — the API commonly rejects non-HTTPS ipn_callback_url "
+        "(400 Bad Request). Use https:// behind a reverse proxy (port 443) and update PUBLIC_BASE_URL."
+    )
 ADMIN_ID     = int(os.getenv("ADMIN_ID", "123456789"))
 CHANNEL_ID   = os.getenv("CHANNEL_ID",  "@your_channel")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "@your_bot")
@@ -457,7 +463,28 @@ def db_payment_exists(charge_id: str) -> bool:
 # ── NOWPayments (crypto) payment helpers ──────────────────────────
 
 NOWPAYMENTS_BASE = "https://api.nowpayments.io/v1"
-NOWPAYMENTS_PAY_CURRENCY = "usdttrc20"
+
+
+def _nowp_response_error_detail(r: requests.Response) -> str:
+    """Best-effort body summary for NOWPayments HTTP errors."""
+    txt = ""
+    try:
+        j = r.json()
+        if isinstance(j, dict):
+            parts: list[str] = []
+            for key in ("message", "code", "error"):
+                v = j.get(key)
+                if v not in (None, ""):
+                    parts.append(str(v))
+            if parts:
+                return " ".join(parts)
+            txt = json.dumps(j, ensure_ascii=False)
+    except Exception:
+        txt = (r.text or "").strip()
+    if not txt.strip():
+        return f"HTTP {r.status_code}"
+    txt = txt.strip()
+    return txt[:800] + ("…" if len(txt) > 800 else "")
 
 
 def _nowp_headers() -> dict:
@@ -516,7 +543,10 @@ def nowp_create_payment(chat_id: int, plan: str, months: int, price_usd: float) 
         "ipn_callback_url": f"{PUBLIC_BASE_URL.rstrip('/')}/nowpayments",
     }
     r = requests.post(f"{NOWPAYMENTS_BASE}/payment", headers=_nowp_headers(), json=payload, timeout=12)
-    r.raise_for_status()
+    if not r.ok:
+        detail = _nowp_response_error_detail(r)
+        log.warning("NOWPayments POST /payment failed: status=%s body=%s", r.status_code, detail)
+        raise RuntimeError(f"NOWPayments error ({r.status_code}): {detail}")
     data = r.json()
     payment_id = str(data.get("payment_id") or "")
     if not payment_id:
@@ -551,7 +581,10 @@ def nowp_get_payment(payment_id: str) -> dict:
     if not NOWPAYMENTS_API_KEY:
         raise RuntimeError("NOWPAYMENTS_API_KEY not set")
     r = requests.get(f"{NOWPAYMENTS_BASE}/payment/{payment_id}", headers=_nowp_headers(), timeout=12)
-    r.raise_for_status()
+    if not r.ok:
+        detail = _nowp_response_error_detail(r)
+        log.warning("NOWPayments GET /payment/%s failed: status=%s body=%s", payment_id, r.status_code, detail)
+        raise RuntimeError(f"NOWPayments error ({r.status_code}): {detail}")
     return r.json()
 
 
@@ -3722,7 +3755,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as e:
             await safe_edit(
                 q,
-                f"❌ Could not create payment: {str(e)[:160]}",
+                f"❌ Could not create payment:\n{str(e)[:380]}",
                 markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")]]),
             )
             return
