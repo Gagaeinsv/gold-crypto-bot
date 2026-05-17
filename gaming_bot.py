@@ -49,7 +49,7 @@ GEMINI_KEY      = os.getenv("GEMINI_KEY", "")             # https://aistudio.goo
 ADMIN_ID        = int(os.getenv("ADMIN_ID", "0"))
 
 GEMINI_MODEL    = "gemini-2.5-flash"
-BOT_VERSION     = "1.6.0"
+BOT_VERSION     = "1.6.1"
 
 def _env_int(key: str, default: int) -> int:
     try:
@@ -1012,7 +1012,8 @@ def _gemini_bilingual_post(
 - title_ua, title_ru — короткий яскравий заголовок (до 100 символів кожен)
 - facts_ua, facts_ru — 2–4 пункти (дата, платформи, жанр, ціна/роздача) через "• "
 - description_ua, description_ru — опис новини (2–3 речення)
-- opinion_ua, opinion_ru — блок "Моя думка": 1–2 речення (оцінка, враження, прогноз або рекомендація)
+- opinion_ua, opinion_ru — блок "Твоя думка" / "Твоё мнение": 1–2 речення (оцінка, враження, прогноз або рекомендація)
+- ОБОВʼЯЗКОВО заповни ВСІ поля. title_ru має бути російською, не копією англійського заголовка.
 - cta_ua, cta_ru — заклик до дії (1 речення, різний від інших постів)
 - hashtags — рядок з 2–4 хештегами латиницею/кирилицею (#Ігри #Gaming тощо), однаковий для обох мов
 
@@ -1034,18 +1035,56 @@ def _gemini_bilingual_post(
             ),
         )
         raw = (response.text or "").strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
         data = json.loads(raw)
         if not isinstance(data, dict):
             return None
-        for key in _POST_JSON_KEYS:
-            if key not in data:
-                data[key] = ""
-        if not data.get("hashtags"):
-            data["hashtags"] = pick_hashtags({"title": title, "url": url, "category": category})
-        return data
+        article_stub = {"title": title, "url": url, "category": category, "source": source}
+        return normalize_post_content(data, article_stub)
     except Exception as exc:
         log.warning("Gemini bilingual post failed: %s", exc)
         return None
+
+def normalize_post_content(content: dict, article: dict) -> dict:
+    """Гарантує повний шаблон: CTA, хештеги, RU-поля, «Твоя думка»."""
+    out = {k: str(content.get(k) or "").strip() for k in _POST_JSON_KEYS}
+
+    title_ua = out["title_ua"] or article.get("title", "Ігрова новина")
+    out["title_ua"] = _clip(title_ua, 120)
+    if not out["title_ru"] or out["title_ru"] == out["title_ua"]:
+        out["title_ru"] = _clip(f"Игровая новость: {title_ua}", 120)
+
+    if not out["facts_ua"]:
+        out["facts_ua"] = f"• Джерело: {article.get('source', '—')}"
+    if not out["facts_ru"]:
+        out["facts_ru"] = f"• Источник: {article.get('source', '—')}"
+
+    summary = strip_urls_from_text(article.get("summary", "")[:400])
+    if not out["description_ua"]:
+        out["description_ua"] = summary or "Деталі за посиланням."
+    if not out["description_ru"]:
+        out["description_ru"] = summary or "Подробности по ссылке."
+
+    if not out["opinion_ua"]:
+        out["opinion_ua"] = "На мій погляд, це варта уваги новина для фанатів жанру."
+    if not out["opinion_ru"]:
+        out["opinion_ru"] = "На мой взгляд, это стоит внимания фанатам жанра."
+
+    out["cta_ua"] = out["cta_ua"] or random.choice(CTA_UA)
+    out["cta_ru"] = out["cta_ru"] or random.choice(CTA_RU)
+    out["hashtags"] = out["hashtags"] or pick_hashtags(article)
+    return out
+
+def is_valid_bilingual_post(text: str) -> bool:
+    return (
+        "🇺🇦" in text
+        and "🇷🇺" in text
+        and "Твоя думка" in text
+        and "👉" in text
+        and "#" in text
+    )
 
 def _fallback_bilingual_post(article: dict) -> dict:
     """Шаблон без AI — базова двомовність."""
@@ -1059,19 +1098,20 @@ def _fallback_bilingual_post(article: dict) -> dict:
         opinion_ua = "Цікава новина — варто стежити за розвитком подій."
         opinion_ru = "Интересная новость — стоит следить за развитием событий."
 
-    return {
+    raw = {
         "title_ua": _clip(title, 100),
-        "title_ru": _clip(title, 100),
+        "title_ru": "",
         "facts_ua": "• Джерело: " + article.get("source", "—"),
         "facts_ru": "• Источник: " + article.get("source", "—"),
         "description_ua": summary or "Деталі за посиланням.",
-        "description_ru": summary or "Подробности по ссылке.",
+        "description_ru": "Подробности в источнике — смотри ссылку ниже.",
         "opinion_ua": opinion_ua,
         "opinion_ru": opinion_ru,
         "cta_ua": random.choice(CTA_UA),
         "cta_ru": random.choice(CTA_RU),
         "hashtags": pick_hashtags(article),
     }
+    return normalize_post_content(raw, article)
 
 def build_bilingual_post(article: dict, content: dict) -> str:
     """Єдиний шаблон: UA блок → роздільник → RU блок → хештеги."""
@@ -1090,12 +1130,13 @@ def build_bilingual_post(article: dict, content: dict) -> str:
 📰 Опис:
 {content.get('description_ua', '')}
 
-💭 Моя думка:
+💭 Твоя думка:
 {content.get('opinion_ua', '')}
 
 🔗 Посилання:
 {url}
 
+📢 Заклик до дії:
 👉 {content.get('cta_ua', random.choice(CTA_UA))}"""
 
     ru_block = f"""🇷🇺 Русская версия
@@ -1108,16 +1149,17 @@ def build_bilingual_post(article: dict, content: dict) -> str:
 📰 Описание:
 {content.get('description_ru', '')}
 
-💭 Моё мнение:
+💭 Твоё мнение:
 {content.get('opinion_ru', '')}
 
 🔗 Ссылка:
 {url}
 
+📢 Призыв к действию:
 👉 {content.get('cta_ru', random.choice(CTA_RU))}"""
 
     separator = "\n\n" + "─" * 22 + "\n\n"
-    text = f"{ua_block}{separator}{ru_block}\n\n{hashtags}"
+    text = f"{ua_block}{separator}{ru_block}\n\n# Хештеги:\n{hashtags}"
 
     if len(text) > TEXT_MESSAGE_MAX:
         for key in ("description_ua", "description_ru", "facts_ua", "facts_ru"):
@@ -1176,43 +1218,49 @@ async def send_post(
 
     if not content:
         content = _fallback_bilingual_post(article)
+    else:
+        content = normalize_post_content(content, article)
 
-    text  = build_bilingual_post(article, content)
+    text = build_bilingual_post(article, content)
+    if not is_valid_bilingual_post(text):
+        log.warning("Invalid bilingual template — using fallback for: %s", title[:60])
+        content = _fallback_bilingual_post(article)
+        text = build_bilingual_post(article, content)
+
     image = article.get("image") or article.get("image_fallback") or ""
     send_kw = {"chat_id": CHANNEL_ID}
+    full_text = text[:TEXT_MESSAGE_MAX]
 
     try:
-        if image and len(text) <= PHOTO_CAPTION_MAX:
-            await bot.send_photo(photo=image, caption=text, **send_kw)
-        elif image:
-            short = f"{CATEGORY_EMOJI.get(article.get('category','news'), '🎮')} {content.get('title_ua', title)[:80]}\n\n🔗 {url}"
-            await bot.send_photo(photo=image, caption=short, **send_kw)
-            await bot.send_message(
-                text=text[:TEXT_MESSAGE_MAX],
-                disable_web_page_preview=True,
-                **send_kw,
-            )
-        else:
-            await bot.send_message(
-                text=text[:TEXT_MESSAGE_MAX],
-                disable_web_page_preview=True,
-                **send_kw,
-            )
+        # Завжди повний пост текстом (UA+RU+CTA) — не обрізаний підпис до фото
+        await bot.send_message(
+            text=full_text,
+            disable_web_page_preview=True,
+            **send_kw,
+        )
+        if image:
+            try:
+                await bot.send_photo(
+                    photo=image,
+                    caption=f"🖼 {content.get('title_ua', title)[:100]}",
+                    **send_kw,
+                )
+            except TelegramError as img_exc:
+                log.warning("Photo attach failed (text post OK): %s", img_exc)
+
         mark_posted(conn, h, title, url, article.get("category", "news"), article.get("source", ""))
-        log.info("Posted: [%s] %s | link: %s", article.get("category"), title[:60], url[:100])
+        log.info(
+            "Posted v%s bilingual [%s] %s | %d chars | RU:%s CTA:%s",
+            BOT_VERSION,
+            article.get("category"),
+            title[:50],
+            len(full_text),
+            "🇷🇺" in full_text,
+            "👉" in full_text,
+        )
         return True
     except TelegramError as exc:
         log.error("Telegram error posting '%s': %s", title[:60], exc)
-        try:
-            await bot.send_message(
-                text=text[:TEXT_MESSAGE_MAX],
-                disable_web_page_preview=True,
-                **send_kw,
-            )
-            mark_posted(conn, h, title, url, article.get("category", "news"), article.get("source", ""))
-            return True
-        except TelegramError as exc2:
-            log.error("Retry as text also failed: %s", exc2)
         return False
 
 # ──────────────────────── Dedup & Priority Sort ───────────────────────────────
