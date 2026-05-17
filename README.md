@@ -1,4 +1,4 @@
-# Ігровий Telegram-бот (v2.0.0)
+# Ігровий Telegram-бот (v2.0.1)
 
 Канал про **PlayStation, PS Plus, Xbox / Game Pass**: ігри місяця, підписки, релізи.  
 Пости **українською + російською**. Кілька разів на день, **без спаму**. Роздачі — **лише коли немає свіжих новин**.
@@ -15,7 +15,7 @@ https://raw.githubusercontent.com/Gagaeinsv/gold-crypto-bot/gaming-news-bot-only
 - **Фільтр:** лише PS / PS+ / Xbox / Game Pass / ігри місяця
 - **Релізи:** RAWG (опційно), лише PlayStation та Xbox
 - **Роздачі:** лише PlayStation / Xbox, і лише якщо 24+ год без новин
-- **Gemini:** двомовний шаблон (UA + RU, CTA, хештеги)
+- **Gemini:** повний переклад UA + RU (без англійського тексту в пості)
 
 ## Ліміти за замовчуванням
 

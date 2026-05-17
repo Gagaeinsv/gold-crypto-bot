@@ -1,5 +1,5 @@
 """
-Gaming News Telegram Channel Bot (v2.0.0)
+Gaming News Telegram Channel Bot (v2.0.1)
 -----------------------------------------
 Фокус: PlayStation, PS Plus, Xbox / Game Pass — ігри місяця, підписки, релізи.
 Пости: шаблон UA + RU (Gemini). Кілька разів на день, без спаму.
@@ -48,7 +48,7 @@ GEMINI_KEY      = os.getenv("GEMINI_KEY", "")             # https://aistudio.goo
 ADMIN_ID        = int(os.getenv("ADMIN_ID", "0"))
 
 GEMINI_MODEL    = "gemini-2.5-flash"
-BOT_VERSION     = "2.0.0"
+BOT_VERSION     = "2.0.1"
 
 def _env_int(key: str, default: int) -> int:
     try:
@@ -131,6 +131,8 @@ JUNK_KEYWORDS = (
     "black friday tv", "cyber monday tv", "how to watch",
     "nintendo switch", "zelda only", "pokemon only", "pc only",
     "steam deck only", "best gaming laptop", "best gaming phone",
+    "poll:", " poll ", "are you happy", "what do you think",
+    "reader vote", "cast your vote", "plus or minus?",
 )
 
 _PS_XBOX_RSS_SOURCES = frozenset({"Push Square", "PlayStation Blog", "Pure Xbox"})
@@ -260,7 +262,15 @@ def article_text_blob(article: dict) -> str:
 
 def is_junk_article(article: dict) -> bool:
     blob = article_text_blob(article)
-    return any(k in blob for k in JUNK_KEYWORDS)
+    if any(k in blob for k in JUNK_KEYWORDS):
+        return True
+    url = (article.get("url") or "").lower()
+    if "/poll" in url or "/features/poll" in url:
+        return True
+    title = (article.get("title") or "").strip().lower()
+    if title.startswith("poll:") or title.startswith("poll "):
+        return True
+    return False
 
 def is_platform_focus_article(article: dict) -> bool:
     """PS, PS Plus, Xbox Game Pass, ігри місяця, консольні релізи."""
@@ -461,6 +471,11 @@ def clean_html(text: str) -> str:
     text = re.sub(r"&quot;", '"', text)
     text = re.sub(r"&#\d+;", "", text)
     text = re.sub(r"\s+", " ", text)
+    text = re.sub(
+        r"read the full article on [\w.]+\.?\s*",
+        "", text, flags=re.IGNORECASE,
+    )
+    text = re.sub(r"plus or minus\??\s*", "", text, flags=re.IGNORECASE)
     return text.strip()
 
 def is_gaming_related(title: str, description: str = "") -> bool:
@@ -965,22 +980,9 @@ async def fetch_rawg_releases(client: httpx.AsyncClient) -> list[dict]:
         })
     return releases
 
-# ──────────────────────── Hashtags & CTA ────────────────────────────────────────
+# ──────────────────────── Hashtags ─────────────────────────────────────────────
 
 BASE_HASHTAGS = ("#PlayStation", "#Xbox", "#Gaming")
-
-CTA_UA = (
-    "Що думаєш про це? Пиши в коментарях 👇",
-    "Чекаєш реліз? Став 🔥",
-    "Поділися постом з друзями 🎮",
-    "Згоден чи ні? Напиши свою думку 💬",
-)
-CTA_RU = (
-    "Что думаешь об этом? Пиши в комментариях 👇",
-    "Ждёшь релиз? Ставь 🔥",
-    "Поделись постом с друзьями 🎮",
-    "Согласен или нет? Напиши своё мнение 💬",
-)
 
 def pick_hashtags(article: dict) -> str:
     """2–4 хештеги (однакові для UA та RU блоків)."""
@@ -1011,11 +1013,35 @@ def _clip(text: str, limit: int) -> str:
 _POST_JSON_KEYS = (
     "title_ua", "title_ru", "facts_ua", "facts_ru",
     "description_ua", "description_ru", "opinion_ua", "opinion_ru",
-    "cta_ua", "cta_ru", "hashtags",
+    "hashtags",
 )
+
+def cyrillic_ratio(text: str) -> float:
+    letters = [c for c in (text or "") if c.isalpha()]
+    if not letters:
+        return 0.0
+    cyr = sum(1 for c in letters if "\u0400" <= c <= "\u04FF")
+    return cyr / len(letters)
+
+def is_mostly_english(text: str) -> bool:
+    t = (text or "").strip()
+    if len(t) < 12:
+        return False
+    return cyrillic_ratio(t) < 0.35
+
+def content_is_fully_localized(content: dict) -> bool:
+    for key in (
+        "title_ua", "title_ru", "description_ua", "description_ru",
+        "opinion_ua", "opinion_ru",
+    ):
+        val = (content.get(key) or "").strip()
+        if not val or is_mostly_english(val):
+            return False
+    return True
 
 def _gemini_bilingual_post(
     title: str, summary: str, category: str, source: str, url: str,
+    *, strict: bool = False,
 ) -> Optional[dict]:
     """Повертає структурований пост UA+RU для єдиного шаблону."""
     if not GEMINI_KEY:
@@ -1035,32 +1061,34 @@ def _gemini_bilingual_post(
         "news":     "Ігрова новина. Коротко та цікаво.",
     }
     hint = cat_hints.get(category, cat_hints["news"])
+    strict_note = (
+        "\nКРИТИЧНО: усі поля ЛИШЕ українською або російською. "
+        "Заборонено залишати англійські речення з оригіналу."
+        if strict
+        else ""
+    )
 
     prompt = f"""Ти — редактор Telegram-каналу про PlayStation, PS Plus та Xbox / Game Pass.
-Створи пост за ЄДИНИМ шаблоном у ДВОХ мовах (спочатку повна українська версія, потім повна російська).
-Акцент: підписки, ігри місяця, релізи на PS5/PS4/Xbox — без зайвого PC/Nintendo.
+Переклади та адаптуй новину у ДВОХ мовах. Жодного англійського тексту в полях JSON.{strict_note}
 
 Контекст: {hint}
 
-Оригінал:
+Оригінал (англійською — переклади повністю):
 Заголовок: {title}
 Опис: {summary[:700] if summary else '(немає)'}
 Джерело: {source}
 
-Поверни JSON з полями:
-- title_ua, title_ru — короткий яскравий заголовок (до 100 символів кожен)
-- facts_ua, facts_ru — 2–4 пункти (дата, платформи, жанр, ціна/роздача) через "• "
-- description_ua, description_ru — опис новини (2–3 речення)
-- opinion_ua, opinion_ru — блок "Твоя думка" / "Твоё мнение": 1–2 речення (оцінка, враження, прогноз або рекомендація)
-- ОБОВʼЯЗКОВО заповни ВСІ поля. title_ru має бути російською, не копією англійського заголовка.
-- cta_ua, cta_ru — заклик до дії (1 речення, різний від інших постів)
-- hashtags — рядок з 2–4 хештегами латиницею/кирилицею (#Ігри #Gaming тощо), однаковий для обох мов
+Поверни JSON:
+- title_ua, title_ru — короткий заголовок КИРИЛИЦЕЮ (до 100 символів), переклад з англійського
+- facts_ua, facts_ru — 2–4 пункти через "• " (дата, PS Plus / Game Pass, платформи)
+- description_ua, description_ru — 2–3 речення КИРИЛИЦЕЮ, суть новини
+- opinion_ua, opinion_ru — 1–2 речення думки редактора КИРИЛИЦЕЮ
+- hashtags — 2–4 хештеги
 
 Правила:
-- Не вигадуй фактів яких немає в оригіналі.
-- Без URL у тексті полів.
-- Українська версія — природна українська, російська — природна російська (не дослівний машинний переклад заголовків-суржиком).
-- Лаконічно: весь JSON разом до ~1800 символів тексту."""
+- title_ua — українська, title_ru — російська; не копіюй англійський заголовок.
+- description та opinion — тільки кирилиця, без англійських фраз.
+- Не вигадуй фактів. Без URL у полях."""
 
     try:
         client = genai.Client(api_key=GEMINI_KEY)
@@ -1087,70 +1115,78 @@ def _gemini_bilingual_post(
         return None
 
 def normalize_post_content(content: dict, article: dict) -> dict:
-    """Гарантує повний шаблон: CTA, хештеги, RU-поля, «Твоя думка»."""
+    """Гарантує повний шаблон UA/RU без англійських вставок."""
     out = {k: str(content.get(k) or "").strip() for k in _POST_JSON_KEYS}
 
-    title_ua = out["title_ua"] or article.get("title", "Ігрова новина")
-    out["title_ua"] = _clip(title_ua, 120)
-    if not out["title_ru"] or out["title_ru"] == out["title_ua"]:
-        out["title_ru"] = _clip(f"Игровая новость: {title_ua}", 120)
+    if is_mostly_english(out["title_ua"]):
+        out["title_ua"] = ""
+    if is_mostly_english(out["title_ru"]):
+        out["title_ru"] = ""
+    if is_mostly_english(out["description_ua"]):
+        out["description_ua"] = ""
+    if is_mostly_english(out["description_ru"]):
+        out["description_ru"] = ""
+
+    if not out["title_ua"]:
+        out["title_ua"] = "Ігрова новина PS / Xbox"
+    out["title_ua"] = _clip(out["title_ua"], 120)
+    if not out["title_ru"]:
+        out["title_ru"] = "Новость PS / Xbox"
+    out["title_ru"] = _clip(out["title_ru"], 120)
 
     if not out["facts_ua"]:
         out["facts_ua"] = f"• Джерело: {article.get('source', '—')}"
     if not out["facts_ru"]:
         out["facts_ru"] = f"• Источник: {article.get('source', '—')}"
 
-    summary = strip_urls_from_text(article.get("summary", "")[:400])
     if not out["description_ua"]:
-        out["description_ua"] = summary or "Деталі за посиланням."
+        out["description_ua"] = "Деталі новини — за посиланням нижче."
     if not out["description_ru"]:
-        out["description_ru"] = summary or "Подробности по ссылке."
+        out["description_ru"] = "Подробности новости — по ссылке ниже."
 
-    if not out["opinion_ua"]:
-        out["opinion_ua"] = "На мій погляд, це варта уваги новина для фанатів жанру."
-    if not out["opinion_ru"]:
-        out["opinion_ru"] = "На мой взгляд, это стоит внимания фанатам жанра."
+    if not out["opinion_ua"] or is_mostly_english(out["opinion_ua"]):
+        out["opinion_ua"] = "На мій погляд, це варта уваги новина для власників консолі."
+    if not out["opinion_ru"] or is_mostly_english(out["opinion_ru"]):
+        out["opinion_ru"] = "На мой взгляд, это стоит внимания владельцам консоли."
 
-    out["cta_ua"] = out["cta_ua"] or random.choice(CTA_UA)
-    out["cta_ru"] = out["cta_ru"] or random.choice(CTA_RU)
     out["hashtags"] = out["hashtags"] or pick_hashtags(article)
     return out
 
 def is_valid_bilingual_post(text: str) -> bool:
-    return (
-        "🇺🇦" in text
-        and "🇷🇺" in text
-        and "Твоя думка" in text
-        and "👉" in text
-        and "#" in text
-    )
+    if "🇺🇦" not in text or "🇷🇺" not in text:
+        return False
+    if "Твоя думка" not in text or "Твоё мнение" not in text:
+        return False
+    if "Заклик до дії" in text or "Призыв к действию" in text:
+        return False
+    if "#" not in text:
+        return False
+    parts = text.split("🇷🇺", 1)
+    ua_part, ru_part = parts[0], parts[1] if len(parts) > 1 else ""
+    return cyrillic_ratio(ua_part) >= 0.35 and cyrillic_ratio(ru_part) >= 0.35
 
-def _fallback_bilingual_post(article: dict) -> dict:
-    """Шаблон без AI — базова двомовність."""
-    title = article.get("title", "Ігрова новина")
-    summary = strip_urls_from_text(article.get("summary", "")[:400])
-    cat = article.get("category", "news")
-    if cat == "giveaway":
-        opinion_ua = "Варто забрати, поки безкоштовно — такі роздачі рідко повторюються."
-        opinion_ru = "Стоит забрать, пока бесплатно — такие раздачи редко повторяются."
-    else:
-        opinion_ua = "Цікава новина — варто стежити за розвитком подій."
-        opinion_ru = "Интересная новость — стоит следить за развитием событий."
+def _generate_bilingual_content(article: dict) -> Optional[dict]:
+    """Gemini з повтором; без англомовного fallback."""
+    title = article.get("title", "")
+    summary = article.get("summary", "")
+    category = article.get("category", "news")
+    source = article.get("source", "")
+    url = article.get("url", "")
 
-    raw = {
-        "title_ua": _clip(title, 100),
-        "title_ru": "",
-        "facts_ua": "• Джерело: " + article.get("source", "—"),
-        "facts_ru": "• Источник: " + article.get("source", "—"),
-        "description_ua": summary or "Деталі за посиланням.",
-        "description_ru": "Подробности в источнике — смотри ссылку ниже.",
-        "opinion_ua": opinion_ua,
-        "opinion_ru": opinion_ru,
-        "cta_ua": random.choice(CTA_UA),
-        "cta_ru": random.choice(CTA_RU),
-        "hashtags": pick_hashtags(article),
-    }
-    return normalize_post_content(raw, article)
+    if not GEMINI_KEY:
+        log.warning("GEMINI_KEY не заданий — пост без перекладу пропущено: %s", title[:50])
+        return None
+
+    for strict in (False, True):
+        content = _gemini_bilingual_post(
+            title, summary, category, source, url, strict=strict,
+        )
+        if content:
+            content = normalize_post_content(content, article)
+            if content_is_fully_localized(content):
+                return content
+            log.warning("Gemini post not localized (strict=%s): %s", strict, title[:50])
+    return None
 
 def build_bilingual_post(article: dict, content: dict) -> str:
     """Єдиний шаблон: UA блок → роздільник → RU блок → хештеги."""
@@ -1176,10 +1212,7 @@ def build_bilingual_post(article: dict, content: dict) -> str:
 {url}
 
 # Хештеги:
-{hashtags}
-
-📢 Заклик до дії:
-👉 {content.get('cta_ua', random.choice(CTA_UA))}"""
+{hashtags}"""
 
     ru_block = f"""🇷🇺 Русская версия
 
@@ -1198,10 +1231,7 @@ def build_bilingual_post(article: dict, content: dict) -> str:
 {url}
 
 # Хештеги:
-{hashtags}
-
-📢 Призыв к действию:
-👉 {content.get('cta_ru', random.choice(CTA_RU))}"""
+{hashtags}"""
 
     separator = "\n\n" + "─" * 22 + "\n\n"
     text = f"{ua_block}{separator}{ru_block}"
@@ -1244,40 +1274,27 @@ async def send_post(
         return False
 
     loop = asyncio.get_event_loop()
-    content: Optional[dict] = None
-    if GEMINI_KEY:
-        try:
-            content = await loop.run_in_executor(
-                None,
-                _gemini_bilingual_post,
-                title,
-                article.get("summary", ""),
-                article.get("category", "news"),
-                article.get("source", ""),
-                url,
-            )
-            if content:
-                log.info("Gemini bilingual post: %s", title[:60])
-        except Exception as exc:
-            log.warning("Gemini executor error: %s", exc)
+    try:
+        content = await loop.run_in_executor(None, _generate_bilingual_content, article)
+    except Exception as exc:
+        log.warning("Gemini executor error: %s", exc)
+        content = None
 
     if not content:
-        content = _fallback_bilingual_post(article)
-    else:
-        content = normalize_post_content(content, article)
+        log.warning("Skip post (no UA/RU translation): %s", title[:60])
+        return False
 
     text = build_bilingual_post(article, content)
     if not is_valid_bilingual_post(text):
-        log.warning("Invalid bilingual template — using fallback for: %s", title[:60])
-        content = _fallback_bilingual_post(article)
-        text = build_bilingual_post(article, content)
+        log.warning("Skip post (invalid bilingual template): %s", title[:60])
+        return False
 
     image = article.get("image") or article.get("image_fallback") or ""
     send_kw = {"chat_id": CHANNEL_ID}
     full_text = text[:TEXT_MESSAGE_MAX]
 
     try:
-        # Завжди повний пост текстом (UA+RU+CTA) — не обрізаний підпис до фото
+        # Повний пост текстом (UA+RU) — не обрізаний підпис до фото
         await bot.send_message(
             text=full_text,
             disable_web_page_preview=True,
@@ -1295,13 +1312,12 @@ async def send_post(
 
         mark_posted(conn, h, title, url, article.get("category", "news"), article.get("source", ""))
         log.info(
-            "Posted v%s bilingual [%s] %s | %d chars | RU:%s CTA:%s",
+            "Posted v%s bilingual [%s] %s | %d chars | localized:%s",
             BOT_VERSION,
             article.get("category"),
             title[:50],
             len(full_text),
-            "🇷🇺" in full_text,
-            "👉" in full_text,
+            content_is_fully_localized(content),
         )
         return True
     except TelegramError as exc:
