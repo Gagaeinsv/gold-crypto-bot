@@ -1,13 +1,16 @@
 """
-Gaming News Telegram Channel Bot
----------------------------------
-Автоматично публікує в Telegram-канал:
-  • Актуальні ігрові новини (RSS з IGN, Eurogamer, PCGamer, Kotaku, та ін.)
-  • Безкоштовні роздачі: Epic Games, Steam, GOG, PlayStation Store
-  • Дати виходу та оновлень ігор (RAWG API)
+Gaming News Telegram Channel Bot (v1.4.0)
+-----------------------------------------
+Публікує в Telegram-канал:
+  • Ігрові новини (IGN, Kotaku, PC Gamer, Eurogamer та ін.) — пріоритет
+  • Безкоштовні ігри з Epic / Steam / GOG / PS / Xbox — рідко, різні магазини
+  • Релізи на найближчі 7 днів (RAWG API, опційно)
+
+Ліміти за замовчуванням: 1 пост / 6 год, макс. 4/день, 1 роздача/день.
+Налаштування в .env — див. .env.example
 
 Запуск:  python gaming_bot.py
-Залежності: pip install -r requirements_gaming.txt
+Залежності: pip install -r requirements.txt
 """
 
 import asyncio
@@ -50,18 +53,25 @@ GEMINI_KEY      = os.getenv("GEMINI_KEY", "")             # https://aistudio.goo
 ADMIN_ID        = int(os.getenv("ADMIN_ID", "0"))
 
 GEMINI_MODEL    = "gemini-2.5-flash"
-BOT_VERSION     = "1.4.0"   # news-first feed, rate limits, diverse giveaways
+BOT_VERSION     = "1.4.0"
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(os.getenv(key, str(default)))
+    except (TypeError, ValueError):
+        return default
 
 DB_PATH         = "gaming_bot.db"
-CHECK_INTERVAL  = 20 * 60          # check sources every 20 minutes
-MIN_POST_GAP    = 6 * 60 * 60      # min 6 hours between any two posts
-MAX_POSTS_PER_CYCLE = 1            # at most one post per check cycle
-MAX_POSTS_PER_DAY   = 4            # hard daily cap
-MAX_GIVEAWAYS_PER_DAY  = 1
-MAX_GIVEAWAYS_PER_WEEK = 3
-MIN_HOURS_BETWEEN_GIVEAWAYS = 36
-FALLBACK_HOURS  = 84               # if nothing posted in 84 h → allow one post anyway
-MAX_POST_LENGTH = 1024             # Telegram caption limit
+CHECK_INTERVAL  = _env_int("CHECK_INTERVAL_MIN", 20) * 60
+MIN_POST_GAP    = _env_int("MIN_POST_GAP_HOURS", 6) * 60 * 60
+MAX_POSTS_PER_CYCLE = _env_int("MAX_POSTS_PER_CYCLE", 1)
+MAX_POSTS_PER_DAY   = _env_int("MAX_POSTS_PER_DAY", 4)
+MAX_GIVEAWAYS_PER_DAY  = _env_int("MAX_GIVEAWAYS_PER_DAY", 1)
+MAX_GIVEAWAYS_PER_WEEK = _env_int("MAX_GIVEAWAYS_PER_WEEK", 3)
+MIN_HOURS_BETWEEN_GIVEAWAYS = _env_int("MIN_HOURS_BETWEEN_GIVEAWAYS", 36)
+NEWS_BEFORE_GIVEAWAY = _env_int("NEWS_BEFORE_GIVEAWAY", 3)
+FALLBACK_HOURS  = _env_int("FALLBACK_HOURS", 84)
+MAX_POST_LENGTH = 1024
 
 # Major stores only for giveaways (skip itch/indiegala flood from aggregators)
 GIVEAWAY_STORE_PRIORITY = (
@@ -357,7 +367,7 @@ def select_articles_for_cycle(articles: list[dict], conn: sqlite3.Connection) ->
     want_giveaway = (
         can_post_giveaway(conn)
         and giveaways
-        and news_after_giveaway >= 3
+        and news_after_giveaway >= NEWS_BEFORE_GIVEAWAY
     )
 
     if want_giveaway:
