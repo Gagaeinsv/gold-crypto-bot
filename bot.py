@@ -1449,6 +1449,26 @@ def get_price(pair: str) -> float | None:
         except Exception as e:
             log.debug("Binance (%s): %s", pair, e)
 
+    # TONUSD: CoinGecko when Binance is geo-blocked (common on VPS) — before slow Yahoo cascade
+    if pair == "TONUSD":
+        try:
+            r = requests.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": "the-open-network", "vs_currencies": "usd"},
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "GoldCryptoTradingBot/1.0",
+                },
+                timeout=10,
+            )
+            r.raise_for_status()
+            p = float((r.json().get("the-open-network") or {}).get("usd") or 0)
+            if p and _valid_price(p, pair):
+                log.debug("Price %s = %s (CoinGecko)", pair, p)
+                return _save(p)
+        except Exception as e:
+            log.debug("CoinGecko (%s): %s", pair, e)
+
     # Yahoo Finance — GC=F for gold, SI=F for silver, direct tickers for crypto
     yahoo_tickers = {
         "XAUUSD": ["GC%3DF"],       # Gold futures
@@ -3331,13 +3351,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     acc   = db_access(cid)
     plan  = acc["plan"]
 
-    # Show prices for pairs accessible on this plan
+    # Show pairs for this plan; include N/A if feeds fail so new pairs stay visible (e.g. TON behind Binance blocks).
     price_lines = []
     for pid, cfg in PAIRS.items():
-        if plan in cfg["plans"]:
-            p = get_price(pid)
-            if p:
-                price_lines.append(f"{cfg['emoji']} {cfg['name']}: *{fmt_price(p, pid)}*")
+        if plan not in cfg["plans"]:
+            continue
+        px = get_price(pid)
+        if px:
+            price_lines.append(f"{cfg['emoji']} {cfg['name']}: *{fmt_price(px, pid)}*")
+        else:
+            price_lines.append(f"{cfg['emoji']} {cfg['name']}: _N/A_")
     prices_text = "\n".join(price_lines) if price_lines else ""
 
     # Welcome message differs for referred users
@@ -4370,8 +4393,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if q.data == "choose_pair":
-        await safe_edit(q, "🔀 *Select pair*\n\n🔒 XAG — Basic+\n🔒 BTC/ETH/SOL/XRP/BNB/ADA — Pro+",
-                        markup=kb_pairs(u.selected_pair, plan))
+        hint = (
+            "🔀 *Select pair*\n\n"
+            "🔒 XAG — Basic+\n"
+            "🔒 Crypto _(BTC ETH SOL XRP BNB TON ADA)_ — Pro+"
+        )
+        await safe_edit(q, hint, markup=kb_pairs(u.selected_pair, plan))
         return
 
     if q.data.startswith("pair_"):
