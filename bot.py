@@ -373,6 +373,13 @@ PAIRS: dict = {
         "plans": ["pro", "diamond", "admin"],
         "image": "https://images.unsplash.com/photo-1639762681485-074b7f938ba0?w=800&q=80",
     },
+    "TONUSD": {
+        "name": "TON/USD", "emoji": "🔹", "yahoo": "TON11419-USD", "stooq": "tonusd",
+        "news_q": "Toncoin TON Telegram Open Network blockchain",
+        "sl_pct": 4.5, "tp_pct": 7.5,
+        "plans": ["pro", "diamond", "admin"],
+        "image": "https://images.unsplash.com/photo-1639762681485-074b7f938ba0?w=800&q=80",
+    },
     "ADAUSD": {
         "name": "ADA/USD", "emoji": "🔵", "yahoo": "ADA-USD", "stooq": "adausd",
         "news_q": "Cardano ADA crypto blockchain",
@@ -1334,6 +1341,7 @@ _BINANCE_SYMBOLS = {
     'SOLUSD':  'SOLUSDT',
     'XRPUSD':  'XRPUSDT',
     'BNBUSD':  'BNBUSDT',
+    'TONUSD':  'TONUSDT',
     'ADAUSD':  'ADAUSDT',
 }
 PRICE_RANGES = {
@@ -1344,6 +1352,7 @@ PRICE_RANGES = {
     "SOLUSD": (1,      5_000),
     "XRPUSD": (0.01,   100),
     "BNBUSD": (10,     5_000),
+    "TONUSD": (0.1,    500),
     "ADAUSD": (0.01,   50),
 }
 
@@ -1449,6 +1458,8 @@ def get_price(pair: str) -> float | None:
         "SOLUSD": ["SOL-USD"],
         "XRPUSD": ["XRP-USD"],
         "BNBUSD": ["BNB-USD"],
+        # Yahoo "TON-USD" is NOT Toncoin (~$2); Toncoin/The Open Network is TON11419-USD.
+        "TONUSD": ["TON11419-USD"],
         "ADAUSD": ["ADA-USD"],
     }
     for ticker in yahoo_tickers.get(pair, []):
@@ -1478,6 +1489,7 @@ def get_price(pair: str) -> float | None:
         "SOLUSD": "SOLUSDT",
         "XRPUSD": "XRPUSDT",
         "BNBUSD": "BNBUSDT",
+        "TONUSD": "TONUSDT",
         "ADAUSD": "ADAUSDT",
     }
     if pair in binance_sym:
@@ -2350,7 +2362,7 @@ def fmt_price(price, pair: str) -> str:
         return f"{price:,.0f}"
     elif pair in ("ETHUSD", "SOLUSD", "XAGUSD"):
         return f"{price:,.2f}"
-    elif pair in ("XRPUSD", "ADAUSD"):
+    elif pair in ("XRPUSD", "ADAUSD", "TONUSD"):
         return f"{price:,.4f}"
     else:   # XAUUSD
         return f"{price:,.2f}"
@@ -2576,6 +2588,7 @@ NEWS_TOPICS = [
     "XRP Ripple SEC crypto regulation",
     "Solana SOL crypto ecosystem news",
     "BNB Binance crypto exchange news",
+    "Toncoin TON Telegram Open Network blockchain",
     "Cardano ADA blockchain crypto",
     "central bank interest rates dollar DXY",
     "crypto market sentiment bitcoin altcoins",
@@ -2990,6 +3003,8 @@ def _gen_news_chart(topic: str) -> io.BytesIO | None:
         pair = "BTCUSD"
     elif "ethereum" in t or "eth" in t:
         pair = "ETHUSD"
+    elif "toncoin" in t or "the open network" in t:
+        pair = "TONUSD"
     else:
         pair = "XAUUSD"
     return _gen_price_chart(pair)
@@ -3209,18 +3224,18 @@ def sub_info_text(acc: dict) -> str:
         lines += [f"⭐ Basic: *{dl} days* left", "",
                   "🥇 XAU/USD — ✅", "🥈 XAG/USD — ✅",
                   "₿ BTC — 🔒", "Ξ ETH — 🔒", "◎ SOL — 🔒",
-                  "✕ XRP — 🔒", "🔶 BNB — 🔒", "🔵 ADA — 🔒", ""]
+                  "✕ XRP — 🔒", "🔶 BNB — 🔒", "🔹 TON — 🔒", "🔵 ADA — 🔒", ""]
     elif plan == "pro":
         lines += [f"💎 Pro: *{dl} days* left", "",
                   "🥇 XAU — ✅", "🥈 XAG — ✅",
                   "₿ BTC — ✅", "Ξ ETH — ✅", "◎ SOL — ✅",
-                  "✕ XRP — ✅", "🔶 BNB — ✅", "🔵 ADA — ✅",
+                  "✕ XRP — ✅", "🔶 BNB — ✅", "🔹 TON — ✅", "🔵 ADA — ✅",
                   "✅ Auto-signals", ""]
     elif plan == "diamond":
         lines += [f"💠 Diamond: *{dl} days* left", "",
                   "🥇 XAU — ✅", "🥈 XAG — ✅",
                   "₿ BTC — ✅", "Ξ ETH — ✅", "◎ SOL — ✅",
-                  "✕ XRP — ✅", "🔶 BNB — ✅", "🔵 ADA — ✅",
+                  "✕ XRP — ✅", "🔶 BNB — ✅", "🔹 TON — ✅", "🔵 ADA — ✅",
                   "✅ Auto-signals (priority)", "✅ Chart AI screenshot analysis",
                   "✅ Priority alerts (lower threshold)", ""]
     elif plan in ("expired", "none"):
@@ -4227,7 +4242,7 @@ async def cmd_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     sol = prices.get("SOLUSD", "N/A"); xrp = prices.get("XRPUSD", "N/A")
     text = (
         "<b>📊 Gold &amp; Crypto AI Signals</b>\n"
-        "<i>AI-powered signals — 8 pairs</i>\n\n"
+        "<i>AI-powered signals — 9 pairs</i>\n\n"
         "📡 AI market analysis 3x per day:\n"
         "☀️ 09:00  📊 15:00  🌙 21:00 (Kyiv time)\n\n"
         "<b>── Current prices ──</b>\n"
@@ -4238,6 +4253,7 @@ async def cmd_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"◎  SOL/USD  <code>{sol}</code>\n"
         f"✕  XRP/USD  <code>{xrp}</code>\n"
         f"🔶 BNB/USD  <code>{prices.get(chr(66)+chr(78)+chr(66)+chr(85)+chr(83)+chr(68), chr(78)+chr(47)+chr(65))}</code>\n"
+        f"🔹 TON/USD  <code>{prices.get('TONUSD', 'N/A')}</code>\n"
         f"🔵 ADA/USD  <code>{prices.get(chr(65)+chr(68)+chr(65)+chr(85)+chr(83)+chr(68), chr(78)+chr(47)+chr(65))}</code>\n\n"
         "<b>── Plans ──</b>\n\n"
         "⭐ <b>Basic</b> — $5/mo\n"
@@ -4248,7 +4264,7 @@ async def cmd_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "Auto-signals 24/7\n"
         "3 months — $25 🔥 (save 17%)\n\n"
         "👑 <b>Diamond</b> — $19.99/mo\n"
-        "ALL 8 pairs (XAU XAG BTC ETH SOL XRP BNB ADA)\n"
+        "ALL 9 pairs (XAU XAG BTC ETH SOL XRP BNB TON ADA)\n"
         "Chart screenshot analysis\n"
         "Deep AI analysis\n"
         "Priority signals\n"
@@ -5136,6 +5152,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
          InlineKeyboardButton("🥇 XAU/USD",    callback_data="stats_XAUUSD_30")],
         [InlineKeyboardButton("₿ BTC/USD",     callback_data="stats_BTCUSD_30"),
          InlineKeyboardButton("Ξ ETH/USD",     callback_data="stats_ETHUSD_30")],
+        [InlineKeyboardButton("🔹 TON/USD",     callback_data="stats_TONUSD_30"),
+         InlineKeyboardButton("◎ SOL/USD",     callback_data="stats_SOLUSD_30")],
         [InlineKeyboardButton("📅 7 days",     callback_data=f"stats_{pair or 'ALL'}_7"),
          InlineKeyboardButton("📅 30 days",    callback_data=f"stats_{pair or 'ALL'}_30"),
          InlineKeyboardButton("📅 90 days",    callback_data=f"stats_{pair or 'ALL'}_90")],
@@ -5404,7 +5422,7 @@ async def cmd_tvinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f'}}\n'
         f"```\n\n"
         f"*4. Supported pairs:*\n"
-        f"XAUUSD · BTCUSD · ETHUSD\n\n"
+        f"Use any ticker key from `/start` picker (e.g. `XAUUSD`, `BTCUSD`, `TONUSD`).\n\n"
         f"*5. Test with curl:*\n"
         f"```\n"
         f"curl -X POST http://YOUR_SERVER_IP:{TV_WEBHOOK_PORT}/tv \\\\\n"
@@ -5439,6 +5457,8 @@ async def _handle_stats_callback(q, cid: int, data: str) -> None:
          InlineKeyboardButton("🥇 XAU/USD",    callback_data="stats_XAUUSD_30")],
         [InlineKeyboardButton("₿ BTC/USD",     callback_data="stats_BTCUSD_30"),
          InlineKeyboardButton("Ξ ETH/USD",     callback_data="stats_ETHUSD_30")],
+        [InlineKeyboardButton("🔹 TON/USD",     callback_data="stats_TONUSD_30"),
+         InlineKeyboardButton("◎ SOL/USD",     callback_data="stats_SOLUSD_30")],
         [InlineKeyboardButton("📅 7d",  callback_data=f"stats_{pair}_7"),
          InlineKeyboardButton("📅 30d", callback_data=f"stats_{pair}_30"),
          InlineKeyboardButton("📅 90d", callback_data=f"stats_{pair}_90")],
