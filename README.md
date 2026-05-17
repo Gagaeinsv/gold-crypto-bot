@@ -1,4 +1,4 @@
-# Ігровий Telegram-бот для новин (v1.4.0)
+# Ігровий Telegram-бот для новин (v1.6.0)
 
 Автоматично веде ігровий Telegram-канал: **новини в пріоритеті**, роздачі — рідко і з різних магазинів.
 
@@ -7,7 +7,8 @@
 - **12 RSS-джерел** — IGN, Kotaku, PC Gamer, Eurogamer, GamesRadar, GameSpot, Destructoid, Nintendo Life, Push Square та ін.
 - **Безкоштовні ігри** — Epic, Steam, GOG, PlayStation, Xbox (через GamerPower + офіційні API), без спаму itch/indiegala
 - **Релізи** — ігри на найближчі 7 днів (RAWG API, опційно)
-- **Gemini AI** — переклад і живий текст українською
+- **Gemini AI** — кожен пост **українською + російською** за єдиним шаблоном
+- **Шаблон поста** — заголовок, факти, опис, «Моя думка», посилання, хештеги, CTA
 - **Прямі посилання** в магазин (Steam, Epic тощо), не биті URL
 
 ## Ліміти за замовчуванням
@@ -34,7 +35,7 @@ python gaming_bot.py
 Після запуску в терміналі має бути:
 
 ```text
-Bot started v1.4.0: @YourBot | Channel: @YourChannel
+Bot started v1.6.0: @YourBot | Channel: @YourChannel
 Limits: 6h between posts, max 4/day, giveaways max 1/day 3/week
 ```
 

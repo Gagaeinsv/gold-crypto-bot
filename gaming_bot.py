@@ -1,13 +1,9 @@
 """
-Gaming News Telegram Channel Bot (v1.4.0)
+Gaming News Telegram Channel Bot (v1.6.0)
 -----------------------------------------
-Публікує в Telegram-канал:
-  • Ігрові новини (IGN, Kotaku, PC Gamer, Eurogamer та ін.) — пріоритет
-  • Безкоштовні ігри з Epic / Steam / GOG / PS / Xbox — рідко, різні магазини
-  • Релізи на найближчі 7 днів (RAWG API, опційно)
-
-Ліміти за замовчуванням: 1 пост / 6 год, макс. 4/день, 1 роздача/день.
-Налаштування в .env — див. .env.example
+• Ігрові новини, релізи, патчі (RSS) + рідкі роздачі (Epic/Steam/GOG/PS/Xbox)
+• Кожен пост: шаблон UA + RU, «Моя думка», хештеги, CTA (Gemini)
+• Ліміти: 6 год між постами, 4/день, 1 роздача/день
 
 Запуск:  python gaming_bot.py
 Залежності: pip install -r requirements.txt
@@ -53,7 +49,7 @@ GEMINI_KEY      = os.getenv("GEMINI_KEY", "")             # https://aistudio.goo
 ADMIN_ID        = int(os.getenv("ADMIN_ID", "0"))
 
 GEMINI_MODEL    = "gemini-2.5-flash"
-BOT_VERSION     = "1.4.0"
+BOT_VERSION     = "1.6.0"
 
 def _env_int(key: str, default: int) -> int:
     try:
@@ -64,6 +60,7 @@ def _env_int(key: str, default: int) -> int:
 DB_PATH         = "gaming_bot.db"
 CHECK_INTERVAL  = _env_int("CHECK_INTERVAL_MIN", 20) * 60
 MIN_POST_GAP    = _env_int("MIN_POST_GAP_HOURS", 6) * 60 * 60
+NEWS_MIN_POST_GAP = _env_int("NEWS_MIN_POST_GAP_HOURS", 2) * 60 * 60
 MAX_POSTS_PER_CYCLE = _env_int("MAX_POSTS_PER_CYCLE", 1)
 MAX_POSTS_PER_DAY   = _env_int("MAX_POSTS_PER_DAY", 4)
 MAX_GIVEAWAYS_PER_DAY  = _env_int("MAX_GIVEAWAYS_PER_DAY", 1)
@@ -71,7 +68,8 @@ MAX_GIVEAWAYS_PER_WEEK = _env_int("MAX_GIVEAWAYS_PER_WEEK", 3)
 MIN_HOURS_BETWEEN_GIVEAWAYS = _env_int("MIN_HOURS_BETWEEN_GIVEAWAYS", 36)
 NEWS_BEFORE_GIVEAWAY = _env_int("NEWS_BEFORE_GIVEAWAY", 3)
 FALLBACK_HOURS  = _env_int("FALLBACK_HOURS", 84)
-MAX_POST_LENGTH = 1024
+PHOTO_CAPTION_MAX = 1024
+TEXT_MESSAGE_MAX  = 4000
 
 # Major stores only for giveaways (skip itch/indiegala flood from aggregators)
 GIVEAWAY_STORE_PRIORITY = (
@@ -175,6 +173,16 @@ RSS_SOURCES = [
 # ──────────────────────── Giveaway APIs ───────────────────────────────────────
 GIVEAWAYRADAR_URL = "https://www.giveawayradar.com/api/giveaways/gaming?count=10"
 GAMERPOWER_URL    = "https://www.gamerpower.com/api/giveaways?platform=pc&type=game&sort-by=date"
+# Окремі магазини — щоб роздачі були з Epic / Steam / GOG / PS / Xbox, а не лише з одного агрегатора
+GAMERPOWER_STORES = (
+    ("epic-games-store", "Epic Games Store"),
+    ("steam",            "Steam"),
+    ("gog",              "GOG"),
+    ("ps4",              "PlayStation"),
+    ("xbox-one",         "Xbox"),
+)
+
+CONTENT_CATEGORIES = ("news", "update", "trailer", "release")
 
 # Category emojis
 CATEGORY_EMOJI = {
@@ -323,6 +331,40 @@ def pick_diverse_giveaway(giveaways: list[dict], conn: sqlite3.Connection) -> Op
 
     return None
 
+def required_gap_seconds(category: str) -> int:
+    if category == "giveaway":
+        return MIN_HOURS_BETWEEN_GIVEAWAYS * 3600
+    return NEWS_MIN_POST_GAP
+
+def classify_rss_category(title: str, summary: str = "") -> str:
+    """Визначити тип матеріалу за заголовком (новина / патч / трейлер / реліз)."""
+    t = f"{title} {summary}".lower()
+    if any(w in t for w in ("trailer", "gameplay trailer", "cinematic", "трейлер")):
+        return "trailer"
+    if any(w in t for w in ("patch", "hotfix", "dlc", "update ", "updated", "оновлення", "патч")):
+        return "update"
+    if any(w in t for w in ("release date", "releases on", "launching", "coming to", "реліз", "вихід")):
+        return "release"
+    return "news"
+
+def freshness_boost(article: dict) -> float:
+    pd = article.get("pub_date")
+    if not pd:
+        return 0.0
+    age_h = (datetime.now(timezone.utc) - pd).total_seconds() / 3600
+    if age_h <= 3:
+        return 3.0
+    if age_h <= 12:
+        return 1.5
+    return 0.0
+
+def sort_content(articles: list[dict]) -> list[dict]:
+    def key(a):
+        pd = a.get("pub_date")
+        ts = pd.timestamp() if pd else 0
+        return (freshness_boost(a), ts)
+    return sorted(articles, key=key, reverse=True)
+
 def can_post_giveaway(conn: sqlite3.Connection) -> bool:
     if count_posts_since(conn, 24, "giveaway") >= MAX_GIVEAWAYS_PER_DAY:
         return False
@@ -340,26 +382,20 @@ def select_articles_for_cycle(articles: list[dict], conn: sqlite3.Connection) ->
         log.info("Daily post cap reached (%d)", MAX_POSTS_PER_DAY)
         return []
 
-    news     = [a for a in articles if a.get("category") == "news"]
+    news = [a for a in articles if a.get("category") in ("news", "update", "trailer")]
     releases = [a for a in articles if a.get("category") == "release"]
     giveaways = [a for a in articles if a.get("category") == "giveaway"]
 
-    # News and releases: newest first
-    def by_date(a):
-        pd = a.get("pub_date")
-        return pd.timestamp() if pd else 0
+    news = sort_content(news)
+    releases = sort_content(releases)
 
-    news.sort(key=by_date, reverse=True)
-    releases.sort(key=by_date, reverse=True)
-
-    # Giveaway only after at least 3 news posts since the last giveaway
     last_gv = conn.execute(
         "SELECT MAX(posted_at) FROM posted WHERE category = 'giveaway'"
     ).fetchone()[0]
     news_after_giveaway = 999
     if last_gv:
         row = conn.execute(
-            "SELECT COUNT(*) FROM posted WHERE category = 'news' AND posted_at > ?",
+            "SELECT COUNT(*) FROM posted WHERE category IN ('news','update','trailer','release') AND posted_at > ?",
             (last_gv,),
         ).fetchone()
         news_after_giveaway = int(row[0]) if row else 0
@@ -395,7 +431,7 @@ def make_hash(*parts: str) -> str:
     text = "|".join(str(p) for p in parts)
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
-def truncate(text: str, limit: int = MAX_POST_LENGTH) -> str:
+def truncate(text: str, limit: int = PHOTO_CAPTION_MAX) -> str:
     if not text:
         return ""
     text = text.strip()
@@ -893,13 +929,57 @@ async def fetch_rawg_releases(client: httpx.AsyncClient) -> list[dict]:
         })
     return releases
 
-# ──────────────────────── Gemini AI Rewriter ─────────────────────────────────
+# ──────────────────────── Hashtags & CTA ────────────────────────────────────────
 
-def _gemini_rewrite(title: str, summary: str, category: str, source: str, url: str) -> Optional[str]:
-    """
-    Use Gemini Flash to rewrite an article into an engaging Ukrainian Telegram post.
-    Returns the rewritten text, or None on failure (caller falls back to plain format).
-    """
+BASE_HASHTAGS = ("#Ігри", "#НовиниІгор", "#Gaming")
+
+CTA_UA = (
+    "Що думаєш про це? Пиши в коментарях 👇",
+    "Чекаєш реліз? Став 🔥",
+    "Поділися постом з друзями 🎮",
+    "Згоден чи ні? Напиши свою думку 💬",
+)
+CTA_RU = (
+    "Что думаешь об этом? Пиши в комментариях 👇",
+    "Ждёшь релиз? Ставь 🔥",
+    "Поделись постом с друзьями 🎮",
+    "Согласен или нет? Напиши своё мнение 💬",
+)
+
+def pick_hashtags(article: dict) -> str:
+    """2–4 хештеги (однакові для UA та RU блоків)."""
+    tags = list(BASE_HASHTAGS)
+    blob = f"{article.get('title', '')} {article.get('url', '')} {article.get('platform', '')}".lower()
+    if any(x in blob for x in ("playstation", "ps4", "ps5", "ps ")):
+        tags.append("#PS5")
+    elif "xbox" in blob:
+        tags.append("#Xbox")
+    elif "nintendo" in blob or "switch" in blob:
+        tags.append("#Nintendo")
+    elif "epic" in blob:
+        tags.append("#EpicGames")
+    elif "steam" in blob:
+        tags.append("#Steam")
+    return " ".join(tags[:4])
+
+def _clip(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+# ──────────────────────── Gemini: bilingual post template ─────────────────────
+
+_POST_JSON_KEYS = (
+    "title_ua", "title_ru", "facts_ua", "facts_ru",
+    "description_ua", "description_ru", "opinion_ua", "opinion_ru",
+    "cta_ua", "cta_ru", "hashtags",
+)
+
+def _gemini_bilingual_post(
+    title: str, summary: str, category: str, source: str, url: str,
+) -> Optional[dict]:
+    """Повертає структурований пост UA+RU для єдиного шаблону."""
     if not GEMINI_KEY:
         return None
     try:
@@ -910,30 +990,37 @@ def _gemini_rewrite(title: str, summary: str, category: str, source: str, url: s
         return None
 
     cat_hints = {
-        "giveaway": "Це безкоштовна роздача гри. Зроби акцент на тому, що гра безкоштовна, і що треба поспішати.",
-        "release":  "Це новина про реліз або дату виходу гри. Підкресли дату і платформи.",
-        "update":   "Це патч або оновлення гри. Коротко перелічи найцікавіше що додали/виправили.",
-        "news":     "Це загальна ігрова новина. Подай її захопливо.",
+        "giveaway": "Безкоштовна роздача. Акцент: забери гру безкоштовно, обмежений час.",
+        "release":  "Реліз або дата виходу. Вкажи дату та платформи у facts.",
+        "update":   "Патч/DLC. У facts — що змінилось.",
+        "trailer":  "Трейлер. У facts — гра та платформи.",
+        "news":     "Ігрова новина. Коротко та цікаво.",
     }
     hint = cat_hints.get(category, cat_hints["news"])
 
-    prompt = f"""Ти — редактор україномовного Telegram-каналу про відеоігри.
-Твоє завдання: перетворити нижченаведену англомовну новину на короткий, живий пост УКРАЇНСЬКОЮ мовою для Telegram-каналу.
+    prompt = f"""Ти — редактор Telegram-каналу про відеоігри.
+Створи пост за ЄДИНИМ шаблоном у ДВОХ мовах (спочатку повна українська версія, потім повна російська).
 
-Правила:
-1. Пиши виключно УКРАЇНСЬКОЮ мовою.
-2. Починай одразу з суті — без вступних фраз типу "Ось новина" або "Привіт".
-3. Обсяг: 2–4 речення (максимум 300 символів тексту без заголовку).
-4. Додавай 1–2 доречних емодзі в тексті — не переборщуй.
-5. НЕ додавай посилань (жодних URL), хештегів, підписів "#реклама" чи будь-яких HTML-тегів — тільки чистий текст.
-6. НЕ вигадуй деталей яких немає в оригіналі.
-7. {hint}
+Контекст: {hint}
 
-Оригінальний заголовок: {title}
-Короткий опис: {summary[:600] if summary else '(немає)'}
+Оригінал:
+Заголовок: {title}
+Опис: {summary[:700] if summary else '(немає)'}
 Джерело: {source}
 
-Виведи ТІЛЬКИ готовий текст посту українською — без жодних пояснень, заголовків чи обгортки."""
+Поверни JSON з полями:
+- title_ua, title_ru — короткий яскравий заголовок (до 100 символів кожен)
+- facts_ua, facts_ru — 2–4 пункти (дата, платформи, жанр, ціна/роздача) через "• "
+- description_ua, description_ru — опис новини (2–3 речення)
+- opinion_ua, opinion_ru — блок "Моя думка": 1–2 речення (оцінка, враження, прогноз або рекомендація)
+- cta_ua, cta_ru — заклик до дії (1 речення, різний від інших постів)
+- hashtags — рядок з 2–4 хештегами латиницею/кирилицею (#Ігри #Gaming тощо), однаковий для обох мов
+
+Правила:
+- Не вигадуй фактів яких немає в оригіналі.
+- Без URL у тексті полів.
+- Українська версія — природна українська, російська — природна російська (не дослівний машинний переклад заголовків-суржиком).
+- Лаконічно: весь JSON разом до ~1800 символів тексту."""
 
     try:
         client = genai.Client(api_key=GEMINI_KEY)
@@ -941,48 +1028,103 @@ def _gemini_rewrite(title: str, summary: str, category: str, source: str, url: s
             model=GEMINI_MODEL,
             contents=prompt,
             config=gtypes.GenerateContentConfig(
-                max_output_tokens=400,
-                temperature=0.7,
+                max_output_tokens=1400,
+                temperature=0.75,
+                response_mime_type="application/json",
             ),
         )
-        text = (response.text or "").strip()
-        if len(text) < 20:
+        raw = (response.text or "").strip()
+        data = json.loads(raw)
+        if not isinstance(data, dict):
             return None
-        return text
+        for key in _POST_JSON_KEYS:
+            if key not in data:
+                data[key] = ""
+        if not data.get("hashtags"):
+            data["hashtags"] = pick_hashtags({"title": title, "url": url, "category": category})
+        return data
     except Exception as exc:
-        log.warning("Gemini rewrite failed: %s", exc)
+        log.warning("Gemini bilingual post failed: %s", exc)
         return None
 
+def _fallback_bilingual_post(article: dict) -> dict:
+    """Шаблон без AI — базова двомовність."""
+    title = article.get("title", "Ігрова новина")
+    summary = strip_urls_from_text(article.get("summary", "")[:400])
+    cat = article.get("category", "news")
+    if cat == "giveaway":
+        opinion_ua = "Варто забрати, поки безкоштовно — такі роздачі рідко повторюються."
+        opinion_ru = "Стоит забрать, пока бесплатно — такие раздачи редко повторяются."
+    else:
+        opinion_ua = "Цікава новина — варто стежити за розвитком подій."
+        opinion_ru = "Интересная новость — стоит следить за развитием событий."
 
-# ──────────────────────── Message Formatter ───────────────────────────────────
+    return {
+        "title_ua": _clip(title, 100),
+        "title_ru": _clip(title, 100),
+        "facts_ua": "• Джерело: " + article.get("source", "—"),
+        "facts_ru": "• Источник: " + article.get("source", "—"),
+        "description_ua": summary or "Деталі за посиланням.",
+        "description_ru": summary or "Подробности по ссылке.",
+        "opinion_ua": opinion_ua,
+        "opinion_ru": opinion_ru,
+        "cta_ua": random.choice(CTA_UA),
+        "cta_ru": random.choice(CTA_RU),
+        "hashtags": pick_hashtags(article),
+    }
 
-def format_post(article: dict, ai_body: Optional[str] = None) -> str:
-    """
-    Plain-text caption with URL on its own line (Telegram auto-linkifies it).
-    No HTML — avoids broken <a> tags; no reliance on inline buttons in channels.
-    """
-    cat      = article.get("category", "news")
-    emoji    = CATEGORY_EMOJI.get(cat, "🎮")
-    source   = article.get("source", "")
-    title    = article.get("title", "Без назви")
-    url      = normalize_store_url(article.get("url", ""))
+def build_bilingual_post(article: dict, content: dict) -> str:
+    """Єдиний шаблон: UA блок → роздільник → RU блок → хештеги."""
+    url = normalize_store_url(article.get("url", ""))
+    cat = article.get("category", "news")
+    emoji = CATEGORY_EMOJI.get(cat, "🎮")
+    hashtags = (content.get("hashtags") or pick_hashtags(article)).strip()
 
-    platform = article.get("platform", "")
-    plat_em  = PLATFORM_EMOJI.get(platform, "") if platform else ""
+    ua_block = f"""🇺🇦 Українська версія
 
-    raw_body = ai_body if ai_body else (article.get("summary", "")[:600] if article.get("summary") else "")
-    body     = strip_urls_from_text(raw_body)
+{emoji} {content.get('title_ua', '')}
 
-    link_block = f"\n\n🔗 Посилання:\n{url}" if url else ""
-    src_block  = f"\n\n📰 Джерело: {source}" if source else ""
-    header     = f"{emoji}{plat_em} {title}\n\n"
+📌 Ключові факти:
+{content.get('facts_ua', '—')}
 
-    budget = MAX_POST_LENGTH - len(header) - len(link_block) - len(src_block) - 4
-    if body and budget > 20 and len(body) > budget:
-        body = body[: budget - 3].rstrip() + "..."
+📰 Опис:
+{content.get('description_ua', '')}
 
-    text = header + (body + link_block + src_block if body else link_block.lstrip() + src_block)
-    return text[:MAX_POST_LENGTH]
+💭 Моя думка:
+{content.get('opinion_ua', '')}
+
+🔗 Посилання:
+{url}
+
+👉 {content.get('cta_ua', random.choice(CTA_UA))}"""
+
+    ru_block = f"""🇷🇺 Русская версия
+
+{emoji} {content.get('title_ru', '')}
+
+📌 Ключевые факты:
+{content.get('facts_ru', '—')}
+
+📰 Описание:
+{content.get('description_ru', '')}
+
+💭 Моё мнение:
+{content.get('opinion_ru', '')}
+
+🔗 Ссылка:
+{url}
+
+👉 {content.get('cta_ru', random.choice(CTA_RU))}"""
+
+    separator = "\n\n" + "─" * 22 + "\n\n"
+    text = f"{ua_block}{separator}{ru_block}\n\n{hashtags}"
+
+    if len(text) > TEXT_MESSAGE_MAX:
+        for key in ("description_ua", "description_ru", "facts_ua", "facts_ru"):
+            content[key] = _clip(str(content.get(key, "")), 180)
+        return build_bilingual_post(article, content)
+
+    return text
 
 # ──────────────────────── Telegram Poster ─────────────────────────────────────
 
@@ -1014,50 +1156,63 @@ async def send_post(
     if is_posted(conn, h):
         return False
 
-    # Run Gemini rewrite in a thread (blocking SDK call) so we don't block the event loop
-    ai_body: Optional[str] = None
+    loop = asyncio.get_event_loop()
+    content: Optional[dict] = None
     if GEMINI_KEY:
-        loop = asyncio.get_event_loop()
         try:
-            ai_body = await loop.run_in_executor(
+            content = await loop.run_in_executor(
                 None,
-                _gemini_rewrite,
+                _gemini_bilingual_post,
                 title,
                 article.get("summary", ""),
                 article.get("category", "news"),
                 article.get("source", ""),
                 url,
             )
-            if ai_body:
-                log.info("Gemini rewrote: %s", title[:60])
+            if content:
+                log.info("Gemini bilingual post: %s", title[:60])
         except Exception as exc:
             log.warning("Gemini executor error: %s", exc)
 
-    if ai_body:
-        ai_body = strip_urls_from_text(ai_body)
+    if not content:
+        content = _fallback_bilingual_post(article)
 
-    caption = format_post(article, ai_body=ai_body)
-    image   = article.get("image") or article.get("image_fallback") or ""
-    # Plain text + raw URL line — most reliable in Telegram channels
+    text  = build_bilingual_post(article, content)
+    image = article.get("image") or article.get("image_fallback") or ""
     send_kw = {"chat_id": CHANNEL_ID}
 
     try:
-        if image:
-            await bot.send_photo(photo=image, caption=caption, **send_kw)
+        if image and len(text) <= PHOTO_CAPTION_MAX:
+            await bot.send_photo(photo=image, caption=text, **send_kw)
+        elif image:
+            short = f"{CATEGORY_EMOJI.get(article.get('category','news'), '🎮')} {content.get('title_ua', title)[:80]}\n\n🔗 {url}"
+            await bot.send_photo(photo=image, caption=short, **send_kw)
+            await bot.send_message(
+                text=text[:TEXT_MESSAGE_MAX],
+                disable_web_page_preview=True,
+                **send_kw,
+            )
         else:
-            await bot.send_message(text=caption, disable_web_page_preview=True, **send_kw)
+            await bot.send_message(
+                text=text[:TEXT_MESSAGE_MAX],
+                disable_web_page_preview=True,
+                **send_kw,
+            )
         mark_posted(conn, h, title, url, article.get("category", "news"), article.get("source", ""))
         log.info("Posted: [%s] %s | link: %s", article.get("category"), title[:60], url[:100])
         return True
     except TelegramError as exc:
         log.error("Telegram error posting '%s': %s", title[:60], exc)
-        if image:
-            try:
-                await bot.send_message(text=caption, disable_web_page_preview=True, **send_kw)
-                mark_posted(conn, h, title, url, article.get("category", "news"), article.get("source", ""))
-                return True
-            except TelegramError as exc2:
-                log.error("Retry without image also failed: %s", exc2)
+        try:
+            await bot.send_message(
+                text=text[:TEXT_MESSAGE_MAX],
+                disable_web_page_preview=True,
+                **send_kw,
+            )
+            mark_posted(conn, h, title, url, article.get("category", "news"), article.get("source", ""))
+            return True
+        except TelegramError as exc2:
+            log.error("Retry as text also failed: %s", exc2)
         return False
 
 # ──────────────────────── Dedup & Priority Sort ───────────────────────────────
