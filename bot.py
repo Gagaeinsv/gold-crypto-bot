@@ -11,8 +11,7 @@ def fix_markdown(text: str) -> str:
 Gold & Crypto AI Signals Bot
 Run: python bot.py
 Dependencies: pip install python-telegram-bot[job-queue] requests groq google-genai pillow yfinance pandas pandas-ta python-dotenv
-Env: GROQ_MODEL_* ; OpenRouter key pool (`OPENROUTER_API_KEY`, `OPENROUTER_API_KEY_2`, optional `OPENROUTER_API_KEYS`) ;
-     round-robin + automatic failover on 429 ; GEMINI / MONITOR_INTERVAL_SEC / providers — see .env.example.
+Env: Groq/OpenRouter pools/Gemini; `AI_ROUTE_*`; OpenRouter pools; Gemini `GEMINI_DISABLE_THINKING` (see .env.example).
 """
 
 import asyncio
@@ -66,8 +65,7 @@ load_dotenv()
 TOKEN        = os.getenv("TOKEN",        "INSERT_TOKEN")
 NEWS_API     = os.getenv("NEWS_API",     "INSERT_NEWS_API")
 GROQ_KEY     = os.getenv("GROQ_KEY",     "INSERT_GROQ_KEY")
-# OpenRouter — Groq fallback + optional deep/chart (OpenAI-compatible API).
-# Multiple keys: round-robin per request; on 429/quota — automatic failover to next key.
+# OpenRouter — role-based key pools (light vs heavy workloads). See OPENROUTER_KEYS_* and AI_ROUTE_*.
 OPENROUTER_API_KEY     = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_API_KEY_2   = os.getenv("OPENROUTER_API_KEY_2", "").strip()
 OPENROUTER_API_KEYS    = os.getenv("OPENROUTER_API_KEYS", "").strip()  # optional comma-separated extra keys
@@ -76,30 +74,172 @@ OPENROUTER_VISION_MODEL = os.getenv("OPENROUTER_VISION_MODEL", "")  # if empty, 
 OPENROUTER_SITE_URL    = os.getenv("OPENROUTER_SITE_URL", "")   # optional HTTP-Referer for OpenRouter rankings
 OPENROUTER_APP_TITLE   = os.getenv("OPENROUTER_APP_TITLE", "Gold Crypto Trading Bot")
 OPENROUTER_API_URL     = "https://openrouter.ai/api/v1/chat/completions"
+try:
+    _or402_hold = int(os.getenv("OPENROUTER_402_CREDIT_HOLD_SEC", "3600"))
+except ValueError:
+    _or402_hold = 3600
+OPENROUTER_402_CREDIT_HOLD_SEC = max(60, _or402_hold)
+# Optional explicit pools (comma-separated API keys). Defaults use OPENROUTER_API_KEY / _2.
+OPENROUTER_KEYS_LIGHT = os.getenv("OPENROUTER_KEYS_LIGHT", "").strip()
+OPENROUTER_KEYS_HEAVY = os.getenv("OPENROUTER_KEYS_HEAVY", "").strip()
+
+_openrouter_rr_lock = threading.Lock()
+# Per-pool round-robin cursor (light / heavy / merged).
+_openrouter_pool_rr: dict[str, int] = {"light": 0, "heavy": 0, "merged": 0}
+# API key string → time.monotonic() until deprioritised (HTTP 402 insufficient credits).
+_OPENROUTER_CREDIT_HOLD_UNTIL: dict[str, float] = {}
 
 
-def _openrouter_key_pool() -> list[str]:
-    keys: list[str] = []
-    for k in (OPENROUTER_API_KEY, OPENROUTER_API_KEY_2):
-        if k and k not in keys:
-            keys.append(k)
+def _openrouter_legacy_extra_keys() -> list[str]:
+    out: list[str] = []
     for part in OPENROUTER_API_KEYS.split(","):
         p = part.strip()
-        if p and p not in keys:
-            keys.append(p)
-    return keys
+        if p and p not in out:
+            out.append(p)
+    return out
 
 
-_OPENROUTER_KEYS: list[str] = _openrouter_key_pool()
-_openrouter_rr_lock = threading.Lock()
-_openrouter_rr_i = 0
+def _dedupe_api_keys(keys: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for k in keys:
+        if k and k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def _openrouter_keys_light() -> list[str]:
+    """Short / low max_tokens jobs: monitor JSON, article fallback, etc."""
+    if OPENROUTER_KEYS_LIGHT:
+        return _dedupe_api_keys(
+            [p.strip() for p in OPENROUTER_KEYS_LIGHT.split(",") if p.strip()]
+        )
+    keys: list[str] = []
+    if OPENROUTER_API_KEY:
+        keys.append(OPENROUTER_API_KEY)
+    keys.extend(k for k in _openrouter_legacy_extra_keys() if k not in keys)
+    return _dedupe_api_keys(keys)
+
+
+def _openrouter_keys_heavy() -> list[str]:
+    """Long-form + vision on OpenRouter: deep analysis chart screenshots."""
+    if OPENROUTER_KEYS_HEAVY:
+        return _dedupe_api_keys(
+            [p.strip() for p in OPENROUTER_KEYS_HEAVY.split(",") if p.strip()]
+        )
+    if OPENROUTER_API_KEY_2:
+        return [OPENROUTER_API_KEY_2]
+    # No dedicated heavy key — reuse light pool (same account / single key setups).
+    return _openrouter_keys_light()
+
+
+def _openrouter_keys_merged() -> list[str]:
+    out: list[str] = []
+    for k in _openrouter_keys_light() + _openrouter_keys_heavy():
+        if k not in out:
+            out.append(k)
+    return out
 
 
 def _openrouter_configured() -> bool:
-    return bool(_OPENROUTER_KEYS)
+    return bool(_openrouter_keys_merged())
 # Google Gemini — deep analysis, chart vision, Groq 429 fallback (works alongside OpenRouter)
 GEMINI_KEY   = os.getenv("GEMINI_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+try:
+    _deep_out_cap = int(os.getenv("DEEP_ANALYSIS_MAX_OUTPUT_TOKENS", "8192").strip())
+except ValueError:
+    _deep_out_cap = 8192
+# Long Deep Analysis replies need a high ceiling; ~1800 output tokens truncates mid-paragraph (MAX_TOKENS).
+DEEP_ANALYSIS_MAX_OUTPUT_TOKENS = max(2048, min(_deep_out_cap, 65536))
+try:
+    _cv_out_cap = int(os.getenv("CHART_VISION_MAX_OUTPUT_TOKENS", "4096").strip())
+except ValueError:
+    _cv_out_cap = 4096
+# Chart screenshot multimodal replies; tight limits cut off before SL/TP/verdict sections.
+CHART_VISION_MAX_OUTPUT_TOKENS = max(1024, min(_cv_out_cap, 65536))
+
+
+def _gemini_thinking_kw() -> dict:
+    """Gemini 2.5 can spend max_output_tokens on internal reasoning; visible text truncates early."""
+    import google.genai.types as gtypes
+
+    v = os.getenv("GEMINI_DISABLE_THINKING", "1").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return {}
+    return {"thinking_config": gtypes.ThinkingConfig(thinking_budget=0)}
+
+
+def _gemini_candidate_visible_text(candidate) -> str:
+    chunks: list[str] = []
+    content = getattr(candidate, "content", None)
+    for part in getattr(content, "parts", None) or []:
+        t = getattr(part, "text", None)
+        if isinstance(t, str) and t.strip():
+            chunks.append(t)
+    return "".join(chunks).strip()
+
+
+def _gemini_response_visible_text(response, *, context: str) -> str:
+    """Safely extract user-visible text (handles blocked prompts and quirky responses)."""
+    import google.genai.types as gtypes
+
+    fb = getattr(response, "prompt_feedback", None)
+    block_reason = getattr(fb, "block_reason", None) if fb else None
+    if block_reason:
+        raise RuntimeError(
+            f"Gemini blocked the request [{context}]: {block_reason}",
+        )
+
+    extracted: list[str] = []
+    try:
+        t = response.text  # raises if mixed/blocked/no parts depending on SDK
+        if isinstance(t, str) and t.strip():
+            extracted.append(t.strip())
+    except Exception as e:
+        log.info("Gemini %s: response.text not used (%s)", context, str(e)[:200])
+
+    if not extracted:
+        for cand in getattr(response, "candidates", None) or []:
+            s = _gemini_candidate_visible_text(cand)
+            if s:
+                extracted.append(s)
+
+    out = extracted[0] if len(extracted) == 1 else "\n".join(extracted).strip()
+
+    fr = None
+    cands = getattr(response, "candidates", None) or []
+    if cands:
+        fr = getattr(cands[0], "finish_reason", None)
+        if fr == gtypes.FinishReason.MAX_TOKENS:
+            suffix = ""
+            if context == "deep_analysis":
+                suffix = (
+                    " — raise DEEP_ANALYSIS_MAX_OUTPUT_TOKENS "
+                    "or ensure GEMINI_DISABLE_THINKING=1 (thinking eats output quota)"
+                )
+            elif context == "chart_vision":
+                suffix = (
+                    " — raise CHART_VISION_MAX_OUTPUT_TOKENS "
+                    "or ensure GEMINI_DISABLE_THINKING=1"
+                )
+            log.warning("Gemini %s hit MAX_TOKENS%s", context, suffix)
+        unsafe = frozenset(
+            {
+                gtypes.FinishReason.SAFETY,
+                gtypes.FinishReason.PROHIBITED_CONTENT,
+                gtypes.FinishReason.RECITATION,
+            }
+        )
+        if fr in unsafe and not out.strip():
+            raise RuntimeError(f"Gemini refused output [{context}]: finish_reason={fr}")
+
+    if not out.strip():
+        raise RuntimeError(f"Gemini returned empty visible text [{context}] finish_reason={fr}")
+    return out
+
+
 # gemini | openrouter | auto  (auto prefers Gemini when GEMINI_KEY is set)
 DEEP_ANALYSIS_PROVIDER = os.getenv("DEEP_ANALYSIS_PROVIDER", "gemini").strip().lower()
 CHART_VISION_PROVIDER  = os.getenv("CHART_VISION_PROVIDER", "gemini").strip().lower()
@@ -118,6 +258,27 @@ if NOWPAYMENTS_API_KEY and PUBLIC_BASE_URL.strip() and PUBLIC_BASE_URL.lower().s
 ADMIN_ID     = int(os.getenv("ADMIN_ID", "123456789"))
 CHANNEL_ID   = os.getenv("CHANNEL_ID",  "@your_channel")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "@your_bot")
+
+
+def bot_telegram_url() -> str:
+    """Canonical https://t.me/… link (bare @username in channels is not always clickable)."""
+    u = (BOT_USERNAME or "").strip()
+    if u.startswith("@"):
+        u = u[1:]
+    if not u or u in ("your_bot", ""):
+        u = "your_bot"
+    return f"https://t.me/{u}"
+
+
+def bot_link_markdown() -> str:
+    """Telegram Markdown: explicit link so channel captions stay tappable."""
+    return f"[{BOT_USERNAME}]({bot_telegram_url()})"
+
+
+def bot_link_html() -> str:
+    """HTML <a href> for parse_mode=HTML channel posts."""
+    return f'<a href="{bot_telegram_url()}">{BOT_USERNAME}</a>'
+
 
 # Groq: use a high-quota model for channel + articles vs a stronger model for per-user signals
 # (free tier: 8b ≈ 14k req/day, 70b ≈ 1k req/day — see Groq dashboard).
@@ -150,6 +311,8 @@ USD_PRO_1       = 9.99
 USD_PRO_3       = 25.00
 USD_DIAMOND_1   = 19.99
 USD_DIAMOND_3   = 49.99
+# NOWPayments: Basic (incl. 3mo crypto) violates fair price vs gateway minimum — crypto only Pro 3mo + Diamond.
+CRYPTO_PAY_ALLOWED = frozenset({("pro", 3), ("diamond", 1), ("diamond", 3)})
 DB_PATH           = "users.db"
 CHANNEL_HOURS_UTC = [6, 12, 18]   # market analysis posts (UTC)
 ARTICLE_HOURS_UTC = [8, 14, 20]   # article posts — separate from analysis
@@ -207,6 +370,13 @@ PAIRS: dict = {
         "name": "BNB/USD", "emoji": "🔶", "yahoo": "BNB-USD", "stooq": "bnbusd",
         "news_q": "BNB Binance crypto exchange",
         "sl_pct": 3.5, "tp_pct": 6.0,
+        "plans": ["pro", "diamond", "admin"],
+        "image": "https://images.unsplash.com/photo-1639762681485-074b7f938ba0?w=800&q=80",
+    },
+    "TONUSD": {
+        "name": "TON/USD", "emoji": "🔹", "yahoo": "TON11419-USD", "stooq": "tonusd",
+        "news_q": "Toncoin TON Telegram Open Network blockchain",
+        "sl_pct": 4.5, "tp_pct": 7.5,
         "plans": ["pro", "diamond", "admin"],
         "image": "https://images.unsplash.com/photo-1639762681485-074b7f938ba0?w=800&q=80",
     },
@@ -494,6 +664,257 @@ def _nowp_headers() -> dict:
     }
 
 
+def _nowp_first_float(d: dict, keys: tuple[str, ...]) -> float | None:
+    """First parsable numeric among common NOWPayments JSON field names."""
+    for key in keys:
+        raw = d.get(key)
+        if raw is None:
+            continue
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _nowp_body_is_hard_fail(body: dict) -> bool:
+    """NOWPayments mixes success payloads and `{status:false,...}` shapes."""
+    if body.get("status") is False:
+        return True
+    sc = body.get("statusCode")
+    try:
+        if sc is not None and int(float(sc)) >= 400:
+            return True
+    except (TypeError, ValueError):
+        pass
+    st = body.get("status")
+    if isinstance(st, str) and st.strip().lower() in ("false", "fail", "failed", "error"):
+        return True
+    return False
+
+
+def _nowp_http_get_body(path_relative: str, params: dict) -> dict | None:
+    """GET `/v1/{path}` → parsed JSON dict, or None on transport / unreadable payloads."""
+    url = f"{NOWPAYMENTS_BASE}/{path_relative.lstrip('/')}"
+    try:
+        r = requests.get(url, headers=_nowp_headers(), params=params, timeout=12)
+    except requests.RequestException as e:
+        log.warning("NOWPayments GET %s transport error: %s", path_relative, e)
+        return None
+    try:
+        body = r.json()
+    except ValueError:
+        log.warning(
+            "NOWPayments GET %s non-JSON HTTP %s: %s",
+            path_relative,
+            r.status_code,
+            (r.text or "")[:220],
+        )
+        return None
+    if not isinstance(body, dict):
+        return None
+    ok_http = bool(r.ok)
+    if ok_http:
+        if _nowp_body_is_hard_fail(body):
+            detail_parts = []
+            for k in ("message", "code", "error"):
+                v = body.get(k)
+                if v not in (None, ""):
+                    detail_parts.append(str(v))
+            detail = " ".join(detail_parts) if detail_parts else repr(body)[:260]
+            log.warning(
+                "NOWPayments GET %s HTTP OK but payload looks like error: %s",
+                path_relative,
+                detail[:300],
+            )
+            return None
+        return body
+
+    detail_parts = []
+    for k in ("message", "code", "error"):
+        v = body.get(k)
+        if v not in (None, ""):
+            detail_parts.append(str(v))
+    detail = " ".join(detail_parts) if detail_parts else f"HTTP {r.status_code}"
+    log.warning(
+        "NOWPayments GET %s refused: HTTP %s %s",
+        path_relative,
+        r.status_code,
+        detail[:300],
+    )
+    return None
+
+
+def nowp_minimum_pay_crypto() -> float | None:
+    """Minimum payout size in **`pay_currency`** (from `/min-amount`)."""
+    j = _nowp_http_get_body(
+        "min-amount",
+        {"currency_from": "usd", "currency_to": NOWPAYMENTS_PAY_CURRENCY},
+    )
+    if not j:
+        return None
+    return _nowp_first_float(j, ("min_amount", "minAmount"))
+
+
+def nowp_estimate_pay_crypto_for_usd(price_usd: float) -> float | None:
+    """Estimate how much **`pay_currency`** user pays for a USD-denominated list price."""
+    path = "estimate"
+    params = {
+        "amount": round(float(price_usd), 10),
+        "currency_from": "usd",
+        "currency_to": NOWPAYMENTS_PAY_CURRENCY,
+    }
+
+    url = f"{NOWPAYMENTS_BASE}/{path.lstrip('/')}"
+    try:
+        r = requests.get(url, headers=_nowp_headers(), params=params, timeout=12)
+    except requests.RequestException as e:
+        log.warning("NOWPayments GET %s transport error: %s", path, e)
+        return None
+
+    try:
+        j = r.json()
+    except ValueError:
+        log.warning("NOWPayments GET %s non-JSON HTTP %s", path, r.status_code)
+        return None
+    if not isinstance(j, dict):
+        return None
+
+    estimate = _nowp_first_float(j, ("estimated_amount", "estimatedAmount"))
+    # Success payloads look like `{ currency_from, currency_to, amount_from?, estimated_amount }`
+    # and usually omit `"status"` entirely.
+    if estimate is None or _nowp_body_is_hard_fail(j) or not bool(r.ok):
+        dp: list[str] = []
+        for k in ("message", "code", "error"):
+            v = j.get(k)
+            if v not in (None, ""):
+                dp.append(str(v))
+        detail = " ".join(dp) if dp else ((r.text or "")[:240])
+        log.warning(
+            "NOWPayments GET estimate unusable (HTTP %s): %s",
+            r.status_code,
+            detail[:320],
+        )
+        return None
+
+    return estimate
+
+
+def nowp_crypto_invoice_ceiling_usd(list_price_usd: float) -> float | None:
+    """
+    HARD cap above list price shown in Telegram so NOWPayments probing cannot explode totals.
+    Set NOWP_CRYPTO_DISABLE_INVOICE_CAP=1 on your own risk.
+    effective_invoice <= list_price + max(ABS, list_price * pct/100).
+    """
+    if os.getenv("NOWP_CRYPTO_DISABLE_INVOICE_CAP", "").strip().lower() in ("1", "true", "yes", "on"):
+        return None
+
+    lst = max(0.0, float(list_price_usd))
+    abs_extra = max(0.0, float(os.getenv("NOWP_CRYPTO_MAX_SURCHARGE_ABS_USD", "14")))
+    pct = max(0.0, float(os.getenv("NOWP_CRYPTO_MAX_SURCHARGE_PCT", "35")))
+    ceil_usd = round(lst + max(abs_extra, lst * pct / 100.0), 2)
+    log.debug(
+        "NOWPayments: invoice cap list=$%.4f ceiling=$%.4f (+max($%.4f flat, %.3f%%))",
+        lst,
+        ceil_usd,
+        abs_extra,
+        pct,
+    )
+    return ceil_usd
+
+
+def _nowp_invoice_cap_blocked_message(list_price_usd: float, cap: float | None) -> str:
+    cap_txt = "—"
+    if cap is not None:
+        cap_txt = f"${cap:.2f}"
+    return (
+        "NOWPayments вимагає мінімуму вище допустимого націнування до цінника в меню. "
+        f"Тариф ${float(list_price_usd):.2f}; дозволена верхня межа інвойса — {cap_txt}. "
+        "Спробуй оплату ⭐ або звернися до підтримки / адміна щодо криптомінімумів."
+    )
+
+
+def nowp_price_usd_above_crypto_minimum(price_usd: float) -> float:
+    """
+    Raise fiat list price slightly if NOWPayments rejects low crypto totals (AMOUNTMINIMALERROR).
+    """
+    floor = round(float(price_usd), 8)
+    invoice_cap = nowp_crypto_invoice_ceiling_usd(floor)
+    fallback_min = float(os.getenv("NOWPAYMENTS_MIN_PAY_CRYPTO_FALLBACK", "6"))
+    margin = float(os.getenv("NOWPAYMENTS_MIN_PAY_MARGIN", "1.035"))
+    # Extra absolute headroom **in pay_currency units** atop `min_crypto * margin`.
+    abs_pad_crypto = max(0.0, float(os.getenv("NOWP_MIN_PAY_CRYPTO_ABS_PAD", "0.2")))
+    # If NOWPayments/dashboard shows a larger floor than `/min-amount` returns for your merchant, raise it here (e.g. 13–20 for USDT TRC20).
+    hard_floor = float(os.getenv("NOWP_MIN_PAY_CRYPTO_HARD_FLOOR", "0") or "0")
+    step_usd = float(os.getenv("NOWPAYMENTS_MIN_TOPUP_STEP_USD", "0.1"))
+    ceiling_usd = floor + float(os.getenv("NOWPAYMENTS_MIN_TOPUP_CEILING_USD", "120"))
+    max_steps = max(50, int(os.getenv("NOWPAYMENTS_MIN_TOPUP_MAX_STEPS", "400")))
+
+    parsed_min = nowp_minimum_pay_crypto()
+    min_crypto = parsed_min if (parsed_min is not None and parsed_min > 0) else fallback_min
+    if parsed_min is None or parsed_min <= 0:
+        log.warning(
+            "NOWPayments: min-amount API missing/bad — using NOWPAYMENTS_MIN_PAY_CRYPTO_FALLBACK=%s",
+            fallback_min,
+        )
+
+    min_crypto_eff = float(min_crypto)
+    if hard_floor > 0:
+        if min_crypto_eff + 1e-9 < hard_floor:
+            log.info(
+                "NOWPayments: applying NOWP_MIN_PAY_CRYPTO_HARD_FLOOR=%.8f (was effective min_crypto≈ %.8f)",
+                hard_floor,
+                min_crypto_eff,
+            )
+        min_crypto_eff = max(min_crypto_eff, hard_floor)
+
+    threshold = min_crypto_eff * margin + abs_pad_crypto
+
+    usd_eff = floor
+    for step_i in range(max_steps):
+        if invoice_cap is not None and usd_eff > invoice_cap:
+            raise RuntimeError(_nowp_invoice_cap_blocked_message(floor, invoice_cap))
+        if usd_eff > ceiling_usd:
+            raise RuntimeError(
+                "NOWPayments: invoiced USD climbed above ceiling while sizing crypto minimum "
+                f"({usd_eff:.4f} > {ceiling_usd:.4f}); check pay_currency or API."
+            )
+
+        estimated = nowp_estimate_pay_crypto_for_usd(usd_eff)
+        if estimated is None:
+            bump_fail = round(max(step_usd * 3.0, 0.18), 6)
+            usd_eff = round(usd_eff + bump_fail, 6)
+            if step_i + 1 == max_steps:
+                raise RuntimeError("NOWPayments: estimate API unreachable; cannot size invoice.")
+            continue
+
+        if estimated >= threshold:
+            cushion_usd = max(0.0, float(os.getenv("NOWP_ESTIMATE_CUSHION_USD", "0.55")))
+            usd_final = round(usd_eff + cushion_usd, 10)
+            if invoice_cap is not None and usd_final > invoice_cap + 1e-9:
+                raise RuntimeError(_nowp_invoice_cap_blocked_message(floor, invoice_cap))
+            if usd_eff > floor or cushion_usd > 0:
+                log.info(
+                    "NOWPayments: invoice sizing list=%.4f USD → fiat_try=%.6f + cushion=%.4f → final=%.8f USD "
+                    "(min pay_crypto≈ %.8f %s, estimate_pay≈ %.10f)",
+                    floor,
+                    usd_eff,
+                    cushion_usd,
+                    usd_final,
+                    min_crypto_eff,
+                    NOWPAYMENTS_PAY_CURRENCY,
+                    estimated,
+                )
+            return usd_final
+
+        usd_eff = round(usd_eff + step_usd, 8)
+
+    raise RuntimeError(
+        f"NOWPayments: exceeded {max_steps} sizing steps starting from {floor:.8f} USD; "
+        "try another NOWPAYMENTS_PAY_CURRENCY or increase ceiling env."
+    )
+
+
 def db_crypto_payment_upsert(
     payment_id: str,
     chat_id: int,
@@ -533,21 +954,93 @@ def nowp_create_payment(chat_id: int, plan: str, months: int, price_usd: float) 
     if not PUBLIC_BASE_URL:
         raise RuntimeError("PUBLIC_BASE_URL not set")
 
-    order_id = f"tg_{chat_id}_{plan}_{months}_{uuid.uuid4().hex[:10]}"
-    payload = {
-        "price_amount": float(price_usd),
-        "price_currency": "usd",
-        "pay_currency": NOWPAYMENTS_PAY_CURRENCY,
-        "order_id": order_id,
-        "order_description": f"Telegram subscription: {plan} x{months}mo (chat {chat_id})",
-        "ipn_callback_url": f"{PUBLIC_BASE_URL.rstrip('/')}/nowpayments",
-    }
-    r = requests.post(f"{NOWPAYMENTS_BASE}/payment", headers=_nowp_headers(), json=payload, timeout=12)
-    if not r.ok:
-        detail = _nowp_response_error_detail(r)
-        log.warning("NOWPayments POST /payment failed: status=%s body=%s", r.status_code, detail)
-        raise RuntimeError(f"NOWPayments error ({r.status_code}): {detail}")
-    data = r.json()
+    requested_usd = float(price_usd)
+    invoice_ceiling = nowp_crypto_invoice_ceiling_usd(requested_usd)
+
+    initial_usd = round(nowp_price_usd_above_crypto_minimum(requested_usd), 10)
+    price_try = float(initial_usd)
+    if invoice_ceiling is not None and price_try > invoice_ceiling + 1e-9:
+        raise RuntimeError(_nowp_invoice_cap_blocked_message(requested_usd, invoice_ceiling))
+
+    pad_base = float(os.getenv("NOWP_AMOUNT_MINIMAL_ERR_PAD_USD", "0.35"))
+    pad_ramp = float(os.getenv("NOWP_AMOUNT_MINIMAL_ERR_PAD_RAMP_USD", "0.05"))
+    max_pay_retries = max(5, int(os.getenv("NOWP_AMOUNT_MINIMAL_ERR_MAX_RETRIES", "20")))
+    last_detail = ""
+    data: dict | None = None
+
+    for pay_attempt in range(max_pay_retries):
+        order_id = f"tg_{chat_id}_{plan}_{months}_{uuid.uuid4().hex[:10]}"
+        invoiced_vs_list = abs(price_try - requested_usd) > 5e-3 or abs(price_try - initial_usd) > 5e-3
+        payload = {
+            "price_amount": float(price_try),
+            "price_currency": "usd",
+            "pay_currency": NOWPAYMENTS_PAY_CURRENCY,
+            "order_id": order_id,
+            "order_description": (
+                f"Telegram subscription: {plan} x{months}mo (chat {chat_id}); "
+                f"list ${requested_usd:.2f}; invoiced ${price_try:.2f} USD equiv"
+                if invoiced_vs_list
+                else f"Telegram subscription: {plan} x{months}mo (chat {chat_id})"
+            ),
+            "ipn_callback_url": f"{PUBLIC_BASE_URL.rstrip('/')}/nowpayments",
+        }
+        fixed_on = (
+            os.getenv("NOWP_PAYMENTS_FIXED_RATE", "1").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        if fixed_on:
+            payload["fixed_rate"] = True
+
+        log.info(
+            "NOWPayments: POST /payment attempt %s/%s chat=%s plan=%s/%smo listed_usd=%.4f try_usd=%.6f pay=%s fixed_rate=%s",
+            pay_attempt + 1,
+            max_pay_retries,
+            chat_id,
+            plan,
+            months,
+            requested_usd,
+            price_try,
+            NOWPAYMENTS_PAY_CURRENCY,
+            fixed_on,
+        )
+
+        r = requests.post(f"{NOWPAYMENTS_BASE}/payment", headers=_nowp_headers(), json=payload, timeout=12)
+        if r.ok:
+            try:
+                data = r.json()
+            except ValueError:
+                raise RuntimeError("NOWPayments: payment response was not JSON")
+            break
+
+        last_detail = _nowp_response_error_detail(r)
+        log.warning(
+            "NOWPayments POST /payment attempt %s failed: status=%s body=%s",
+            pay_attempt + 1,
+            r.status_code,
+            last_detail,
+        )
+        if (
+            pay_attempt + 1 < max_pay_retries
+            and ("AMOUNTMINIMAL" in last_detail.upper() or " LESS THAN MINIMAL" in last_detail.upper())
+        ):
+            bump = pad_base + pad_ramp * float(pay_attempt)
+            nxt_try = round(float(price_try) + bump, 10)
+            if invoice_ceiling is not None and nxt_try > invoice_ceiling + 1e-9:
+                raise RuntimeError(_nowp_invoice_cap_blocked_message(requested_usd, invoice_ceiling))
+            price_try = nxt_try
+            log.warning(
+                "NOWPayments: AMOUNTMINIMALERROR → +%.4f USD retry toward %.8f USD",
+                bump,
+                price_try,
+            )
+            continue
+
+        raise RuntimeError(f"NOWPayments error ({r.status_code}): {last_detail}")
+
+    if data is None:
+        raise RuntimeError(last_detail or "NOWPayments payment create failed unexpectedly")
+
+    price_amount = round(float(price_try), 10)
     payment_id = str(data.get("payment_id") or "")
     if not payment_id:
         raise RuntimeError(f"NOWPayments create payment failed: {data}")
@@ -561,7 +1054,7 @@ def nowp_create_payment(chat_id: int, plan: str, months: int, price_usd: float) 
         chat_id=chat_id,
         plan=plan,
         months=months,
-        price_usd=float(price_usd),
+        price_usd=float(price_amount),
         pay_currency=NOWPAYMENTS_PAY_CURRENCY,
         pay_amount=float(pay_amount) if pay_amount else None,
         pay_address=str(pay_address) if pay_address else None,
@@ -574,6 +1067,8 @@ def nowp_create_payment(chat_id: int, plan: str, months: int, price_usd: float) 
         "pay_currency": NOWPAYMENTS_PAY_CURRENCY,
         "invoice_url": invoice_url,
         "raw": data,
+        "price_usd_requested": requested_usd,
+        "price_usd_invoiced": float(price_amount),
     }
 
 
@@ -846,6 +1341,7 @@ _BINANCE_SYMBOLS = {
     'SOLUSD':  'SOLUSDT',
     'XRPUSD':  'XRPUSDT',
     'BNBUSD':  'BNBUSDT',
+    'TONUSD':  'TONUSDT',
     'ADAUSD':  'ADAUSDT',
 }
 PRICE_RANGES = {
@@ -856,6 +1352,7 @@ PRICE_RANGES = {
     "SOLUSD": (1,      5_000),
     "XRPUSD": (0.01,   100),
     "BNBUSD": (10,     5_000),
+    "TONUSD": (0.1,    500),
     "ADAUSD": (0.01,   50),
 }
 
@@ -952,6 +1449,26 @@ def get_price(pair: str) -> float | None:
         except Exception as e:
             log.debug("Binance (%s): %s", pair, e)
 
+    # TONUSD: CoinGecko when Binance is geo-blocked (common on VPS) — before slow Yahoo cascade
+    if pair == "TONUSD":
+        try:
+            r = requests.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": "the-open-network", "vs_currencies": "usd"},
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "GoldCryptoTradingBot/1.0",
+                },
+                timeout=10,
+            )
+            r.raise_for_status()
+            p = float((r.json().get("the-open-network") or {}).get("usd") or 0)
+            if p and _valid_price(p, pair):
+                log.debug("Price %s = %s (CoinGecko)", pair, p)
+                return _save(p)
+        except Exception as e:
+            log.debug("CoinGecko (%s): %s", pair, e)
+
     # Yahoo Finance — GC=F for gold, SI=F for silver, direct tickers for crypto
     yahoo_tickers = {
         "XAUUSD": ["GC%3DF"],       # Gold futures
@@ -961,6 +1478,8 @@ def get_price(pair: str) -> float | None:
         "SOLUSD": ["SOL-USD"],
         "XRPUSD": ["XRP-USD"],
         "BNBUSD": ["BNB-USD"],
+        # Yahoo "TON-USD" is NOT Toncoin (~$2); Toncoin/The Open Network is TON11419-USD.
+        "TONUSD": ["TON11419-USD"],
         "ADAUSD": ["ADA-USD"],
     }
     for ticker in yahoo_tickers.get(pair, []):
@@ -990,6 +1509,7 @@ def get_price(pair: str) -> float | None:
         "SOLUSD": "SOLUSDT",
         "XRPUSD": "XRPUSDT",
         "BNBUSD": "BNBUSDT",
+        "TONUSD": "TONUSDT",
         "ADAUSD": "ADAUSDT",
     }
     if pair in binance_sym:
@@ -1159,16 +1679,44 @@ def _openrouter_headers_for(api_key: str) -> dict[str, str]:
     return h
 
 
-def _next_openrouter_rr_start() -> int:
-    """Rotate which key is tried first on each request (spread load across accounts)."""
-    n = len(_OPENROUTER_KEYS)
-    if n <= 1:
-        return 0
-    global _openrouter_rr_i
+def _openrouter_rr_bump(pool_tag: str, span: int) -> int:
+    """Return current RR offset for this pool and advance the counter."""
     with _openrouter_rr_lock:
-        idx = _openrouter_rr_i % n
-        _openrouter_rr_i += 1
-        return idx
+        cur = _openrouter_pool_rr.get(pool_tag, 0)
+        _openrouter_pool_rr[pool_tag] = cur + 1
+        return cur % max(1, span)
+
+
+def _openrouter_attempt_key_strings(pool_keys: list[str], pool_tag: str) -> list[str]:
+    if not pool_keys:
+        return []
+    n = len(pool_keys)
+    start = _openrouter_rr_bump(pool_tag, n)
+    ring = pool_keys[start:] + pool_keys[:start]
+    now = time.monotonic()
+    healthy = [k for k in ring if _OPENROUTER_CREDIT_HOLD_UNTIL.get(k, 0.0) <= now]
+    held = [k for k in ring if k not in healthy]
+    return healthy + held if healthy else ring
+
+
+def _openrouter_payment_starved_error(http_status: int, err_msg: str) -> bool:
+    """402 from OpenRouter when the account can't pay for requested max_tokens / usage."""
+    if http_status != 402:
+        return False
+    m = (err_msg or "").lower()
+    return ("credit" in m) or ("afford" in m) or ("balance" in m) or ("billing" in m)
+
+
+def _openrouter_hold_key_credit_low(api_key: str) -> None:
+    until = time.monotonic() + OPENROUTER_402_CREDIT_HOLD_SEC
+    with _openrouter_rr_lock:
+        _OPENROUTER_CREDIT_HOLD_UNTIL[api_key] = until
+    tail = api_key[-4:] if len(api_key) >= 4 else "****"
+    log.warning(
+        "OpenRouter key …%s on credit hold ~%ss (HTTP 402). Prefer other keys/credits.",
+        tail,
+        OPENROUTER_402_CREDIT_HOLD_SEC,
+    )
 
 
 def _openrouter_failover_eligible(http_status: int, err_msg: str) -> bool:
@@ -1250,11 +1798,22 @@ def _openrouter_chat(
     max_tokens: int = 1024,
     temperature: float = 0.35,
     response_format: dict | None = None,
+    key_scope: str = "light",
 ) -> str:
-    if not _OPENROUTER_KEYS:
+    scope = key_scope if key_scope in ("light", "heavy", "merged") else "light"
+    if scope == "light":
+        pool = _openrouter_keys_light()
+    elif scope == "heavy":
+        pool = _openrouter_keys_heavy()
+    else:
+        pool = _openrouter_keys_merged()
+
+    if not pool:
         raise RuntimeError(
-            "OpenRouter API keys not configured — set OPENROUTER_API_KEY and/or OPENROUTER_API_KEY_2",
+            "OpenRouter key pool is empty for scope %r — set OPENROUTER_API_KEY and/or "
+            "OPENROUTER_KEYS_LIGHT / OPENROUTER_KEYS_HEAVY" % scope,
         )
+
     use_model = (model or OPENROUTER_MODEL).strip()
     payload: dict = {
         "model": use_model,
@@ -1265,46 +1824,55 @@ def _openrouter_chat(
     if response_format is not None:
         payload["response_format"] = response_format
 
-    n = len(_OPENROUTER_KEYS)
-    start = _next_openrouter_rr_start()
+    pool_rr_tag = "merged" if scope == "merged" else scope
+    order = _openrouter_attempt_key_strings(pool, pool_rr_tag)
     last_err = ""
     last_sc = 0
 
-    for attempt in range(n):
-        k_ix = (start + attempt) % n
-        api_key = _OPENROUTER_KEYS[k_ix]
+    for attempt, api_key in enumerate(order):
         ok, text, sc, err = _openrouter_post_once(api_key, payload)
         if ok:
             if attempt > 0:
-                log.info("OpenRouter: OK using key #%s after failover/rotation", k_ix)
+                log.info(
+                    "OpenRouter: OK using key …%s (%s pool) after failover",
+                    api_key[-4:] if len(api_key) >= 4 else "****",
+                    scope,
+                )
             return text
         last_err, last_sc = err, sc
+        if sc == 402 and _openrouter_payment_starved_error(sc, err):
+            _openrouter_hold_key_credit_low(api_key)
         if not _openrouter_failover_eligible(sc, err):
             raise RuntimeError(err or f"OpenRouter HTTP {sc}")
-        if attempt < n - 1:
+        if attempt < len(order) - 1:
             log.warning(
-                "OpenRouter key #%s HTTP %s — %s; trying next key",
-                k_ix, sc, (err or "")[:160],
+                "OpenRouter key …%s HTTP %s — %s; trying next key (%s pool)",
+                api_key[-4:] if len(api_key) >= 4 else "****",
+                sc,
+                (err or "")[:160],
+                scope,
             )
 
     raise RuntimeError(last_err or f"OpenRouter HTTP {last_sc} (all keys exhausted)")
 
 
 def _openrouter_text(prompt: str, max_tokens: int = 500) -> str:
-    """Generate plain text via OpenRouter. Used as Groq fallback for articles."""
+    """Generate plain text via OpenRouter (light pool)."""
     return _openrouter_chat(
         [{"role": "user", "content": prompt}],
         max_tokens=max_tokens,
         temperature=0.45,
+        key_scope="light",
     )
 
 
 def _openrouter_json_analysis(prompt: str) -> str:
-    """Ask OpenRouter for a JSON trading signal. Used as Groq fallback."""
+    """Ask OpenRouter for a JSON trading signal (light pool)."""
     return _openrouter_chat(
         [{"role": "user", "content": prompt + "\n\nReply with ONLY valid JSON, no markdown code fences."}],
         max_tokens=400,
         temperature=0.25,
+        key_scope="light",
     )
 
 
@@ -1317,9 +1885,12 @@ def _gemini_text(prompt: str, max_tokens: int = 500) -> str:
     response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=prompt,
-        config=gtypes.GenerateContentConfig(max_output_tokens=max_tokens),
+        config=gtypes.GenerateContentConfig(
+            max_output_tokens=max_tokens,
+            **_gemini_thinking_kw(),
+        ),
     )
-    return response.text
+    return _gemini_response_visible_text(response, context="gemini_text")
 
 
 def _gemini_json_analysis(prompt: str) -> str:
@@ -1334,36 +1905,200 @@ def _gemini_json_analysis(prompt: str) -> str:
         config=gtypes.GenerateContentConfig(
             max_output_tokens=300,
             response_mime_type="application/json",
+            **_gemini_thinking_kw(),
         ),
     )
-    return response.text
+    return _gemini_response_visible_text(response, context="signal_json_gemini")
 
 
-def _groq_fallback_json_analysis(prompt: str) -> str:
-    """After Groq 429: try OpenRouter, then Gemini."""
-    if _openrouter_configured():
-        try:
-            return _openrouter_json_analysis(prompt)
-        except Exception as e:
-            log.warning("OpenRouter JSON fallback failed: %s", e)
-    if GEMINI_KEY:
-        return _gemini_json_analysis(prompt)
-    raise RuntimeError(
-        "Groq rate-limited: set OpenRouter (`OPENROUTER_API_KEY` / `OPENROUTER_API_KEY_2`) and/or `GEMINI_KEY` for fallback AI"
+_AI_ROUTE_BACKEND_TOKENS = frozenset({
+    "groq",
+    "openrouter_light",
+    "openrouter_heavy",
+    "openrouter_merged",
+    "gemini",
+})
+
+
+def _parse_ai_route_env(env_name: str, default_csv: str) -> tuple[str, ...]:
+    """Parse comma-separated backend order from env; invalid tokens are skipped."""
+    raw = os.getenv(env_name, "").strip()
+    src = raw if raw else default_csv
+    out: list[str] = []
+    for part in src.split(","):
+        p = part.strip().lower()
+        if not p:
+            continue
+        if p not in _AI_ROUTE_BACKEND_TOKENS:
+            log.warning("%s: unknown backend %r — skipped", env_name, p)
+            continue
+        out.append(p)
+    if not out:
+        for part in default_csv.split(","):
+            p = part.strip().lower()
+            if p in _AI_ROUTE_BACKEND_TOKENS:
+                out.append(p)
+    return tuple(out)
+
+
+def _groq_err_is_rate_limit(exc: BaseException) -> bool:
+    s = str(exc).lower()
+    return ("429" in str(exc)) or ("rate_limit" in s) or ("rate limit" in s)
+
+
+def _openrouter_scope_for_route_token(token: str) -> str:
+    if token == "openrouter_heavy":
+        return "heavy"
+    if token == "openrouter_merged":
+        return "merged"
+    return "light"
+
+
+def _ai_backend_route_ready(token: str) -> bool:
+    if token == "groq":
+        return bool(GROQ_KEY)
+    if token == "gemini":
+        return bool(GEMINI_KEY)
+    if token == "openrouter_light":
+        return bool(_openrouter_keys_light())
+    if token == "openrouter_heavy":
+        return bool(_openrouter_keys_heavy())
+    if token == "openrouter_merged":
+        return _openrouter_configured()
+    return False
+
+
+def _ai_route_signal_json() -> tuple[str, ...]:
+    return _parse_ai_route_env(
+        "AI_ROUTE_SIGNAL_JSON",
+        "groq,openrouter_light,gemini",
     )
 
 
-def _groq_fallback_article_text(prompt: str, max_tokens: int = 500) -> str:
-    """After Groq 429 on article: try OpenRouter, then Gemini."""
-    if _openrouter_configured():
+def _ai_route_article() -> tuple[str, ...]:
+    return _parse_ai_route_env(
+        "AI_ROUTE_ARTICLE",
+        "groq,openrouter_light,gemini",
+    )
+
+
+def _ai_route_deep() -> tuple[str, ...]:
+    if os.getenv("AI_ROUTE_DEEP", "").strip():
+        return _parse_ai_route_env("AI_ROUTE_DEEP", "gemini,openrouter_heavy")
+    pref = (DEEP_ANALYSIS_PROVIDER or "gemini").strip().lower()
+    if pref not in ("gemini", "openrouter", "auto"):
+        pref = "gemini"
+    if pref == "openrouter":
+        return ("openrouter_heavy", "gemini")
+    # gemini + auto: prefer Gemini for long-context reports, heavy OpenRouter as backup
+    return ("gemini", "openrouter_heavy")
+
+
+def _ai_route_chart_vision() -> tuple[str, ...]:
+    if os.getenv("AI_ROUTE_CHART_VISION", "").strip():
+        return _parse_ai_route_env("AI_ROUTE_CHART_VISION", "gemini,openrouter_heavy")
+    pref = (CHART_VISION_PROVIDER or "gemini").strip().lower()
+    if pref not in ("gemini", "openrouter", "auto"):
+        pref = "gemini"
+    if pref == "openrouter":
+        return ("openrouter_heavy", "gemini")
+    return ("gemini", "openrouter_heavy")
+
+
+def _deep_route_step_allowed(step: str) -> bool:
+    """Groq skipped for oversized deep prompts."""
+    return step != "groq"
+
+
+def _chart_route_step_allowed(step: str) -> bool:
+    """Groq skipped — no multimodal path for chart in this codebase."""
+    return step != "groq"
+
+
+def _invoke_signal_json_llm(analysis_prompt: str, groq_model: str) -> str:
+    """Trading-signal JSON: order from AI_ROUTE_SIGNAL_JSON (Groq / OpenRouter / Gemini)."""
+    errs: list[str] = []
+    for step in _ai_route_signal_json():
+        if not _ai_backend_route_ready(step):
+            continue
         try:
-            return _openrouter_text(prompt, max_tokens=max_tokens)
+            if step == "groq":
+                return _groq_client().chat.completions.create(
+                    model=groq_model,
+                    timeout=GROQ_TIMEOUT,
+                    messages=[{"role": "user", "content": analysis_prompt}],
+                    temperature=0.3,
+                    max_tokens=280,
+                ).choices[0].message.content
+            if step in ("openrouter_light", "openrouter_heavy", "openrouter_merged"):
+                return _openrouter_chat(
+                    [
+                        {
+                            "role": "user",
+                            "content": analysis_prompt
+                            + "\n\nReply with ONLY valid JSON, no markdown code fences.",
+                        }
+                    ],
+                    max_tokens=400,
+                    temperature=0.25,
+                    key_scope=_openrouter_scope_for_route_token(step),
+                )
+            if step == "gemini":
+                return _gemini_json_analysis(analysis_prompt)
         except Exception as e:
-            log.warning("OpenRouter article fallback failed: %s", e)
-    if GEMINI_KEY:
-        return _gemini_text(prompt, max_tokens=max_tokens)
+            if step == "groq" and _groq_err_is_rate_limit(e):
+                log.info("Groq rate limit — trying next backend in AI_ROUTE_SIGNAL_JSON")
+                continue
+            errs.append(f"{step}:{e}")
+            log.warning("AI_ROUTE_SIGNAL_JSON step=%s failed: %s", step, str(e)[:220])
+            continue
     raise RuntimeError(
-        "Groq rate-limited: set OpenRouter (`OPENROUTER_API_KEY` / `OPENROUTER_API_KEY_2`) and/or `GEMINI_KEY` for fallback AI"
+        errs[-1]
+        if errs
+        else "No AI backend available for signals — configure Groq/OpenRouter/Gemini for this route."
+    )
+
+
+def _invoke_article_llm(prompt: str) -> str:
+    """Channel article body: order from AI_ROUTE_ARTICLE."""
+    errs: list[str] = []
+    for step in _ai_route_article():
+        if not _ai_backend_route_ready(step):
+            continue
+        try:
+            if step == "groq":
+                return (
+                    _groq_client()
+                    .chat.completions.create(
+                        model=GROQ_MODEL_NEWS,
+                        timeout=GROQ_TIMEOUT,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.5,
+                        max_tokens=500,
+                    )
+                    .choices[0]
+                    .message.content.strip()
+                )
+            if step in ("openrouter_light", "openrouter_heavy", "openrouter_merged"):
+                return _openrouter_chat(
+                    [{"role": "user", "content": prompt}],
+                    max_tokens=500,
+                    temperature=0.45,
+                    key_scope=_openrouter_scope_for_route_token(step),
+                )
+            if step == "gemini":
+                return _gemini_text(prompt, max_tokens=500).strip()
+        except Exception as e:
+            if step == "groq" and _groq_err_is_rate_limit(e):
+                log.info("Groq rate limit — trying next backend in AI_ROUTE_ARTICLE")
+                continue
+            errs.append(f"{step}:{e}")
+            log.warning("AI_ROUTE_ARTICLE step=%s failed: %s", step, str(e)[:220])
+            continue
+    raise RuntimeError(
+        errs[-1]
+        if errs
+        else "No AI backend available for articles — configure Groq/OpenRouter/Gemini for this route."
     )
 
 
@@ -1443,18 +2178,7 @@ def groq_analysis(news_text: str, price: float, tech: dict,
                 "Keys: sentiment, confidence, risk_level, recommendation, "
                 "optimal_entry, stop_loss, take_profit, risk_reward, entry_reason, main_driver"
         )
-        try:
-            raw = _groq_client().chat.completions.create(
-                model=groq_model, timeout=GROQ_TIMEOUT,
-                messages=[{"role": "user", "content": analysis_prompt}],
-                temperature=0.3, max_tokens=280,
-            ).choices[0].message.content
-        except Exception as groq_err:
-            if "429" in str(groq_err) or "rate_limit" in str(groq_err).lower():
-                log.info("Groq rate limit — trying OpenRouter then Gemini for analysis")
-                raw = _groq_fallback_json_analysis(analysis_prompt)
-            else:
-                raise
+        raw = _invoke_signal_json_llm(analysis_prompt, groq_model)
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         if m:
             parsed = json.loads(m.group())
@@ -1658,7 +2382,7 @@ def fmt_price(price, pair: str) -> str:
         return f"{price:,.0f}"
     elif pair in ("ETHUSD", "SOLUSD", "XAGUSD"):
         return f"{price:,.2f}"
-    elif pair in ("XRPUSD", "ADAUSD"):
+    elif pair in ("XRPUSD", "ADAUSD", "TONUSD"):
         return f"{price:,.4f}"
     else:   # XAUUSD
         return f"{price:,.2f}"
@@ -1775,7 +2499,7 @@ def groq_channel_post(a: dict, post_type: str) -> str:
         "",
         verdict,
         div,
-        f"🤖 {BOT_USERNAME}",
+        f"🤖 {bot_link_markdown()}",
     ]
     return "\n".join(lines)
 
@@ -1884,6 +2608,7 @@ NEWS_TOPICS = [
     "XRP Ripple SEC crypto regulation",
     "Solana SOL crypto ecosystem news",
     "BNB Binance crypto exchange news",
+    "Toncoin TON Telegram Open Network blockchain",
     "Cardano ADA blockchain crypto",
     "central bank interest rates dollar DXY",
     "crypto market sentiment bitcoin altcoins",
@@ -1941,29 +2666,17 @@ def groq_article(topic_type: str, topic: str) -> str:
             "- 📌 Practical tip: 1 sentence\n\n"
             "Length: 120-160 words. Use *bold* ONLY for the headline. No hashtags."
         )
-    try:
-        result = _groq_client().chat.completions.create(
-            model=GROQ_MODEL_NEWS, timeout=GROQ_TIMEOUT,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.5, max_tokens=500,
-        ).choices[0].message.content.strip()
-    except Exception as groq_err:
-        if "429" in str(groq_err) or "rate_limit" in str(groq_err).lower():
-            log.info("Groq rate limit — trying OpenRouter then Gemini for article")
-            result = _groq_fallback_article_text(prompt, max_tokens=500)
-        else:
-            raise
-    return result
+    return _invoke_article_llm(prompt)
 
 
 def format_article_post(topic_type: str, body: str) -> str:
     div = "─" * 30
     if topic_type == "edu":
         header = f"📚 *Educational Post*\n{div}"
-        footer = f"\n{div}\n💡 _Learn more → {BOT_USERNAME}_"
+        footer = f"\n{div}\n💡 _Learn more:_ {bot_link_markdown()}"
     else:
         header = f"📰 *Market News*\n{div}"
-        footer = f"\n{div}\n📊 _Signals & analysis → {BOT_USERNAME}_"
+        footer = f"\n{div}\n📊 _Signals & analysis:_ {bot_link_markdown()}"
     return f"{header}\n\n{body}\n{footer}"
 
 
@@ -2310,6 +3023,8 @@ def _gen_news_chart(topic: str) -> io.BytesIO | None:
         pair = "BTCUSD"
     elif "ethereum" in t or "eth" in t:
         pair = "ETHUSD"
+    elif "toncoin" in t or "the open network" in t:
+        pair = "TONUSD"
     else:
         pair = "XAUUSD"
     return _gen_price_chart(pair)
@@ -2529,18 +3244,18 @@ def sub_info_text(acc: dict) -> str:
         lines += [f"⭐ Basic: *{dl} days* left", "",
                   "🥇 XAU/USD — ✅", "🥈 XAG/USD — ✅",
                   "₿ BTC — 🔒", "Ξ ETH — 🔒", "◎ SOL — 🔒",
-                  "✕ XRP — 🔒", "🔶 BNB — 🔒", "🔵 ADA — 🔒", ""]
+                  "✕ XRP — 🔒", "🔶 BNB — 🔒", "🔹 TON — 🔒", "🔵 ADA — 🔒", ""]
     elif plan == "pro":
         lines += [f"💎 Pro: *{dl} days* left", "",
                   "🥇 XAU — ✅", "🥈 XAG — ✅",
                   "₿ BTC — ✅", "Ξ ETH — ✅", "◎ SOL — ✅",
-                  "✕ XRP — ✅", "🔶 BNB — ✅", "🔵 ADA — ✅",
+                  "✕ XRP — ✅", "🔶 BNB — ✅", "🔹 TON — ✅", "🔵 ADA — ✅",
                   "✅ Auto-signals", ""]
     elif plan == "diamond":
         lines += [f"💠 Diamond: *{dl} days* left", "",
                   "🥇 XAU — ✅", "🥈 XAG — ✅",
                   "₿ BTC — ✅", "Ξ ETH — ✅", "◎ SOL — ✅",
-                  "✕ XRP — ✅", "🔶 BNB — ✅", "🔵 ADA — ✅",
+                  "✕ XRP — ✅", "🔶 BNB — ✅", "🔹 TON — ✅", "🔵 ADA — ✅",
                   "✅ Auto-signals (priority)", "✅ Chart AI screenshot analysis",
                   "✅ Priority alerts (lower threshold)", ""]
     elif plan in ("expired", "none"):
@@ -2636,13 +3351,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     acc   = db_access(cid)
     plan  = acc["plan"]
 
-    # Show prices for pairs accessible on this plan
+    # Show pairs for this plan; include N/A if feeds fail so new pairs stay visible (e.g. TON behind Binance blocks).
     price_lines = []
     for pid, cfg in PAIRS.items():
-        if plan in cfg["plans"]:
-            p = get_price(pid)
-            if p:
-                price_lines.append(f"{cfg['emoji']} {cfg['name']}: *{fmt_price(p, pid)}*")
+        if plan not in cfg["plans"]:
+            continue
+        px = get_price(pid)
+        if px:
+            price_lines.append(f"{cfg['emoji']} {cfg['name']}: *{fmt_price(px, pid)}*")
+        else:
+            price_lines.append(f"{cfg['emoji']} {cfg['name']}: _N/A_")
     prices_text = "\n".join(price_lines) if price_lines else ""
 
     # Welcome message differs for referred users
@@ -3002,84 +3720,128 @@ Respond ONLY in this exact structure. Use the actual numbers from the data above
 Be precise. Use exact prices from the data. No vague statements."""
 
 
-def _resolved_deep_provider() -> str:
-    """Which backend runs /deepanalysis: gemini | openrouter | none (auto picks first available)."""
-    p = (DEEP_ANALYSIS_PROVIDER or "gemini").strip().lower()
-    if p not in ("gemini", "openrouter", "auto"):
-        p = "gemini"
-    if p == "openrouter":
-        return "openrouter"
-    if p == "gemini":
-        return "gemini"
-    if GEMINI_KEY:
-        return "gemini"
-    if _openrouter_configured():
-        return "openrouter"
-    return "none"
-
-
 def _deep_analysis_model_label() -> str:
-    return OPENROUTER_MODEL if _resolved_deep_provider() == "openrouter" else GEMINI_MODEL
+    """First configured backend named in AI_ROUTE_DEEP (excluding Groq here)."""
+    for step in _ai_route_deep():
+        if not _deep_route_step_allowed(step) or not _ai_backend_route_ready(step):
+            continue
+        if step.startswith("openrouter"):
+            return OPENROUTER_MODEL
+        if step == "gemini":
+            return GEMINI_MODEL
+    return "—"
 
 
 def _deep_analysis_config_ok() -> tuple[bool, str]:
-    w = _resolved_deep_provider()
-    if w == "none":
+    route = _ai_route_deep()
+    usable = [
+        s for s in route
+        if _deep_route_step_allowed(s) and _ai_backend_route_ready(s)
+    ]
+    if not usable:
         return False, (
-            "No AI backend for deep analysis. Set `GEMINI_KEY` and/or OpenRouter keys "
-            "(`OPENROUTER_API_KEY`, `OPENROUTER_API_KEY_2`), "
-            "or adjust `DEEP_ANALYSIS_PROVIDER` (gemini | openrouter | auto)."
+            "No AI backend reachable for Deep Analysis. Set `GEMINI_KEY` and/or configure "
+            "OpenRouter (`OPENROUTER_API_KEY`, `OPENROUTER_API_KEY_2` or `OPENROUTER_KEYS_*`). "
+            "Optional: `AI_ROUTE_DEEP=gemini,openrouter_heavy`."
         )
-    if w == "openrouter" and not _openrouter_configured():
-        return (
-            False,
-            "`DEEP_ANALYSIS_PROVIDER` uses OpenRouter but no OpenRouter keys are set "
-            "(set `OPENROUTER_API_KEY` and optionally `OPENROUTER_API_KEY_2`).",
-        )
-    if w == "gemini" and not GEMINI_KEY:
-        return False, "`DEEP_ANALYSIS_PROVIDER` uses Gemini but `GEMINI_KEY` is missing."
     return True, ""
 
 
-def _resolved_chart_provider() -> str:
-    p = (CHART_VISION_PROVIDER or "gemini").strip().lower()
-    if p not in ("gemini", "openrouter", "auto"):
-        p = "gemini"
-    if p == "openrouter":
-        return "openrouter"
-    if p == "gemini":
-        return "gemini"
-    if GEMINI_KEY:
-        return "gemini"
-    if _openrouter_configured():
-        return "openrouter"
-    return "none"
+def _chart_vision_label() -> str:
+    """First configured vision backend in AI_ROUTE_CHART_VISION."""
+    for step in _ai_route_chart_vision():
+        if not _chart_route_step_allowed(step) or not _ai_backend_route_ready(step):
+            continue
+        if step.startswith("openrouter"):
+            return _openrouter_vision_model()
+        if step == "gemini":
+            return GEMINI_MODEL
+    return "—"
 
 
 def _chart_vision_config_ok() -> tuple[bool, str]:
-    w = _resolved_chart_provider()
-    if w == "none":
+    route = _ai_route_chart_vision()
+    usable = [
+        s for s in route
+        if _chart_route_step_allowed(s) and _ai_backend_route_ready(s)
+    ]
+    if not usable:
         return False, (
-            "Set `GEMINI_KEY` or OpenRouter keys (`OPENROUTER_API_KEY` / `OPENROUTER_API_KEY_2`) "
-            "for chart vision (or `CHART_VISION_PROVIDER`)."
+            "No vision backend reachable. Set `GEMINI_KEY` and/or heavy OpenRouter keys. "
+            "Optional: `AI_ROUTE_CHART_VISION=gemini,openrouter_heavy`."
         )
-    if w == "openrouter" and not _openrouter_configured():
-        return (
-            False,
-            "Chart vision uses OpenRouter but no OpenRouter keys are configured.",
-        )
-    if w == "gemini" and not GEMINI_KEY:
-        return False, "Chart vision uses Gemini but `GEMINI_KEY` is missing."
     return True, ""
 
 
-def _chart_model_label() -> str:
-    if _resolved_chart_provider() == "openrouter":
-        return _openrouter_vision_model()
-    return GEMINI_MODEL
+def _chart_vision_via_gemini(photo_bytes: bytes, prompt: str) -> str:
+    import google.genai as genai
+    import google.genai.types as gtypes
+    import PIL.Image
+
+    client = genai.Client(api_key=GEMINI_KEY)
+    image = PIL.Image.open(io.BytesIO(bytes(photo_bytes)))
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[prompt, image],
+        config=gtypes.GenerateContentConfig(
+            max_output_tokens=CHART_VISION_MAX_OUTPUT_TOKENS,
+            **_gemini_thinking_kw(),
+        ),
+    )
+    return _gemini_response_visible_text(response, context="chart_vision")
 
 
-def _openrouter_deep_analysis(pair: str, price: float) -> str:
+def _chart_vision_via_openrouter(
+    photo_bytes: bytes,
+    prompt: str,
+    mime: str,
+    *,
+    key_scope: str,
+) -> str:
+    b64 = base64.standard_b64encode(bytes(photo_bytes)).decode("ascii")
+    data_url = f"data:{mime};base64,{b64}"
+    return _openrouter_chat(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ],
+        model=_openrouter_vision_model(),
+        max_tokens=CHART_VISION_MAX_OUTPUT_TOKENS,
+        temperature=0.3,
+        key_scope=key_scope,
+    )
+
+
+def _invoke_chart_vision_route(photo_bytes: bytes, prompt: str, mime: str) -> str:
+    errs: list[str] = []
+    for step in _ai_route_chart_vision():
+        if not _chart_route_step_allowed(step) or not _ai_backend_route_ready(step):
+            continue
+        scope = _openrouter_scope_for_route_token(step)
+        try:
+            if step == "gemini":
+                return _chart_vision_via_gemini(photo_bytes, prompt)
+            if step in ("openrouter_light", "openrouter_heavy", "openrouter_merged"):
+                return _chart_vision_via_openrouter(
+                    photo_bytes, prompt, mime, key_scope=scope,
+                )
+        except Exception as e:
+            errs.append(f"{step}:{e}")
+            log.warning("AI_ROUTE_CHART_VISION step=%s failed: %s", step, str(e)[:260])
+            continue
+    raise RuntimeError(
+        errs[-1]
+        if errs
+        else "No vision-capable backend available for chart analysis.",
+    )
+
+
+def _openrouter_deep_analysis(pair: str, price: float, *, key_scope: str = "heavy") -> str:
     """Run deep analysis using OpenRouter (long-form report)."""
     # Gather all data
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
@@ -3104,8 +3866,9 @@ def _openrouter_deep_analysis(pair: str, price: float) -> str:
 
     return _openrouter_chat(
         [{"role": "user", "content": prompt}],
-        max_tokens=1800,
+        max_tokens=DEEP_ANALYSIS_MAX_OUTPUT_TOKENS,
         temperature=0.35,
+        key_scope=key_scope,
     )
 
 
@@ -3139,19 +3902,37 @@ def _gemini_deep_analysis(pair: str, price: float) -> str:
         model=GEMINI_MODEL,
         contents=prompt,
         config=gtypes.GenerateContentConfig(
-            max_output_tokens=1800,
+            max_output_tokens=DEEP_ANALYSIS_MAX_OUTPUT_TOKENS,
+            **_gemini_thinking_kw(),
         ),
     )
-    return response.text
+    return _gemini_response_visible_text(response, context="deep_analysis")
 
 
 def _deep_analysis_llm_call(pair: str, price: float) -> str:
-    w = _resolved_deep_provider()
-    if w == "none":
-        raise RuntimeError("No deep-analysis backend configured")
-    if w == "openrouter":
-        return _openrouter_deep_analysis(pair, price)
-    return _gemini_deep_analysis(pair, price)
+    errs: list[str] = []
+    for step in _ai_route_deep():
+        if not _deep_route_step_allowed(step) or not _ai_backend_route_ready(step):
+            continue
+        try:
+            if step == "gemini":
+                return _gemini_deep_analysis(pair, price)
+            if step in ("openrouter_light", "openrouter_heavy", "openrouter_merged"):
+                scope = _openrouter_scope_for_route_token(step)
+                return _openrouter_deep_analysis(pair, price, key_scope=scope)
+        except Exception as e:
+            errs.append(f"{step}:{e}")
+            log.warning(
+                "AI_ROUTE_DEEP step=%s failed: %s",
+                step,
+                str(e)[:260],
+            )
+            continue
+    raise RuntimeError(
+        errs[-1]
+        if errs
+        else "No deep-analysis backend available for this route.",
+    )
 
 
 async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3318,7 +4099,7 @@ async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Vision Chart Analysis  (Gemini or OpenRouter — see CHART_VISION_PROVIDER)
+#  Vision Chart Analysis — AI_ROUTE_CHART_VISION / CHART_VISION_PROVIDER (Gemini + OpenRouter pools)
 # ═══════════════════════════════════════════════════════════════════
 
 async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3380,7 +4161,7 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     await update.message.reply_text(
         "🔍 *Analysing your chart…*\n"
-        f"_Model `{_chart_model_label()}` — about 15–45 seconds_",
+        f"_Model `{_chart_vision_label()}` — about 15–45 seconds_",
         parse_mode="Markdown",
     )
 
@@ -3417,39 +4198,13 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "Keep it concise. Use prices visible on the chart."
         )
 
-        if _resolved_chart_provider() == "openrouter":
-            mime = getattr(photo, "mime_type", None) or "image/jpeg"
-            b64 = base64.standard_b64encode(bytes(photo_bytes)).decode("ascii")
-            data_url = f"data:{mime};base64,{b64}"
-            result = _openrouter_chat(
-                [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": data_url}},
-                        ],
-                    }
-                ],
-                model=_openrouter_vision_model(),
-                max_tokens=1000,
-                temperature=0.3,
-            )
-        else:
-            import google.genai as genai
-            import google.genai.types as gtypes
-            import PIL.Image
-
-            client = genai.Client(api_key=GEMINI_KEY)
-            image = PIL.Image.open(io.BytesIO(bytes(photo_bytes)))
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=[prompt, image],
-                config=gtypes.GenerateContentConfig(
-                    max_output_tokens=1000,
-                ),
-            )
-            result = response.text
+        mime = getattr(photo, "mime_type", None) or "image/jpeg"
+        result = await asyncio.to_thread(
+            _invoke_chart_vision_route,
+            bytes(photo_bytes),
+            prompt,
+            mime,
+        )
 
         # Strip common markdown so plain-text Telegram replies stay readable
         result = re.sub(r"\*+", "", result)
@@ -3479,7 +4234,12 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             if i < len(parts) - 1:
                 await asyncio.sleep(0.5)
 
-        log.info("Chart analysis: cid=%s plan=%s model=%s", cid, acc["plan"], _chart_model_label())
+        log.info(
+            "Chart analysis: cid=%s plan=%s model=%s",
+            cid,
+            acc["plan"],
+            _chart_vision_label(),
+        )
 
     except Exception as e:
         await update.message.reply_text(
@@ -3505,7 +4265,7 @@ async def cmd_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     sol = prices.get("SOLUSD", "N/A"); xrp = prices.get("XRPUSD", "N/A")
     text = (
         "<b>📊 Gold &amp; Crypto AI Signals</b>\n"
-        "<i>AI-powered signals — 8 pairs</i>\n\n"
+        "<i>AI-powered signals — 9 pairs</i>\n\n"
         "📡 AI market analysis 3x per day:\n"
         "☀️ 09:00  📊 15:00  🌙 21:00 (Kyiv time)\n\n"
         "<b>── Current prices ──</b>\n"
@@ -3516,6 +4276,7 @@ async def cmd_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"◎  SOL/USD  <code>{sol}</code>\n"
         f"✕  XRP/USD  <code>{xrp}</code>\n"
         f"🔶 BNB/USD  <code>{prices.get(chr(66)+chr(78)+chr(66)+chr(85)+chr(83)+chr(68), chr(78)+chr(47)+chr(65))}</code>\n"
+        f"🔹 TON/USD  <code>{prices.get('TONUSD', 'N/A')}</code>\n"
         f"🔵 ADA/USD  <code>{prices.get(chr(65)+chr(68)+chr(65)+chr(85)+chr(83)+chr(68), chr(78)+chr(47)+chr(65))}</code>\n\n"
         "<b>── Plans ──</b>\n\n"
         "⭐ <b>Basic</b> — $5/mo\n"
@@ -3526,13 +4287,13 @@ async def cmd_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "Auto-signals 24/7\n"
         "3 months — $25 🔥 (save 17%)\n\n"
         "👑 <b>Diamond</b> — $19.99/mo\n"
-        "ALL 8 pairs (XAU XAG BTC ETH SOL XRP BNB ADA)\n"
+        "ALL 9 pairs (XAU XAG BTC ETH SOL XRP BNB TON ADA)\n"
         "Chart screenshot analysis\n"
         "Deep AI analysis\n"
         "Priority signals\n"
         "3 months — $49.99 🔥 (save 17%)\n\n"
         "🎁 <b>First week FREE</b>\n\n"
-        f"👇 Start → {BOT_USERNAME}"
+        f"👇 Start → {bot_link_html()}"
     )
     try:
         msg = await context.bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
@@ -3632,8 +4393,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if q.data == "choose_pair":
-        await safe_edit(q, "🔀 *Select pair*\n\n🔒 XAG — Basic+\n🔒 BTC/ETH/SOL/XRP/BNB/ADA — Pro+",
-                        markup=kb_pairs(u.selected_pair, plan))
+        hint = (
+            "🔀 *Select pair*\n\n"
+            "🔒 XAG — Basic+\n"
+            "🔒 Crypto _(BTC ETH SOL XRP BNB TON ADA)_ — Pro+"
+        )
+        await safe_edit(q, hint, markup=kb_pairs(u.selected_pair, plan))
         return
 
     if q.data.startswith("pair_"):
@@ -3696,19 +4461,24 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("₮ Basic — 1 mo ($5)",       callback_data="crypto_pay_basic_1")],
-            [InlineKeyboardButton("₮ Basic — 3 mo ($12.5)",    callback_data="crypto_pay_basic_3")],
-            [InlineKeyboardButton("₮ Pro — 1 mo ($9.99)",      callback_data="crypto_pay_pro_1")],
-            [InlineKeyboardButton("₮ Pro — 3 mo ($25)",        callback_data="crypto_pay_pro_3")],
+            [InlineKeyboardButton("₮ Pro — 3 mo ($25)", callback_data="crypto_pay_pro_3")],
             [InlineKeyboardButton("₮ Diamond — 1 mo ($19.99)", callback_data="crypto_pay_diamond_1")],
             [InlineKeyboardButton("₮ Diamond — 3 mo ($49.99)", callback_data="crypto_pay_diamond_3")],
             [InlineKeyboardButton("↩️ Back", callback_data="sub_menu")],
         ])
+        crypto_menu_intro = (
+            "₮ *Pay with Crypto (USDT TRC20)*\n\n"
+            "*UA:* Отримаєш адресу й *точну кількість USDT*. Підписка увімкнеться після підтвердження мережею.\n"
+            "*EN:* You get address + *exact USDT amount*; access unlocks after network confirmation.\n\n"
+            "⚠️ *Чому немає Basic і коротких планів?*\n"
+            "Мінімальні суми *NOWPayments* і мережі означали б для *Basic* криптом значну доплату "
+            "(наприклад ~$13 замість $12.5 — цього ми свідомо не пропонуємо). Усе *Basic / Pro на 1 міс* й пакунок "
+            "*Basic на 3 міс* доступні через ⭐ у *Subscription*.\n\n"
+            "📋 Тут лише:\n• *Pro — 3 місяці*\n• *Diamond — 1 або 3 міс*"
+        )
         await safe_edit(
             q,
-            "₮ *Pay with Crypto (USDT TRC20)*\n\n"
-            "Choose your plan. You'll receive an address and exact amount.\n"
-            "_Auto-activation after confirmation._",
+            crypto_menu_intro,
             markup=kb,
         )
         return
@@ -3729,6 +4499,29 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 q,
                 "❌ Bad crypto plan option.",
                 markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")]]),
+            )
+            return
+
+        if (plan_key, months) not in CRYPTO_PAY_ALLOWED:
+            denied = (
+                "⚠️ *Цей план оплатити криптою через це меню не можна*\n\n"
+                "Посередник *NOWPayments* і мінімуми мережі роблять криптоплатіж по *Basic* "
+                "(у тому числі пакету на *3 міс*) або дешевим *Pro на 1 міс* практично неможливим "
+                "*без великої надбавки* до цінника — тому ці тарифи криптом ми не показуємо.\n\n"
+                "*Що робити:*\n"
+                "• *Basic*, *Pro 1 міс* → оплата ⭐ у *Subscription*\n"
+                "• Криптом тут лише *Pro на 3 міс* й *Diamond* (1 або 3 міс).\n\n"
+                "_Якщо підказка зʼявилась після старої кнопки — онови бота на сервері._"
+            )
+            await safe_edit(
+                q,
+                denied,
+                markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("↩️ Оплата криптою", callback_data="crypto_menu"),
+                        InlineKeyboardButton("↩️ Підписка", callback_data="sub_menu"),
+                    ],
+                ]),
             )
             return
 
@@ -3766,17 +4559,21 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         url = inv.get("invoice_url")
 
         lines = [
-            "₮ *Crypto Payment Created*",
+            "₮ *Рахунок USDT (TRC20)*",
             "",
-            f"Plan: *{plan_label(plan_key)}*  |  Months: *{months}*",
-            f"Currency: *USDT (TRC20)*",
-            f"Amount: *{amt}*",
-            f"Address: `{addr}`",
+            f"*План:* {plan_label(plan_key)} × *{months}* міс.",
             "",
-            "After payment gets confirmed, your plan will activate automatically.",
+            "*Сплата — рівно ця сума USDT,* скопіюй символ‑в‑символ:",
+            f"`{amt}` *USDT*",
+            "",
+            "*Адреса:*",
+            f"`{addr}`",
+            "",
+            "⚠️ Не округлюй і не діли суму на кілька платежів — інакше автоактивізація не спрацює.",
+            "_Підписка вмикається одразу після підтвердження вашого переказу в блокчейні._",
         ]
         if url:
-            lines += ["", f"Invoice link: `{url}`"]
+            lines += ["", f"*Посилання інвойсу:* `{url}`"]
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Check payment", callback_data=f"crypto_check_{payment_id}")],
             [InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")],
@@ -4370,6 +5167,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
          InlineKeyboardButton("🥇 XAU/USD",    callback_data="stats_XAUUSD_30")],
         [InlineKeyboardButton("₿ BTC/USD",     callback_data="stats_BTCUSD_30"),
          InlineKeyboardButton("Ξ ETH/USD",     callback_data="stats_ETHUSD_30")],
+        [InlineKeyboardButton("🔹 TON/USD",     callback_data="stats_TONUSD_30"),
+         InlineKeyboardButton("◎ SOL/USD",     callback_data="stats_SOLUSD_30")],
         [InlineKeyboardButton("📅 7 days",     callback_data=f"stats_{pair or 'ALL'}_7"),
          InlineKeyboardButton("📅 30 days",    callback_data=f"stats_{pair or 'ALL'}_30"),
          InlineKeyboardButton("📅 90 days",    callback_data=f"stats_{pair or 'ALL'}_90")],
@@ -4450,7 +5249,7 @@ async def _tv_webhook_handler(request) -> "web.Response":
         f"📐 R/R: *1:{rr_pct:.1f}*\n\n"
         f"📊 Score: `{score_bar(score)}`  *{score}/100*\n\n"
         f"⚡ _Source: Pine Script strategy_\n\n"
-        f"▶️ Details → {BOT_USERNAME}"
+        f"▶️ Details → {bot_link_markdown()}"
     )
 
     # Get the bot application from global context
@@ -4638,7 +5437,7 @@ async def cmd_tvinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f'}}\n'
         f"```\n\n"
         f"*4. Supported pairs:*\n"
-        f"XAUUSD · BTCUSD · ETHUSD\n\n"
+        f"Use any ticker key from `/start` picker (e.g. `XAUUSD`, `BTCUSD`, `TONUSD`).\n\n"
         f"*5. Test with curl:*\n"
         f"```\n"
         f"curl -X POST http://YOUR_SERVER_IP:{TV_WEBHOOK_PORT}/tv \\\\\n"
@@ -4673,6 +5472,8 @@ async def _handle_stats_callback(q, cid: int, data: str) -> None:
          InlineKeyboardButton("🥇 XAU/USD",    callback_data="stats_XAUUSD_30")],
         [InlineKeyboardButton("₿ BTC/USD",     callback_data="stats_BTCUSD_30"),
          InlineKeyboardButton("Ξ ETH/USD",     callback_data="stats_ETHUSD_30")],
+        [InlineKeyboardButton("🔹 TON/USD",     callback_data="stats_TONUSD_30"),
+         InlineKeyboardButton("◎ SOL/USD",     callback_data="stats_SOLUSD_30")],
         [InlineKeyboardButton("📅 7d",  callback_data=f"stats_{pair}_7"),
          InlineKeyboardButton("📅 30d", callback_data=f"stats_{pair}_30"),
          InlineKeyboardButton("📅 90d", callback_data=f"stats_{pair}_90")],
@@ -4712,8 +5513,8 @@ def main() -> None:
     )
     if _openrouter_configured():
         log.info(
-            "OpenRouter: %d API key(s) — round-robin + auto-failover on quota (429)",
-            len(_OPENROUTER_KEYS),
+            "OpenRouter: %d merged key(s) — light/heavy pools + failover (429 / credit hold)",
+            len(_openrouter_keys_merged()),
         )
     else:
         log.info("OpenRouter: not configured (optional; used after Groq 429 with Gemini fallback)")
