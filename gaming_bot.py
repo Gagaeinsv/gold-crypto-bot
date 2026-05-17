@@ -1,12 +1,11 @@
 """
-Gaming News Telegram Channel Bot (v1.6.0)
+Gaming News Telegram Channel Bot (v2.0.0)
 -----------------------------------------
-• Ігрові новини, релізи, патчі (RSS) + рідкі роздачі (Epic/Steam/GOG/PS/Xbox)
-• Кожен пост: шаблон UA + RU, «Моя думка», хештеги, CTA (Gemini)
-• Ліміти: 6 год між постами, 4/день, 1 роздача/день
+Фокус: PlayStation, PS Plus, Xbox / Game Pass — ігри місяця, підписки, релізи.
+Пости: шаблон UA + RU (Gemini). Кілька разів на день, без спаму.
+Роздачі: лише PS/Xbox і лише коли немає свіжих новин.
 
 Запуск:  python gaming_bot.py
-Залежності: pip install -r requirements.txt
 """
 
 import asyncio
@@ -49,7 +48,7 @@ GEMINI_KEY      = os.getenv("GEMINI_KEY", "")             # https://aistudio.goo
 ADMIN_ID        = int(os.getenv("ADMIN_ID", "0"))
 
 GEMINI_MODEL    = "gemini-2.5-flash"
-BOT_VERSION     = "1.6.1"
+BOT_VERSION     = "2.0.0"
 
 def _env_int(key: str, default: int) -> int:
     try:
@@ -58,129 +57,88 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 DB_PATH         = "gaming_bot.db"
-CHECK_INTERVAL  = _env_int("CHECK_INTERVAL_MIN", 20) * 60
-MIN_POST_GAP    = _env_int("MIN_POST_GAP_HOURS", 6) * 60 * 60
-NEWS_MIN_POST_GAP = _env_int("NEWS_MIN_POST_GAP_HOURS", 2) * 60 * 60
-MAX_POSTS_PER_CYCLE = _env_int("MAX_POSTS_PER_CYCLE", 1)
-MAX_POSTS_PER_DAY   = _env_int("MAX_POSTS_PER_DAY", 4)
+CHECK_INTERVAL  = _env_int("CHECK_INTERVAL_MIN", 60) * 60       # перевірка раз на годину
+NEWS_MIN_POST_GAP = _env_int("NEWS_MIN_POST_GAP_HOURS", 4) * 60 * 60  # ~4–6 новин/день
+MIN_POST_GAP    = NEWS_MIN_POST_GAP
+MAX_POSTS_PER_CYCLE = 1
+MAX_POSTS_PER_DAY   = _env_int("MAX_POSTS_PER_DAY", 5)
 MAX_GIVEAWAYS_PER_DAY  = _env_int("MAX_GIVEAWAYS_PER_DAY", 1)
-MAX_GIVEAWAYS_PER_WEEK = _env_int("MAX_GIVEAWAYS_PER_WEEK", 3)
-MIN_HOURS_BETWEEN_GIVEAWAYS = _env_int("MIN_HOURS_BETWEEN_GIVEAWAYS", 36)
-NEWS_BEFORE_GIVEAWAY = _env_int("NEWS_BEFORE_GIVEAWAY", 3)
-FALLBACK_HOURS  = _env_int("FALLBACK_HOURS", 84)
+MAX_GIVEAWAYS_PER_WEEK = _env_int("MAX_GIVEAWAYS_PER_WEEK", 2)
+MIN_HOURS_BETWEEN_GIVEAWAYS = _env_int("MIN_HOURS_BETWEEN_GIVEAWAYS", 48)
+GIVEAWAY_IF_NO_NEWS_HOURS = _env_int("GIVEAWAY_IF_NO_NEWS_HOURS", 24)  # роздача лише якщо N год без новин
+FALLBACK_HOURS  = _env_int("FALLBACK_HOURS", 72)
 PHOTO_CAPTION_MAX = 1024
 TEXT_MESSAGE_MAX  = 4000
 
-# Major stores only for giveaways (skip itch/indiegala flood from aggregators)
+# Роздачі: пріоритет PlayStation / Xbox (без PC-спаму)
 GIVEAWAY_STORE_PRIORITY = (
-    ("epic",   "epicgames.com"),
-    ("steam",  "steampowered.com"),
-    ("gog",    "gog.com"),
     ("ps",     "playstation.com"),
     ("xbox",   "xbox.com"),
-    ("nintendo", "nintendo.com"),
 )
-GIVEAWAY_STORE_SKIP = ("itch.io", "indiegala.com", "onstove.com", "gamerpower.com")
+GIVEAWAY_STORE_SKIP = (
+    "itch.io", "indiegala.com", "onstove.com", "gamerpower.com",
+    "steampowered.com", "epicgames.com", "gog.com",
+)
 
-# ──────────────────────── RSS News Sources ────────────────────────────────────
+# ──────────────────────── RSS: лише PlayStation / Xbox ─────────────────────────
 RSS_SOURCES = [
     {
-        "name": "IGN",
-        "url": "https://feeds.ign.com/ign/all",
+        "name": "Push Square",
+        "url": "https://www.pushsquare.com/feeds/news",
         "category": "news",
-        "lang": "en",
-        "image_fallback": "https://assets1.ignimgs.com/2019/06/06/ign-logo-alt-1559862288132.jpg",
+        "image_fallback": "https://www.pushsquare.com/images/icons/ps_icon.png",
+    },
+    {
+        "name": "PlayStation Blog",
+        "url": "https://blog.playstation.com/feed/",
+        "category": "news",
+        "image_fallback": "https://blog.playstation.com/favicon.ico",
+    },
+    {
+        "name": "Pure Xbox",
+        "url": "https://www.purexbox.com/feeds/news",
+        "category": "news",
+        "image_fallback": "https://www.purexbox.com/images/icons/xbox_icon.png",
     },
     {
         "name": "Eurogamer",
         "url": "https://www.eurogamer.net/feed",
         "category": "news",
-        "lang": "en",
         "image_fallback": "https://www.eurogamer.net/images/2023/08/eurogamer_icon.png",
-    },
-    {
-        "name": "PC Gamer",
-        "url": "https://www.pcgamer.com/rss/",
-        "category": "news",
-        "lang": "en",
-        "image_fallback": "https://cdn.mos.cms.futurecdn.net/PCGamerFavicon-16x16.png",
-    },
-    {
-        "name": "Kotaku",
-        "url": "https://kotaku.com/rss",
-        "category": "news",
-        "lang": "en",
-        "image_fallback": "https://i.kinja-img.com/gawker-media/image/upload/s--JEQ09gIe--/c_fill,f_auto,fl_progressive,g_center,h_80,q_80,w_80/18j9bkx4d4r1xjpg.jpg",
-    },
-    {
-        "name": "Rock Paper Shotgun",
-        "url": "https://www.rockpapershotgun.com/feed",
-        "category": "news",
-        "lang": "en",
-        "image_fallback": "https://www.rockpapershotgun.com/images/icons/rps-favicon.png",
     },
     {
         "name": "VG247",
         "url": "https://www.vg247.com/feed",
         "category": "news",
-        "lang": "en",
         "image_fallback": "https://www.vg247.com/wp-content/uploads/2023/01/vg247-logo.svg",
-    },
-    {
-        "name": "GamesRadar",
-        "url": "https://www.gamesradar.com/rss/",
-        "category": "news",
-        "lang": "en",
-        "image_fallback": "https://www.gamesradar.com/wp-content/themes/gamesradar/images/gamesradar-logo.png",
-    },
-    {
-        "name": "GameSpot News",
-        "url": "https://www.gamespot.com/feeds/mashup/",
-        "category": "news",
-        "lang": "en",
-        "image_fallback": "https://www.gamespot.com/a/bundles/gamespotsite/images/favicon.ico",
-    },
-    {
-        "name": "Destructoid",
-        "url": "https://www.destructoid.com/feed/",
-        "category": "news",
-        "lang": "en",
-        "image_fallback": "https://www.destructoid.com/wp-content/themes/destructoid/images/logo.png",
-    },
-    {
-        "name": "Nintendo Life",
-        "url": "https://www.nintendolife.com/feeds/news",
-        "category": "news",
-        "lang": "en",
-        "image_fallback": "https://www.nintendolife.com/images/icons/nl_icon.png",
-    },
-    {
-        "name": "Push Square (PlayStation)",
-        "url": "https://www.pushsquare.com/feeds/news",
-        "category": "news",
-        "lang": "en",
-        "image_fallback": "https://www.pushsquare.com/images/icons/ps_icon.png",
-    },
-    {
-        "name": "GamingBolt",
-        "url": "https://gamingbolt.com/feed",
-        "category": "news",
-        "lang": "en",
-        "image_fallback": "https://gamingbolt.com/wp-content/uploads/2023/01/gamingbolt-logo.png",
     },
 ]
 
-# ──────────────────────── Giveaway APIs ───────────────────────────────────────
-GIVEAWAYRADAR_URL = "https://www.giveawayradar.com/api/giveaways/gaming?count=10"
-GAMERPOWER_URL    = "https://www.gamerpower.com/api/giveaways?platform=pc&type=game&sort-by=date"
-# Окремі магазини — щоб роздачі були з Epic / Steam / GOG / PS / Xbox, а не лише з одного агрегатора
-GAMERPOWER_STORES = (
-    ("epic-games-store", "Epic Games Store"),
-    ("steam",            "Steam"),
-    ("gog",              "GOG"),
-    ("ps4",              "PlayStation"),
-    ("xbox-one",         "Xbox"),
+# Ключові слова: PS, PS Plus, Xbox Game Pass, ігри місяця
+PLATFORM_KEYWORDS = (
+    "playstation", "ps5", "ps4", "ps plus", "ps+", "playstation plus",
+    "ps plus essential", "ps plus extra", "ps plus premium",
+    "xbox", "xbox series", "game pass", "xbox game pass", "pc game pass",
+    "games with gold", "core games",
 )
+MONTHLY_LINEUP_KEYWORDS = (
+    "monthly games", "this month", "next month", "coming to ps",
+    "coming to xbox", "leaving ", "lineup", "day one", "day 1",
+    "games arriving", "free games for", "subscription",
+)
+JUNK_KEYWORDS = (
+    "oled tv", "gaming monitor", "graphics card", "best tv",
+    "black friday tv", "cyber monday tv", "how to watch",
+    "nintendo switch", "zelda only", "pokemon only", "pc only",
+    "steam deck only", "best gaming laptop", "best gaming phone",
+)
+
+_PS_XBOX_RSS_SOURCES = frozenset({"Push Square", "PlayStation Blog", "Pure Xbox"})
+RAWG_PS_XBOX = ("playstation", "xbox")
+
+# ──────────────────────── Giveaway APIs (лише PS / Xbox) ─────────────────────
+GAMERPOWER_PS   = "https://www.gamerpower.com/api/giveaways?platform=ps4&type=game&sort-by=date"
+GAMERPOWER_XBOX = "https://www.gamerpower.com/api/giveaways?platform=xbox-one&type=game&sort-by=date"
 
 CONTENT_CATEGORIES = ("news", "update", "trailer", "release")
 
@@ -288,6 +246,64 @@ def hours_since_last_category(conn: sqlite3.Connection, category: str) -> float:
         return 9999.0
     return (time.time() - last) / 3600
 
+def hours_since_last_content_post(conn: sqlite3.Connection) -> float:
+    """Годин з останнього поста про новини/реліз (не роздачу)."""
+    last = conn.execute(
+        "SELECT MAX(posted_at) FROM posted WHERE category IN ('news','update','trailer','release')"
+    ).fetchone()[0]
+    if not last:
+        return 9999.0
+    return (time.time() - last) / 3600
+
+def article_text_blob(article: dict) -> str:
+    return f"{article.get('title', '')} {article.get('summary', '')} {article.get('source', '')}".lower()
+
+def is_junk_article(article: dict) -> bool:
+    blob = article_text_blob(article)
+    return any(k in blob for k in JUNK_KEYWORDS)
+
+def is_platform_focus_article(article: dict) -> bool:
+    """PS, PS Plus, Xbox Game Pass, ігри місяця, консольні релізи."""
+    if is_junk_article(article):
+        return False
+    blob = article_text_blob(article)
+    if any(k in blob for k in PLATFORM_KEYWORDS):
+        return True
+    if any(k in blob for k in MONTHLY_LINEUP_KEYWORDS):
+        return True
+    return False
+
+def passes_content_filter(article: dict) -> bool:
+    """Джерела PS/Xbox — ширше; Eurogamer/VG247 — лише за ключовими словами."""
+    if is_junk_article(article):
+        return False
+    if article.get("source") in _PS_XBOX_RSS_SOURCES:
+        return True
+    return is_platform_focus_article(article)
+
+def platform_priority_score(article: dict) -> float:
+    blob = article_text_blob(article)
+    score = freshness_boost(article)
+    if any(k in blob for k in MONTHLY_LINEUP_KEYWORDS):
+        score += 6.0
+    if any(k in blob for k in ("ps plus", "ps+", "playstation plus", "game pass", "games with gold")):
+        score += 5.0
+    if any(k in blob for k in ("ps5", "ps4", "xbox series", "xbox one")):
+        score += 2.0
+    return score
+
+def sort_platform_content(articles: list[dict]) -> list[dict]:
+    def key(a):
+        pd = a.get("pub_date")
+        ts = pd.timestamp() if pd else 0
+        return (platform_priority_score(a), ts)
+    return sorted(articles, key=key, reverse=True)
+
+def is_ps_xbox_giveaway(article: dict) -> bool:
+    if not is_quality_giveaway(article):
+        return False
+    return giveaway_store_key(article.get("url", "")) in ("ps", "xbox")
+
 def giveaway_store_key(url: str) -> str:
     url = (url or "").lower()
     for key, domain in GIVEAWAY_STORE_PRIORITY:
@@ -376,53 +392,47 @@ def can_post_giveaway(conn: sqlite3.Connection) -> bool:
 
 def select_articles_for_cycle(articles: list[dict], conn: sqlite3.Connection) -> list[dict]:
     """
-    News-first scheduling: usually one news item; giveaways rarely, rotated across stores.
+    Спочатку новини PS / PS+ / Xbox. Роздача — лише якщо давно не було контент-постів.
     """
     if count_posts_since(conn, 24) >= MAX_POSTS_PER_DAY:
         log.info("Daily post cap reached (%d)", MAX_POSTS_PER_DAY)
         return []
 
-    news = [a for a in articles if a.get("category") in ("news", "update", "trailer")]
-    releases = [a for a in articles if a.get("category") == "release"]
-    giveaways = [a for a in articles if a.get("category") == "giveaway"]
+    content = [
+        a for a in articles
+        if a.get("category") in CONTENT_CATEGORIES and passes_content_filter(a)
+    ]
+    content = sort_platform_content(content)
 
-    news = sort_content(news)
-    releases = sort_content(releases)
+    giveaways = [
+        a for a in articles
+        if a.get("category") == "giveaway" and is_ps_xbox_giveaway(a)
+    ]
 
-    last_gv = conn.execute(
-        "SELECT MAX(posted_at) FROM posted WHERE category = 'giveaway'"
-    ).fetchone()[0]
-    news_after_giveaway = 999
-    if last_gv:
-        row = conn.execute(
-            "SELECT COUNT(*) FROM posted WHERE category IN ('news','update','trailer','release') AND posted_at > ?",
-            (last_gv,),
-        ).fetchone()
-        news_after_giveaway = int(row[0]) if row else 0
+    if content:
+        pick = content[0]
+        log.info(
+            "Selected %s (score %.1f): %s",
+            pick.get("category"), platform_priority_score(pick), pick.get("title", "")[:55],
+        )
+        return [pick]
 
-    want_giveaway = (
-        can_post_giveaway(conn)
+    hours_no_content = hours_since_last_content_post(conn)
+    if (
+        hours_no_content >= GIVEAWAY_IF_NO_NEWS_HOURS
+        and can_post_giveaway(conn)
         and giveaways
-        and news_after_giveaway >= NEWS_BEFORE_GIVEAWAY
-    )
-
-    if want_giveaway:
+    ):
         pick = pick_diverse_giveaway(giveaways, conn)
         if pick:
-            log.info("Selected giveaway from store: %s", giveaway_store_key(pick.get("url", "")))
+            log.info(
+                "Giveaway (no PS/Xbox news %.0fh): %s",
+                hours_no_content, pick.get("title", "")[:55],
+            )
             return [pick]
 
-    if news:
-        return [news[0]]
-    if releases:
-        return [releases[0]]
-
-    # Last resort: giveaway if allowed and nothing else
-    if can_post_giveaway(conn) and giveaways:
-        pick = pick_diverse_giveaway(giveaways, conn)
-        if pick:
-            return [pick]
-
+    if hours_no_content >= GIVEAWAY_IF_NO_NEWS_HOURS and giveaways:
+        log.info("Giveaway skipped (rate limit), queue has %d", len(giveaways))
     return []
 
 # ──────────────────────── Helpers ─────────────────────────────────────────────
@@ -699,7 +709,7 @@ async def fetch_rss(client: httpx.AsyncClient, source: dict) -> list[dict]:
     except ET.ParseError as exc:
         log.warning("RSS parse error for %s: %s", source["name"], exc)
 
-    # Filter to last 48 hours (generous window to not miss slower days)
+    # Останні 48 год; лише PS / Xbox тематика
     cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
     recent = []
     for a in articles:
@@ -707,17 +717,19 @@ async def fetch_rss(client: httpx.AsyncClient, source: dict) -> list[dict]:
             continue
         if a["pub_date"] and a["pub_date"] < cutoff:
             continue
-        if not is_gaming_related(a["title"], a.get("summary", "")):
+        if not passes_content_filter(a):
             continue
+        a["category"] = classify_rss_category(a["title"], a.get("summary", ""))
         recent.append(a)
 
     return recent
 
 # ──────────────────────── Giveaway Fetcher ────────────────────────────────────
 
-async def fetch_gamerpower_giveaways(client: httpx.AsyncClient) -> list[dict]:
-    """Fetch free game giveaways from GamerPower API (free, no key needed)."""
-    data = await fetch_url(client, GAMERPOWER_URL)
+async def _fetch_gamerpower_platform(
+    client: httpx.AsyncClient, api_url: str, platform_label: str,
+) -> list[dict]:
+    data = await fetch_url(client, api_url)
     if not data:
         return []
     try:
@@ -727,9 +739,8 @@ async def fetch_gamerpower_giveaways(client: httpx.AsyncClient) -> list[dict]:
     except json.JSONDecodeError:
         return []
 
-    giveaways = []
     pending: list[dict] = []
-    for item in items[:12]:
+    for item in items[:8]:
         if item.get("status") != "Active":
             continue
         title    = item.get("title", "")
@@ -752,14 +763,14 @@ async def fetch_gamerpower_giveaways(client: httpx.AsyncClient) -> list[dict]:
             "url":      url,
             "summary":  summary,
             "image":    image,
-            "platform": platform.lower(),
-            "source":   "GamerPower",
+            "platform": platform_label,
+            "source":   f"GamerPower ({platform_label})",
             "category": "giveaway",
             "pub_date": datetime.now(timezone.utc),
             "image_fallback": "https://www.gamerpower.com/images/gamerpower-logo.png",
         })
 
-    # Resolve GamerPower redirect pages → direct Steam / Epic / itch.io links
+    giveaways: list[dict] = []
     if pending:
         resolved = await asyncio.gather(
             *[resolve_final_url(client, g["url"]) for g in pending],
@@ -768,12 +779,29 @@ async def fetch_gamerpower_giveaways(client: httpx.AsyncClient) -> list[dict]:
         for g, final in zip(pending, resolved):
             if isinstance(final, str) and final:
                 g["url"] = normalize_store_url(final)
-            if g.get("url"):
+            if g.get("url") and is_ps_xbox_giveaway(g):
                 giveaways.append(g)
+            elif g.get("url"):
+                log.debug("Giveaway skipped (not PS/Xbox store): %s", g.get("title", "")[:50])
             else:
                 log.warning("Giveaway skipped (no store URL): %s", g.get("title", "")[:50])
 
     return giveaways
+
+async def fetch_ps_xbox_giveaways(client: httpx.AsyncClient) -> list[dict]:
+    """Безкоштовні ігри лише PlayStation / Xbox."""
+    ps, xbox = await asyncio.gather(
+        _fetch_gamerpower_platform(client, GAMERPOWER_PS, "PlayStation"),
+        _fetch_gamerpower_platform(client, GAMERPOWER_XBOX, "Xbox"),
+        return_exceptions=True,
+    )
+    merged: list[dict] = []
+    for batch in (ps, xbox):
+        if isinstance(batch, list):
+            merged.extend(batch)
+        elif isinstance(batch, Exception):
+            log.warning("GamerPower error: %s", batch)
+    return merged
 
 async def fetch_epic_free_games(client: httpx.AsyncClient) -> list[dict]:
     """Fetch free Epic Games Store games via their public promotions API."""
@@ -882,17 +910,18 @@ async def fetch_steam_free_games(client: httpx.AsyncClient) -> list[dict]:
 # ──────────────────────── RAWG Releases Fetcher ───────────────────────────────
 
 async def fetch_rawg_releases(client: httpx.AsyncClient) -> list[dict]:
-    """Fetch upcoming/new game releases from RAWG API."""
+    """Релізи цього місяця — лише PlayStation / Xbox (RAWG)."""
     if not RAWG_KEY:
         return []
-    today    = datetime.now(timezone.utc).date()
-    in_7days = today + timedelta(days=7)
+    today = datetime.now(timezone.utc).date()
+    in_range = today + timedelta(days=45)  # поточний + наступний місяць
     url = (
         f"https://api.rawg.io/api/games"
         f"?key={RAWG_KEY}"
-        f"&dates={today},{in_7days}"
-        f"&ordering=-added"
-        f"&page_size=10"
+        f"&dates={today},{in_range}"
+        f"&platforms=187,186,1,18"
+        f"&ordering=released"
+        f"&page_size=15"
     )
     data = await fetch_url(client, url)
     if not data:
@@ -904,22 +933,29 @@ async def fetch_rawg_releases(client: httpx.AsyncClient) -> list[dict]:
 
     releases = []
     for game in payload.get("results", []):
+        plat_names = [
+            p["platform"]["name"]
+            for p in game.get("platforms", [])
+            if p.get("platform")
+        ]
+        plat_lower = " ".join(plat_names).lower()
+        if not any(px in plat_lower for px in RAWG_PS_XBOX):
+            continue
+
         title    = game.get("name", "")
         slug     = game.get("slug", "")
         rel_date = game.get("released", "")
         rating   = game.get("metacritic")
         image    = game.get("background_image", "")
-        url      = f"https://rawg.io/games/{slug}" if slug else "https://rawg.io"
+        game_url = f"https://rawg.io/games/{slug}" if slug else "https://rawg.io"
 
-        platforms = ", ".join(
-            p["platform"]["name"] for p in game.get("platforms", [])[:4]
-        )
+        platforms = ", ".join(plat_names[:4])
         rating_str   = f"⭐ Metacritic: {rating}\n" if rating else ""
-        platform_str = f"🖥️ Платформи: {platforms}\n" if platforms else ""
+        platform_str = f"🎮 Платформи: {platforms}\n" if platforms else ""
 
         releases.append({
             "title":    f"🚀 Реліз: {title}",
-            "url":      url,
+            "url":      game_url,
             "summary":  f"{rating_str}{platform_str}📅 Дата виходу: {rel_date}",
             "image":    image,
             "source":   "RAWG",
@@ -931,7 +967,7 @@ async def fetch_rawg_releases(client: httpx.AsyncClient) -> list[dict]:
 
 # ──────────────────────── Hashtags & CTA ────────────────────────────────────────
 
-BASE_HASHTAGS = ("#Ігри", "#НовиниІгор", "#Gaming")
+BASE_HASHTAGS = ("#PlayStation", "#Xbox", "#Gaming")
 
 CTA_UA = (
     "Що думаєш про це? Пиши в коментарях 👇",
@@ -950,10 +986,12 @@ def pick_hashtags(article: dict) -> str:
     """2–4 хештеги (однакові для UA та RU блоків)."""
     tags = list(BASE_HASHTAGS)
     blob = f"{article.get('title', '')} {article.get('url', '')} {article.get('platform', '')}".lower()
+    if any(x in blob for x in ("ps plus", "ps+", "playstation plus")):
+        tags.append("#PSPlus")
     if any(x in blob for x in ("playstation", "ps4", "ps5", "ps ")):
         tags.append("#PS5")
-    elif "xbox" in blob:
-        tags.append("#Xbox")
+    if any(x in blob for x in ("game pass", "xbox")):
+        tags.append("#GamePass")
     elif "nintendo" in blob or "switch" in blob:
         tags.append("#Nintendo")
     elif "epic" in blob:
@@ -998,8 +1036,9 @@ def _gemini_bilingual_post(
     }
     hint = cat_hints.get(category, cat_hints["news"])
 
-    prompt = f"""Ти — редактор Telegram-каналу про відеоігри.
+    prompt = f"""Ти — редактор Telegram-каналу про PlayStation, PS Plus та Xbox / Game Pass.
 Створи пост за ЄДИНИМ шаблоном у ДВОХ мовах (спочатку повна українська версія, потім повна російська).
+Акцент: підписки, ігри місяця, релізи на PS5/PS4/Xbox — без зайвого PC/Nintendo.
 
 Контекст: {hint}
 
@@ -1136,6 +1175,9 @@ def build_bilingual_post(article: dict, content: dict) -> str:
 🔗 Посилання:
 {url}
 
+# Хештеги:
+{hashtags}
+
 📢 Заклик до дії:
 👉 {content.get('cta_ua', random.choice(CTA_UA))}"""
 
@@ -1155,11 +1197,14 @@ def build_bilingual_post(article: dict, content: dict) -> str:
 🔗 Ссылка:
 {url}
 
+# Хештеги:
+{hashtags}
+
 📢 Призыв к действию:
 👉 {content.get('cta_ru', random.choice(CTA_RU))}"""
 
     separator = "\n\n" + "─" * 22 + "\n\n"
-    text = f"{ua_block}{separator}{ru_block}\n\n# Хештеги:\n{hashtags}"
+    text = f"{ua_block}{separator}{ru_block}"
 
     if len(text) > TEXT_MESSAGE_MAX:
         for key in ("description_ua", "description_ru", "facts_ua", "facts_ru"):
@@ -1301,20 +1346,11 @@ def deduplicate(articles: list[dict], conn: sqlite3.Connection) -> list[dict]:
 # ──────────────────────── Main Polling Loop ───────────────────────────────────
 
 async def collect_all_news(client: httpx.AsyncClient) -> list[dict]:
-    """Fetch all sources concurrently and return merged article list."""
-    tasks = []
-
-    # RSS feeds
-    for source in RSS_SOURCES:
-        tasks.append(fetch_rss(client, source))
-
-    # Giveaways: aggregator + official store APIs (deduped later)
-    tasks.append(fetch_gamerpower_giveaways(client))
-    tasks.append(fetch_epic_free_games(client))
-    tasks.append(fetch_steam_free_games(client))
-
-    # Upcoming releases
-    tasks.append(fetch_rawg_releases(client))
+    """PS/Xbox RSS + релізи; роздачі лише PS/Xbox (вибір у select_articles_for_cycle)."""
+    tasks = [fetch_rss(client, source) for source in RSS_SOURCES]
+    tasks.append(fetch_ps_xbox_giveaways(client))
+    if RAWG_KEY:
+        tasks.append(fetch_rawg_releases(client))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -1344,8 +1380,9 @@ async def run_bot():
         return
 
     log.info(
-        "Limits: %dh between posts, max %d/day, giveaways max %d/day %d/week",
-        MIN_POST_GAP // 3600, MAX_POSTS_PER_DAY, MAX_GIVEAWAYS_PER_DAY, MAX_GIVEAWAYS_PER_WEEK,
+        "Limits: news every %dh, max %d/day | giveaway if no news %dh | gv max %d/day",
+        NEWS_MIN_POST_GAP // 3600, MAX_POSTS_PER_DAY,
+        GIVEAWAY_IF_NO_NEWS_HOURS, MAX_GIVEAWAYS_PER_DAY,
     )
     log.info("Starting polling loop — check interval: %d min", CHECK_INTERVAL // 60)
 
@@ -1356,12 +1393,15 @@ async def run_bot():
                 articles = await collect_all_news(client)
                 articles = deduplicate(articles, conn)
 
+                platform_queued = sum(
+                    1 for a in articles
+                    if a.get("category") in CONTENT_CATEGORIES and passes_content_filter(a)
+                )
                 log.info(
-                    "Queue after dedup: %d total (%d news, %d giveaway, %d release)",
+                    "Queue: %d total | PS/Xbox content: %d | giveaways: %d",
                     len(articles),
-                    sum(1 for a in articles if a.get("category") == "news"),
+                    platform_queued,
                     sum(1 for a in articles if a.get("category") == "giveaway"),
-                    sum(1 for a in articles if a.get("category") == "release"),
                 )
 
                 hours_since = hours_since_last_post(conn)
@@ -1375,10 +1415,13 @@ async def run_bot():
                 else:
                     to_post = select_articles_for_cycle(articles, conn)
                     if is_fallback and not to_post and articles:
-                        # Guarantee min 2 posts/week — pick best news
-                        news = [a for a in articles if a.get("category") == "news"]
-                        to_post = [news[0] if news else articles[0]]
-                        log.info("Fallback post (nothing new in queue)")
+                        fallback_pool = [
+                            a for a in articles
+                            if a.get("category") in CONTENT_CATEGORIES and passes_content_filter(a)
+                        ]
+                        if fallback_pool:
+                            to_post = [sort_platform_content(fallback_pool)[0]]
+                            log.info("Fallback: repost best PS/Xbox item from queue")
 
                     post_count = 0
                     for article in to_post[:MAX_POSTS_PER_CYCLE]:

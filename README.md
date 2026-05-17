@@ -1,55 +1,48 @@
-# Ігровий Telegram-бот для новин (v1.6.0)
+# Ігровий Telegram-бот (v2.0.0)
 
-Автоматично веде ігровий Telegram-канал: **новини в пріоритеті**, роздачі — рідко і з різних магазинів.
+Канал про **PlayStation, PS Plus, Xbox / Game Pass**: ігри місяця, підписки, релізи.  
+Пости **українською + російською**. Кілька разів на день, **без спаму**. Роздачі — **лише коли немає свіжих новин**.
+
+## Завантажити один файл
+
+https://raw.githubusercontent.com/Gagaeinsv/gold-crypto-bot/gaming-news-bot-only/gaming_bot.py
+
+(Також див. `ЗАВАНТАЖИТИ.txt`)
 
 ## Можливості
 
-- **12 RSS-джерел** — IGN, Kotaku, PC Gamer, Eurogamer, GamesRadar, GameSpot, Destructoid, Nintendo Life, Push Square та ін.
-- **Безкоштовні ігри** — Epic, Steam, GOG, PlayStation, Xbox (через GamerPower + офіційні API), без спаму itch/indiegala
-- **Релізи** — ігри на найближчі 7 днів (RAWG API, опційно)
-- **Gemini AI** — кожен пост **українською + російською** за єдиним шаблоном
-- **Шаблон поста** — заголовок, факти, опис, «Моя думка», посилання, хештеги, CTA
-- **Прямі посилання** в магазин (Steam, Epic тощо), не биті URL
+- **RSS:** Push Square, PlayStation Blog, Pure Xbox + відфільтровані Eurogamer / VG247
+- **Фільтр:** лише PS / PS+ / Xbox / Game Pass / ігри місяця
+- **Релізи:** RAWG (опційно), лише PlayStation та Xbox
+- **Роздачі:** лише PlayStation / Xbox, і лише якщо 24+ год без новин
+- **Gemini:** двомовний шаблон (UA + RU, CTA, хештеги)
 
 ## Ліміти за замовчуванням
 
 | Параметр | Значення |
 |----------|----------|
-| Інтервал між постами | 6 годин |
-| Максимум постів на добу | 4 |
-| Роздачі на добу | 1 |
-| Роздачі на тиждень | 3 |
-| Новин перед наступною роздачею | 3 |
-
-Усі ліміти налаштовуються в `.env` — див. `.env.example`.
+| Перевірка джерел | кожні 60 хв |
+| Між постами (новини) | 4 год |
+| Максимум постів на добу | 5 |
+| Роздача | якщо 24 год без новин PS/Xbox |
 
 ## Швидкий старт
 
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
-# заповни GAMING_BOT_TOKEN, GAMING_CHANNEL_ID, GEMINI_KEY
 python gaming_bot.py
 ```
 
-Після запуску в терміналі має бути:
+У логах: `Bot started v2.0.0`
 
-```text
-Bot started v1.6.0: @YourBot | Channel: @YourChannel
-Limits: 6h between posts, max 4/day, giveaways max 1/day 3/week
-```
+## Інструкція
 
-## Покрокова інструкція
+**[НАЛАШТУВАННЯ.md](НАЛАШТУВАННЯ.md)**
 
-**[НАЛАШТУВАННЯ.md](НАЛАШТУВАННЯ.md)** — ключі, посилання, оновлення, типові помилки.
+## Оновлення
 
-## Оновлення зі старої версії
-
-1. Замінити `gaming_bot.py` (або завантажити ZIP з гілки `gaming-news-bot-only`)
-2. Оновити `.env` за шаблоном `.env.example`
-3. Видалити `gaming_bot.db` (щоб скинути чергу старих роздач)
-4. Перезапустити бота
-
-Завантажити останню версію:
-
-https://github.com/Gagaeinsv/gold-crypto-bot/archive/refs/heads/gaming-news-bot-only.zip
+1. Замінити `gaming_bot.py` за посиланням вище  
+2. Оновити `.env` з `.env.example`  
+3. Видалити `gaming_bot.db`  
+4. Перезапустити бота  
