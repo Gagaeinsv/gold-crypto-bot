@@ -296,7 +296,18 @@ GROQ_TIMEOUT = 20
 
 # Long-form deep analysis & chart vision: see DEEP_ANALYSIS_PROVIDER / CHART_VISION_PROVIDER (default: gemini).
 
-TRIAL_DAYS        = 7
+TRIAL_DAYS        = int(os.getenv("TRIAL_DAYS", "3") or "3") or 3
+TRIAL_DAYS        = max(1, min(TRIAL_DAYS, 14))
+
+
+def _trial_duration_ua() -> str:
+    """Ukrainian 'N days' for fixed marketing copy (trial length)."""
+    n = TRIAL_DAYS
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} день"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return f"{n} дні"
+    return f"{n} днів"
 PRICE_BASIC       = 550    # ~$5 net after Telegram 30% fee
 PRICE_PRO         = 1100   # ~$9.99 net
 PRICE_BASIC_3     = 1375   # 3-month ~17% discount
@@ -311,8 +322,8 @@ USD_PRO_1       = 9.99
 USD_PRO_3       = 25.00
 USD_DIAMOND_1   = 19.99
 USD_DIAMOND_3   = 49.99
-# NOWPayments/crypto-network minimums: only these bundles reliably clear without bogus surcharges.
-CRYPTO_PAY_ALLOWED = frozenset({("basic", 3), ("pro", 3), ("diamond", 1), ("diamond", 3)})
+# NOWPayments: Basic (incl. 3mo crypto) violates fair price vs gateway minimum — crypto only Pro 3mo + Diamond.
+CRYPTO_PAY_ALLOWED = frozenset({("pro", 3), ("diamond", 1), ("diamond", 3)})
 DB_PATH           = "users.db"
 CHANNEL_HOURS_UTC = [6, 12, 18]   # market analysis posts (UTC)
 ARTICLE_HOURS_UTC = [8, 14, 20]   # article posts — separate from analysis
@@ -3285,7 +3296,7 @@ def sub_info_text(acc: dict) -> str:
         f"  1 mo — *{PRICE_DIAMOND}⭐* (~$19.99)",
         f"  3 mo — *{PRICE_DIAMOND_3}⭐* (~$49.99) 🔥 _save ~17%_",
         "",
-        "💡 _First week free for new users_",
+        f"💡 _Безкоштовний trial для нових — {_trial_duration_ua()}_",
     ]
     return "\n".join(lines)
 
@@ -4259,41 +4270,54 @@ async def handle_photo(update, context):
 async def cmd_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.id != ADMIN_ID:
         return
-    await update.message.reply_text("Preparing welcome post…")
+    await update.message.reply_text("Готую пост для каналу…")
     prices = {p: (fmt_price(v, p) if (v := get_price(p)) else "N/A") for p in PAIRS}
-    xau = prices["XAUUSD"]; btc = prices["BTCUSD"]; eth = prices["ETHUSD"]
-    sol = prices.get("SOLUSD", "N/A"); xrp = prices.get("XRPUSD", "N/A")
+
+    crypto_nowp = ""
+    if NOWPAYMENTS_API_KEY and PUBLIC_BASE_URL.strip() and NOWPAYMENTS_IPN_SECRET.strip():
+        crypto_nowp = "• 💳 Також є оплата криптовалютою через NOWPayments.\n"
+
+    trial_line = (
+        f"🎁 <b>Безкоштовний trial — {_trial_duration_ua()}</b> для нових користувачів: "
+        f"XAU/USD + AI-розбір у боті + <b>до 1 Deep Analysis на день</b> лише по золоту. "
+        f"Після trial — обери тариф у боті або доступ зникне.\n\n"
+    )
+
     text = (
-        "<b>📊 Gold &amp; Crypto AI Signals</b>\n"
-        "<i>AI-powered signals — 9 pairs</i>\n\n"
-        "📡 AI market analysis 3x per day:\n"
-        "☀️ 09:00  📊 15:00  🌙 21:00 (Kyiv time)\n\n"
-        "<b>── Current prices ──</b>\n"
-        f"🥇 XAU/USD  <code>{xau}</code>\n"
-        f"🥈 XAG/USD  <code>{prices.get(chr(39)+chr(88)+chr(65)+chr(71)+chr(85)+chr(83)+chr(68)+chr(39), chr(78)+chr(47)+chr(65))}</code>\n"
-        f"₿  BTC/USD  <code>{btc}</code>\n"
-        f"Ξ  ETH/USD  <code>{eth}</code>\n"
-        f"◎  SOL/USD  <code>{sol}</code>\n"
-        f"✕  XRP/USD  <code>{xrp}</code>\n"
-        f"🔶 BNB/USD  <code>{prices.get(chr(66)+chr(78)+chr(66)+chr(85)+chr(83)+chr(68), chr(78)+chr(47)+chr(65))}</code>\n"
-        f"🔹 TON/USD  <code>{prices.get('TONUSD', 'N/A')}</code>\n"
-        f"🔵 ADA/USD  <code>{prices.get(chr(65)+chr(68)+chr(65)+chr(85)+chr(83)+chr(68), chr(78)+chr(47)+chr(65))}</code>\n\n"
-        "<b>── Plans ──</b>\n\n"
-        "⭐ <b>Basic</b> — $5/mo\n"
-        "XAU/USD signals + SL/TP alerts\n"
-        "3 months — $12.5 🔥 (save 17%)\n\n"
-        "💎 <b>Pro</b> — $9.99/mo\n"
-        "XAU + BTC + ETH + XAG\n"
-        "Auto-signals 24/7\n"
-        "3 months — $25 🔥 (save 17%)\n\n"
-        "👑 <b>Diamond</b> — $19.99/mo\n"
-        "ALL 9 pairs (XAU XAG BTC ETH SOL XRP BNB TON ADA)\n"
-        "Chart screenshot analysis\n"
-        "Deep AI analysis\n"
-        "Priority signals\n"
-        "3 months — $49.99 🔥 (save 17%)\n\n"
-        "🎁 <b>First week FREE</b>\n\n"
-        f"👇 Start → {bot_link_html()}"
+        "<b>📊 Gold &amp; Crypto — AI Signals</b>\n"
+        "<i>Золото, срібло та 9 крипто-пар: техніка, новини й мульти-провайдерний AI.</i>\n\n"
+        "<b>⚡ Що зараз у боті та каналі</b>\n"
+        "• Аналітика в канал <b>3× на день</b> (орієнт. 09:15:21 за Києвом, літній час; "
+        "розклад через UTC у сервері).\n"
+        "• Окремо — <b>освітні та новинні</b> дописи без зайвої реклами.\n"
+        "• У боті: <b>передвхідний розбір</b> — RSI, MACD, EMA, SL/TP-ідея, score, "
+        "новини й AI з failover: Groq → OpenRouter → Gemini.\n"
+        "• <b>Deep Analysis</b> — звіт по кількох ТФ + макро; на trial лише XAU, до 1 на день; "
+        "на Diamond до 3 на день і будь-яка пара з підпискою.\n"
+        "• 💠 Diamond: розбір <b>скріншоту графіка</b> (vision) + частіші пріоритетні авто-сигнали.\n"
+        "• Авто-сигнали для <b>Pro / Diamond</b> під час активного ринку.\n"
+        "• Свої алерти: <b>TradingView webhook</b> (/tvinfo у бота).\n"
+        "• /stats — історія сигналів бота й точність; /refer — бонусні дні за друзів.\n"
+        f"{crypto_nowp}"
+        "\n<b>💰 Актуальні ціни (у боті оновлюються частіше)</b>\n"
+        f"🥇 XAU/USD  <code>{prices['XAUUSD']}</code>\n"
+        f"🥈 XAG/USD  <code>{prices['XAGUSD']}</code>\n"
+        f"₿  BTC/USD  <code>{prices['BTCUSD']}</code>\n"
+        f"Ξ  ETH/USD  <code>{prices['ETHUSD']}</code>\n"
+        f"◎  SOL/USD  <code>{prices['SOLUSD']}</code>\n"
+        f"✕  XRP/USD  <code>{prices['XRPUSD']}</code>\n"
+        f"🔶 BNB/USD  <code>{prices['BNBUSD']}</code>\n"
+        f"🔹 TON/USD  <code>{prices['TONUSD']}</code>\n"
+        f"🔵 ADA/USD  <code>{prices['ADAUSD']}</code>\n\n"
+        "<b>📦 Тарифи (оплата зорями Telegram у боті)</b>\n\n"
+        "⭐ <b>Basic</b> (~$5/міс) — XAU/USD, SL/TP-моніторинг, AI по золоту.\n"
+        "Пакет 3 міс — дешевше ≈17%.\n\n"
+        "💎 <b>Pro</b> (~$9.99/міс) — Basic + срібло + усі крипто-пари з бота, "
+        "<b>авто-сигнали 24/7</b>. 3 міс зі знижкою.\n\n"
+        "💠 <b>Diamond</b> (~$19.99/міс) — усе з Pro + Deep по всіх парах (ліміт/день), "
+        "Chart Vision і пріоритетні сповіщення. 3 міс bundle вигідніший.\n\n"
+        f"{trial_line}"
+        f"<b>👇 Старт і підписка</b> — {bot_link_html()}"
     )
     try:
         msg = await context.bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
@@ -4303,7 +4327,8 @@ async def cmd_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception:
             pass
         await update.message.reply_text(
-            f"✅ Welcome post published and pinned!\nXAU={xau} · BTC={btc} · ETH={eth}"
+            "✅ Пост опубліковано й закріплено в каналі.\n"
+            f"XAU={prices['XAUUSD']} · BTC={prices['BTCUSD']} · ETH={prices['ETHUSD']}"
         )
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
@@ -4461,7 +4486,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("₮ Basic — 3 mo ($12.5)", callback_data="crypto_pay_basic_3")],
             [InlineKeyboardButton("₮ Pro — 3 mo ($25)", callback_data="crypto_pay_pro_3")],
             [InlineKeyboardButton("₮ Diamond — 1 mo ($19.99)", callback_data="crypto_pay_diamond_1")],
             [InlineKeyboardButton("₮ Diamond — 3 mo ($49.99)", callback_data="crypto_pay_diamond_3")],
@@ -4469,16 +4493,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ])
         crypto_menu_intro = (
             "₮ *Pay with Crypto (USDT TRC20)*\n\n"
-            "*UA:* Обери план — отримаєш адресу й точну суму. Доступ активується після підтвердження в мережі.\n"
-            "*EN:* Pick a plan — you get address + exact amount; access unlocks once the network confirms.\n\n"
-            "⚠️ *Чому немає Basic/Pro на 1 міс криптою?*\n"
-            "Платіжний посередник *NOWPayments* і правила мережі задають мінімальну суму платежу. "
-            "Найдешевші місячні плани через криптомережу часто просто технічно не проходять без великої несправедливої доплати "
-            "(це не наш довільний барʼєр, а умови процесинг-партнера). "
-            "Тому *Basic та Pro ми пропонуємо криптою пакунком на 3 місяці*, а нижчі 1 міс — також через "
-            "*⭐ Telegram Stars* головному меню підписки.\n\n"
-            "*Diamond* можна платити криптою і на *1 міс*, і на *3 міс*.\n\n"
-            "📋 Обери варіант нижче."
+            "*UA:* Отримаєш адресу й *точну кількість USDT*. Підписка увімкнеться після підтвердження мережею.\n"
+            "*EN:* You get address + *exact USDT amount*; access unlocks after network confirmation.\n\n"
+            "⚠️ *Чому немає Basic і коротких планів?*\n"
+            "Мінімальні суми *NOWPayments* і мережі означали б для *Basic* криптом значну доплату "
+            "(наприклад ~$13 замість $12.5 — цього ми свідомо не пропонуємо). Усе *Basic / Pro на 1 міс* й пакунок "
+            "*Basic на 3 міс* доступні через ⭐ у *Subscription*.\n\n"
+            "📋 Тут лише:\n• *Pro — 3 місяці*\n• *Diamond — 1 або 3 міс*"
         )
         await safe_edit(
             q,
@@ -4508,14 +4529,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if (plan_key, months) not in CRYPTO_PAY_ALLOWED:
             denied = (
-                "⚠️ *Цей план недоступний криптою*\n\n"
-                "Платіжний посередник *NOWPayments* і мінімуми мережі встановлюють мінімальну суму платежу. "
-                "Короткі дешеві періоди *Basic / Pro на 1 міс* криптом зазвичай не створюються без великої "
-                "необгрунтованої надбавки — це *вимоги партнера-еквайєра*, не «забаганка» сервісу.\n\n"
+                "⚠️ *Цей план оплатити криптою через це меню не можна*\n\n"
+                "Посередник *NOWPayments* і мінімуми мережі роблять криптоплатіж по *Basic* "
+                "(у тому числі пакету на *3 міс*) або дешевим *Pro на 1 міс* практично неможливим "
+                "*без великої надбавки* до цінника — тому ці тарифи криптом ми не показуємо.\n\n"
                 "*Що робити:*\n"
-                "• оплатити ⭐ через *Subscription*\n"
-                "• або обрати *Basic / Pro на 3 місяці* криптою в попередньому меню\n"
-                "• *Diamond* — криптом і на *1 міс*, і на *3 міс* там само."
+                "• *Basic*, *Pro 1 міс* → оплата ⭐ у *Subscription*\n"
+                "• Криптом тут лише *Pro на 3 міс* й *Diamond* (1 або 3 міс).\n\n"
+                "_Якщо підказка зʼявилась після старої кнопки — онови бота на сервері._"
             )
             await safe_edit(
                 q,
@@ -4563,29 +4584,21 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         url = inv.get("invoice_url")
 
         lines = [
-            "₮ *Crypto Payment Created*",
+            "₮ *Рахунок USDT (TRC20)*",
             "",
-            f"Plan: *{plan_label(plan_key)}*  |  Months: *{months}*",
-        ]
-        rq = inv.get("price_usd_requested")
-        iq = inv.get("price_usd_invoiced")
-        try:
-            if rq is not None and iq is not None and round(float(iq) - float(rq), 4) >= 0.03:
-                lines.append(
-                    f"In USD (NOWPayments minimum): listed *${float(rq):.2f}* → invoiced *${float(iq):.2f}*"
-                )
-        except (TypeError, ValueError):
-            pass
-
-        lines += [
-            f"Currency: *USDT (TRC20)*",
-            f"Amount: *{amt}*",
-            f"Address: `{addr}`",
+            f"*План:* {plan_label(plan_key)} × *{months}* міс.",
             "",
-            "After payment gets confirmed, your plan will activate automatically.",
+            "*Сплата — рівно ця сума USDT,* скопіюй символ‑в‑символ:",
+            f"`{amt}` *USDT*",
+            "",
+            "*Адреса:*",
+            f"`{addr}`",
+            "",
+            "⚠️ Не округлюй і не діли суму на кілька платежів — інакше автоактивізація не спрацює.",
+            "_Підписка вмикається одразу після підтвердження вашого переказу в блокчейні._",
         ]
         if url:
-            lines += ["", f"Invoice link: `{url}`"]
+            lines += ["", f"*Посилання інвойсу:* `{url}`"]
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Check payment", callback_data=f"crypto_check_{payment_id}")],
             [InlineKeyboardButton("↩️ Back", callback_data="crypto_menu")],
