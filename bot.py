@@ -296,7 +296,18 @@ GROQ_TIMEOUT = 20
 
 # Long-form deep analysis & chart vision: see DEEP_ANALYSIS_PROVIDER / CHART_VISION_PROVIDER (default: gemini).
 
-TRIAL_DAYS        = 7
+TRIAL_DAYS        = int(os.getenv("TRIAL_DAYS", "3") or "3") or 3
+TRIAL_DAYS        = max(1, min(TRIAL_DAYS, 14))
+
+
+def _trial_duration_ua() -> str:
+    """Ukrainian 'N days' for fixed marketing copy (trial length)."""
+    n = TRIAL_DAYS
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} день"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return f"{n} дні"
+    return f"{n} днів"
 PRICE_BASIC       = 550    # ~$5 net after Telegram 30% fee
 PRICE_PRO         = 1100   # ~$9.99 net
 PRICE_BASIC_3     = 1375   # 3-month ~17% discount
@@ -3285,7 +3296,7 @@ def sub_info_text(acc: dict) -> str:
         f"  1 mo — *{PRICE_DIAMOND}⭐* (~$19.99)",
         f"  3 mo — *{PRICE_DIAMOND_3}⭐* (~$49.99) 🔥 _save ~17%_",
         "",
-        "💡 _First week free for new users_",
+        f"💡 _Безкоштовний trial для нових — {_trial_duration_ua()}_",
     ]
     return "\n".join(lines)
 
@@ -4259,41 +4270,54 @@ async def handle_photo(update, context):
 async def cmd_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.id != ADMIN_ID:
         return
-    await update.message.reply_text("Preparing welcome post…")
+    await update.message.reply_text("Готую пост для каналу…")
     prices = {p: (fmt_price(v, p) if (v := get_price(p)) else "N/A") for p in PAIRS}
-    xau = prices["XAUUSD"]; btc = prices["BTCUSD"]; eth = prices["ETHUSD"]
-    sol = prices.get("SOLUSD", "N/A"); xrp = prices.get("XRPUSD", "N/A")
+
+    crypto_nowp = ""
+    if NOWPAYMENTS_API_KEY and PUBLIC_BASE_URL.strip() and NOWPAYMENTS_IPN_SECRET.strip():
+        crypto_nowp = "• 💳 Також є оплата криптовалютою через NOWPayments.\n"
+
+    trial_line = (
+        f"🎁 <b>Безкоштовний trial — {_trial_duration_ua()}</b> для нових користувачів: "
+        f"XAU/USD + AI-розбір у боті + <b>до 1 Deep Analysis на день</b> лише по золоту. "
+        f"Після trial — обери тариф у боті або доступ зникне.\n\n"
+    )
+
     text = (
-        "<b>📊 Gold &amp; Crypto AI Signals</b>\n"
-        "<i>AI-powered signals — 9 pairs</i>\n\n"
-        "📡 AI market analysis 3x per day:\n"
-        "☀️ 09:00  📊 15:00  🌙 21:00 (Kyiv time)\n\n"
-        "<b>── Current prices ──</b>\n"
-        f"🥇 XAU/USD  <code>{xau}</code>\n"
-        f"🥈 XAG/USD  <code>{prices.get(chr(39)+chr(88)+chr(65)+chr(71)+chr(85)+chr(83)+chr(68)+chr(39), chr(78)+chr(47)+chr(65))}</code>\n"
-        f"₿  BTC/USD  <code>{btc}</code>\n"
-        f"Ξ  ETH/USD  <code>{eth}</code>\n"
-        f"◎  SOL/USD  <code>{sol}</code>\n"
-        f"✕  XRP/USD  <code>{xrp}</code>\n"
-        f"🔶 BNB/USD  <code>{prices.get(chr(66)+chr(78)+chr(66)+chr(85)+chr(83)+chr(68), chr(78)+chr(47)+chr(65))}</code>\n"
-        f"🔹 TON/USD  <code>{prices.get('TONUSD', 'N/A')}</code>\n"
-        f"🔵 ADA/USD  <code>{prices.get(chr(65)+chr(68)+chr(65)+chr(85)+chr(83)+chr(68), chr(78)+chr(47)+chr(65))}</code>\n\n"
-        "<b>── Plans ──</b>\n\n"
-        "⭐ <b>Basic</b> — $5/mo\n"
-        "XAU/USD signals + SL/TP alerts\n"
-        "3 months — $12.5 🔥 (save 17%)\n\n"
-        "💎 <b>Pro</b> — $9.99/mo\n"
-        "XAU + BTC + ETH + XAG\n"
-        "Auto-signals 24/7\n"
-        "3 months — $25 🔥 (save 17%)\n\n"
-        "👑 <b>Diamond</b> — $19.99/mo\n"
-        "ALL 9 pairs (XAU XAG BTC ETH SOL XRP BNB TON ADA)\n"
-        "Chart screenshot analysis\n"
-        "Deep AI analysis\n"
-        "Priority signals\n"
-        "3 months — $49.99 🔥 (save 17%)\n\n"
-        "🎁 <b>First week FREE</b>\n\n"
-        f"👇 Start → {bot_link_html()}"
+        "<b>📊 Gold &amp; Crypto — AI Signals</b>\n"
+        "<i>Золото, срібло та 9 крипто-пар: техніка, новини й мульти-провайдерний AI.</i>\n\n"
+        "<b>⚡ Що зараз у боті та каналі</b>\n"
+        "• Аналітика в канал <b>3× на день</b> (орієнт. 09:15:21 за Києвом, літній час; "
+        "розклад через UTC у сервері).\n"
+        "• Окремо — <b>освітні та новинні</b> дописи без зайвої реклами.\n"
+        "• У боті: <b>передвхідний розбір</b> — RSI, MACD, EMA, SL/TP-ідея, score, "
+        "новини й AI з failover: Groq → OpenRouter → Gemini.\n"
+        "• <b>Deep Analysis</b> — звіт по кількох ТФ + макро; на trial лише XAU, до 1 на день; "
+        "на Diamond до 3 на день і будь-яка пара з підпискою.\n"
+        "• 💠 Diamond: розбір <b>скріншоту графіка</b> (vision) + частіші пріоритетні авто-сигнали.\n"
+        "• Авто-сигнали для <b>Pro / Diamond</b> під час активного ринку.\n"
+        "• Свої алерти: <b>TradingView webhook</b> (/tvinfo у бота).\n"
+        "• /stats — історія сигналів бота й точність; /refer — бонусні дні за друзів.\n"
+        f"{crypto_nowp}"
+        "\n<b>💰 Актуальні ціни (у боті оновлюються частіше)</b>\n"
+        f"🥇 XAU/USD  <code>{prices['XAUUSD']}</code>\n"
+        f"🥈 XAG/USD  <code>{prices['XAGUSD']}</code>\n"
+        f"₿  BTC/USD  <code>{prices['BTCUSD']}</code>\n"
+        f"Ξ  ETH/USD  <code>{prices['ETHUSD']}</code>\n"
+        f"◎  SOL/USD  <code>{prices['SOLUSD']}</code>\n"
+        f"✕  XRP/USD  <code>{prices['XRPUSD']}</code>\n"
+        f"🔶 BNB/USD  <code>{prices['BNBUSD']}</code>\n"
+        f"🔹 TON/USD  <code>{prices['TONUSD']}</code>\n"
+        f"🔵 ADA/USD  <code>{prices['ADAUSD']}</code>\n\n"
+        "<b>📦 Тарифи (оплата зорями Telegram у боті)</b>\n\n"
+        "⭐ <b>Basic</b> (~$5/міс) — XAU/USD, SL/TP-моніторинг, AI по золоту.\n"
+        "Пакет 3 міс — дешевше ≈17%.\n\n"
+        "💎 <b>Pro</b> (~$9.99/міс) — Basic + срібло + усі крипто-пари з бота, "
+        "<b>авто-сигнали 24/7</b>. 3 міс зі знижкою.\n\n"
+        "💠 <b>Diamond</b> (~$19.99/міс) — усе з Pro + Deep по всіх парах (ліміт/день), "
+        "Chart Vision і пріоритетні сповіщення. 3 міс bundle вигідніший.\n\n"
+        f"{trial_line}"
+        f"<b>👇 Старт і підписка</b> — {bot_link_html()}"
     )
     try:
         msg = await context.bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
@@ -4303,7 +4327,8 @@ async def cmd_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception:
             pass
         await update.message.reply_text(
-            f"✅ Welcome post published and pinned!\nXAU={xau} · BTC={btc} · ETH={eth}"
+            "✅ Пост опубліковано й закріплено в каналі.\n"
+            f"XAU={prices['XAUUSD']} · BTC={prices['BTCUSD']} · ETH={prices['ETHUSD']}"
         )
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}")
