@@ -2144,6 +2144,59 @@ def _groq_client():
     return Groq(api_key=GROQ_KEY)
 
 
+def _sanitize_ai_trade_fields(ai: dict, fallback: dict, price: float, pair: str) -> None:
+    """Fill/repair optimal_entry, SL, TP, R/R when model JSON used null (overwrites fallback)."""
+    cfg = PAIRS[pair]
+    sl_hint, tp_hint = cfg["sl_pct"], cfg["tp_pct"]
+
+    def as_float(x) -> float | None:
+        if x is None:
+            return None
+        if isinstance(x, str) and x.strip().lower() in ("", "null", "none"):
+            return None
+        try:
+            v = float(x)
+            if v != v:  # NaN
+                return None
+            return v
+        except (TypeError, ValueError):
+            return None
+
+    rd = (
+        0 if pair in ("BTCUSD", "ETHUSD", "BNBUSD", "SOLUSD")
+        else 4 if pair in ("XRPUSD", "ADAUSD", "TONUSD") else 2
+    )
+
+    ent = as_float(ai.get("optimal_entry"))
+    if ent is None or ent <= 0:
+        ent = as_float(fallback.get("optimal_entry")) or float(price)
+
+    ai["optimal_entry"] = round(ent, rd)
+    entry = float(ai["optimal_entry"])
+    sent = (ai.get("sentiment") or "neutral").lower()
+    direction = "SELL" if sent == "bearish" else "BUY"
+    sl_fb, tp_fb = _make_sl_tp(entry, direction, sl_hint, tp_hint)
+
+    sl = as_float(ai.get("stop_loss"))
+    tp = as_float(ai.get("take_profit"))
+    if sl is None or sl <= 0:
+        sl = sl_fb
+    if tp is None or tp <= 0:
+        tp = tp_fb
+
+    if sent == "bearish" and (sl < entry or tp > entry):
+        sl, tp = _make_sl_tp(entry, "SELL", sl_hint, tp_hint)
+    elif sent == "bullish" and (sl > entry or tp < entry):
+        sl, tp = _make_sl_tp(entry, "BUY", sl_hint, tp_hint)
+
+    ai["stop_loss"] = round(float(sl), rd)
+    ai["take_profit"] = round(float(tp), rd)
+
+    rr = ai.get("risk_reward")
+    if rr is None or (isinstance(rr, str) and not str(rr).strip()) or str(rr).strip().lower() == "null":
+        ai["risk_reward"] = fallback.get("risk_reward") or f"1:{tp_hint / sl_hint:.1f}"
+
+
 def groq_analysis(news_text: str, price: float, tech: dict,
                   trend: str, vol: str, pair: str, groq_model: str) -> dict:
     cfg     = PAIRS[pair]
@@ -2193,25 +2246,10 @@ def groq_analysis(news_text: str, price: float, tech: dict,
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         if m:
             parsed = json.loads(m.group())
-            # Normalize confidence (fix 0.0–1.0 fraction from Groq)
             parsed["confidence"] = _normalize_confidence(parsed.get("confidence", 35))
-            # Validate and fix SL/TP direction
-            entry = float(parsed.get("optimal_entry") or price)
-            sl    = float(parsed.get("stop_loss") or 0)
-            tp    = float(parsed.get("take_profit") or 0)
-            sent  = (parsed.get("sentiment") or "neutral").lower()
-            if sl > 0 and tp > 0:
-                if sent == "bearish" and (sl < entry or tp > entry):
-                    log.warning("Groq SL/TP direction mismatch for SELL — fixing")
-                    sl, tp = _make_sl_tp(entry, "SELL", sl_hint, tp_hint)
-                    parsed["stop_loss"]   = sl
-                    parsed["take_profit"] = tp
-                elif sent == "bullish" and (sl > entry or tp < entry):
-                    log.warning("Groq SL/TP direction mismatch for BUY — fixing")
-                    sl, tp = _make_sl_tp(entry, "BUY", sl_hint, tp_hint)
-                    parsed["stop_loss"]   = sl
-                    parsed["take_profit"] = tp
-            return {**fallback, **parsed}
+            merged = {**fallback, **parsed}
+            _sanitize_ai_trade_fields(merged, fallback, price, pair)
+            return merged
     except Exception as e:
         log.warning("AI analysis failed (Groq+OpenRouter+Gemini): %s", e)
     return fallback
@@ -2431,9 +2469,10 @@ def build_analysis_text(a: dict) -> str:
         f"Confidence: *{ai.get('confidence', '?')}%*",
         f"⚖️ Risk: `{(ai.get('risk_level') or 'MEDIUM').upper()}`",
         "",
-        f"🎯 Entry: *{ai.get('optimal_entry', price)}*",
-        f"🛑 SL: *{ai.get('stop_loss', 'N/A')}*   TP: *{ai.get('take_profit', 'N/A')}*",
-        f"📐 R/R: *{ai.get('risk_reward', 'N/A')}*",
+        f"🎯 Entry: *{fmt_price(ai.get('optimal_entry'), pair) if (ai.get('optimal_entry') is not None) else fmt_price(price, pair)}*",
+        f"🛑 SL: *{fmt_price(ai['stop_loss'], pair) if ai.get('stop_loss') is not None else '—'}*   "
+        f"TP: *{fmt_price(ai['take_profit'], pair) if ai.get('take_profit') is not None else '—'}*",
+        f"📐 R/R: *{ai.get('risk_reward') or '—'}*",
     ]
     if tech.get("ok"):
         lines += [
@@ -4728,7 +4767,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
         u.pending_analysis = a
-        opt = a["ai"].get("optimal_entry", price_val)
+        opt = float(a["ai"].get("optimal_entry") or price_val)
         await safe_edit(
             q,
             build_analysis_text(a) + "\n\n*What would you like to do?*",
@@ -4748,8 +4787,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ps.running         = True
         ps.sl_warning_sent = False
         ps.persist(cid, pair)
-        sl = ai.get("stop_loss",   round(price_val * (1 - cfg["sl_pct"] / 100), 2))
-        tp = ai.get("take_profit", round(price_val * (1 + cfg["tp_pct"] / 100), 2))
+        sl = ai.get("stop_loss") or round(price_val * (1 - cfg["sl_pct"] / 100), 2)
+        tp = ai.get("take_profit") or round(price_val * (1 + cfg["tp_pct"] / 100), 2)
         # Save to signals table for backtesting
         db_save_signal(
             pair, dr, price_val, float(sl), float(tp),
@@ -4891,8 +4930,8 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                     # Save to signals table for backtesting
                     ai  = a["ai"]
                     dr, _ = _direction(ai, a["trend"], a.get("tech"))
-                    sl  = ai.get("stop_loss",   round(price * (1 - cfg["sl_pct"] / 100), 2))
-                    tp  = ai.get("take_profit", round(price * (1 + cfg["tp_pct"] / 100), 2))
+                    sl  = ai.get("stop_loss") or round(price * (1 - cfg["sl_pct"] / 100), 2)
+                    tp  = ai.get("take_profit") or round(price * (1 + cfg["tp_pct"] / 100), 2)
                     db_save_signal(pair, dr, price, float(sl), float(tp),
                                    a["score"], ai.get("sentiment", "neutral"), source="ai")
                     log.info("Channel: analysis %s published (score=%s)", pair, a["score"])
