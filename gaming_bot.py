@@ -1,13 +1,11 @@
 """
-Gaming News Telegram Channel Bot
----------------------------------
-Автоматично публікує в Telegram-канал:
-  • Актуальні ігрові новини (RSS з IGN, Eurogamer, PCGamer, Kotaku, та ін.)
-  • Безкоштовні роздачі: Epic Games, Steam, GOG, PlayStation Store
-  • Дати виходу та оновлень ігор (RAWG API)
+Gaming News Telegram Channel Bot (v2.0.2)
+-----------------------------------------
+Фокус: PlayStation, PS Plus, Xbox / Game Pass — ігри місяця, підписки, релізи.
+Пости: шаблон UA + RU (Gemini). Кілька разів на день, без спаму.
+Роздачі: лише PS/Xbox і лише коли немає свіжих новин.
 
 Запуск:  python gaming_bot.py
-Залежності: pip install -r requirements_gaming.txt
 """
 
 import asyncio
@@ -22,12 +20,10 @@ import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from urllib.parse import urlparse, urlencode
 
 import httpx
 from dotenv import load_dotenv
-from telegram import Bot, InputMediaPhoto
-from telegram.constants import ParseMode
+from telegram import Bot
 from telegram.error import TelegramError
 
 # ──────────────────────── Logging ─────────────────────────────────────────────
@@ -52,104 +48,106 @@ GEMINI_KEY      = os.getenv("GEMINI_KEY", "")             # https://aistudio.goo
 ADMIN_ID        = int(os.getenv("ADMIN_ID", "0"))
 
 GEMINI_MODEL    = "gemini-2.5-flash"
+BOT_VERSION     = "2.0.2"
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(os.getenv(key, str(default)))
+    except (TypeError, ValueError):
+        return default
 
 DB_PATH         = "gaming_bot.db"
-CHECK_INTERVAL  = 15 * 60          # check sources every 15 minutes
-MIN_POST_GAP    = 30 * 60          # at least 30 min between posts to avoid spam
-FALLBACK_HOURS  = 84               # if no news in 84 h (~3.5 days) → force a post
-MAX_POST_LENGTH = 1024             # Telegram caption limit
+CHECK_INTERVAL  = _env_int("CHECK_INTERVAL_MIN", 60) * 60       # перевірка раз на годину
+NEWS_MIN_POST_GAP = _env_int("NEWS_MIN_POST_GAP_HOURS", 4) * 60 * 60  # ~4–6 новин/день
+MIN_POST_GAP    = NEWS_MIN_POST_GAP
+MAX_POSTS_PER_CYCLE = 1
+MAX_POSTS_PER_DAY   = _env_int("MAX_POSTS_PER_DAY", 5)
+MAX_GIVEAWAYS_PER_DAY  = _env_int("MAX_GIVEAWAYS_PER_DAY", 1)
+MAX_GIVEAWAYS_PER_WEEK = _env_int("MAX_GIVEAWAYS_PER_WEEK", 2)
+MIN_HOURS_BETWEEN_GIVEAWAYS = _env_int("MIN_HOURS_BETWEEN_GIVEAWAYS", 48)
+GIVEAWAY_IF_NO_NEWS_HOURS = _env_int("GIVEAWAY_IF_NO_NEWS_HOURS", 24)  # роздача лише якщо N год без новин
+MIN_POSTS_PER_DAY = _env_int("MIN_POSTS_PER_DAY", 1)           # мінімум постів на добу
+FORCE_POST_AFTER_HOURS = _env_int("FORCE_POST_AFTER_HOURS", 20)  # якщо стільки год без поста — обовʼязково
+RSS_MAX_AGE_HOURS = _env_int("RSS_MAX_AGE_HOURS", 48)
+RSS_MAX_AGE_FORCE_HOURS = _env_int("RSS_MAX_AGE_FORCE_HOURS", 168)  # 7 днів у «голодному» режимі
+FALLBACK_HOURS  = _env_int("FALLBACK_HOURS", 20)
+MAX_CANDIDATES_FORCE = 8
+PHOTO_CAPTION_MAX = 1024
+TEXT_MESSAGE_MAX  = 4000
 
-# ──────────────────────── RSS News Sources ────────────────────────────────────
+# Роздачі: пріоритет PlayStation / Xbox (без PC-спаму)
+GIVEAWAY_STORE_PRIORITY = (
+    ("ps",     "playstation.com"),
+    ("xbox",   "xbox.com"),
+)
+GIVEAWAY_STORE_SKIP = (
+    "itch.io", "indiegala.com", "onstove.com", "gamerpower.com",
+    "steampowered.com", "epicgames.com", "gog.com",
+)
+
+# ──────────────────────── RSS: лише PlayStation / Xbox ─────────────────────────
 RSS_SOURCES = [
     {
-        "name": "IGN",
-        "url": "https://feeds.ign.com/ign/all",
+        "name": "Push Square",
+        "url": "https://www.pushsquare.com/feeds/news",
         "category": "news",
-        "lang": "en",
-        "image_fallback": "https://assets1.ignimgs.com/2019/06/06/ign-logo-alt-1559862288132.jpg",
+        "image_fallback": "https://www.pushsquare.com/images/icons/ps_icon.png",
+    },
+    {
+        "name": "PlayStation Blog",
+        "url": "https://blog.playstation.com/feed/",
+        "category": "news",
+        "image_fallback": "https://blog.playstation.com/favicon.ico",
+    },
+    {
+        "name": "Pure Xbox",
+        "url": "https://www.purexbox.com/feeds/news",
+        "category": "news",
+        "image_fallback": "https://www.purexbox.com/images/icons/xbox_icon.png",
     },
     {
         "name": "Eurogamer",
         "url": "https://www.eurogamer.net/feed",
         "category": "news",
-        "lang": "en",
         "image_fallback": "https://www.eurogamer.net/images/2023/08/eurogamer_icon.png",
-    },
-    {
-        "name": "PC Gamer",
-        "url": "https://www.pcgamer.com/rss/",
-        "category": "news",
-        "lang": "en",
-        "image_fallback": "https://cdn.mos.cms.futurecdn.net/PCGamerFavicon-16x16.png",
-    },
-    {
-        "name": "Kotaku",
-        "url": "https://kotaku.com/rss",
-        "category": "news",
-        "lang": "en",
-        "image_fallback": "https://i.kinja-img.com/gawker-media/image/upload/s--JEQ09gIe--/c_fill,f_auto,fl_progressive,g_center,h_80,q_80,w_80/18j9bkx4d4r1xjpg.jpg",
-    },
-    {
-        "name": "Rock Paper Shotgun",
-        "url": "https://www.rockpapershotgun.com/feed",
-        "category": "news",
-        "lang": "en",
-        "image_fallback": "https://www.rockpapershotgun.com/images/icons/rps-favicon.png",
     },
     {
         "name": "VG247",
         "url": "https://www.vg247.com/feed",
         "category": "news",
-        "lang": "en",
         "image_fallback": "https://www.vg247.com/wp-content/uploads/2023/01/vg247-logo.svg",
-    },
-    {
-        "name": "GamesRadar",
-        "url": "https://www.gamesradar.com/rss/",
-        "category": "news",
-        "lang": "en",
-        "image_fallback": "https://www.gamesradar.com/wp-content/themes/gamesradar/images/gamesradar-logo.png",
-    },
-    {
-        "name": "GameSpot News",
-        "url": "https://www.gamespot.com/feeds/mashup/",
-        "category": "news",
-        "lang": "en",
-        "image_fallback": "https://www.gamespot.com/a/bundles/gamespotsite/images/favicon.ico",
-    },
-    {
-        "name": "Destructoid",
-        "url": "https://www.destructoid.com/feed/",
-        "category": "news",
-        "lang": "en",
-        "image_fallback": "https://www.destructoid.com/wp-content/themes/destructoid/images/logo.png",
-    },
-    {
-        "name": "Nintendo Life",
-        "url": "https://www.nintendolife.com/feeds/news",
-        "category": "news",
-        "lang": "en",
-        "image_fallback": "https://www.nintendolife.com/images/icons/nl_icon.png",
-    },
-    {
-        "name": "Push Square (PlayStation)",
-        "url": "https://www.pushsquare.com/feeds/news",
-        "category": "news",
-        "lang": "en",
-        "image_fallback": "https://www.pushsquare.com/images/icons/ps_icon.png",
-    },
-    {
-        "name": "GamingBolt",
-        "url": "https://gamingbolt.com/feed",
-        "category": "news",
-        "lang": "en",
-        "image_fallback": "https://gamingbolt.com/wp-content/uploads/2023/01/gamingbolt-logo.png",
     },
 ]
 
-# ──────────────────────── Giveaway APIs ───────────────────────────────────────
-GIVEAWAYRADAR_URL = "https://www.giveawayradar.com/api/giveaways/gaming?count=10"
-GAMERPOWER_URL    = "https://www.gamerpower.com/api/giveaways?platform=pc&type=game&sort-by=date"
+# Ключові слова: PS, PS Plus, Xbox Game Pass, ігри місяця
+PLATFORM_KEYWORDS = (
+    "playstation", "ps5", "ps4", "ps plus", "ps+", "playstation plus",
+    "ps plus essential", "ps plus extra", "ps plus premium",
+    "xbox", "xbox series", "game pass", "xbox game pass", "pc game pass",
+    "games with gold", "core games",
+)
+MONTHLY_LINEUP_KEYWORDS = (
+    "monthly games", "this month", "next month", "coming to ps",
+    "coming to xbox", "leaving ", "lineup", "day one", "day 1",
+    "games arriving", "free games for", "subscription",
+)
+JUNK_KEYWORDS = (
+    "oled tv", "gaming monitor", "graphics card", "best tv",
+    "black friday tv", "cyber monday tv", "how to watch",
+    "nintendo switch", "zelda only", "pokemon only", "pc only",
+    "steam deck only", "best gaming laptop", "best gaming phone",
+    "poll:", " poll ", "are you happy", "what do you think",
+    "reader vote", "cast your vote", "plus or minus?",
+)
+
+_PS_XBOX_RSS_SOURCES = frozenset({"Push Square", "PlayStation Blog", "Pure Xbox"})
+RAWG_PS_XBOX = ("playstation", "xbox")
+
+# ──────────────────────── Giveaway APIs (лише PS / Xbox) ─────────────────────
+GAMERPOWER_PS   = "https://www.gamerpower.com/api/giveaways?platform=ps4&type=game&sort-by=date"
+GAMERPOWER_XBOX = "https://www.gamerpower.com/api/giveaways?platform=xbox-one&type=game&sort-by=date"
+
+CONTENT_CATEGORIES = ("news", "update", "trailer", "release")
 
 # Category emojis
 CATEGORY_EMOJI = {
@@ -234,13 +232,280 @@ def hours_since_last_post(conn: sqlite3.Connection) -> float:
         return 9999.0
     return (time.time() - last) / 3600
 
+def count_posts_since(conn: sqlite3.Connection, hours: float, category: Optional[str] = None) -> int:
+    since = time.time() - hours * 3600
+    if category:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM posted WHERE posted_at > ? AND category = ?",
+            (since, category),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM posted WHERE posted_at > ?", (since,)
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+def hours_since_last_category(conn: sqlite3.Connection, category: str) -> float:
+    last = conn.execute(
+        "SELECT MAX(posted_at) FROM posted WHERE category = ?", (category,)
+    ).fetchone()[0]
+    if not last:
+        return 9999.0
+    return (time.time() - last) / 3600
+
+def hours_since_last_content_post(conn: sqlite3.Connection) -> float:
+    """Годин з останнього поста про новини/реліз (не роздачу)."""
+    last = conn.execute(
+        "SELECT MAX(posted_at) FROM posted WHERE category IN ('news','update','trailer','release')"
+    ).fetchone()[0]
+    if not last:
+        return 9999.0
+    return (time.time() - last) / 3600
+
+def article_text_blob(article: dict) -> str:
+    return f"{article.get('title', '')} {article.get('summary', '')} {article.get('source', '')}".lower()
+
+def is_junk_article(article: dict) -> bool:
+    blob = article_text_blob(article)
+    if any(k in blob for k in JUNK_KEYWORDS):
+        return True
+    url = (article.get("url") or "").lower()
+    if "/poll" in url or "/features/poll" in url:
+        return True
+    title = (article.get("title") or "").strip().lower()
+    if title.startswith("poll:") or title.startswith("poll "):
+        return True
+    return False
+
+def is_platform_focus_article(article: dict) -> bool:
+    """PS, PS Plus, Xbox Game Pass, ігри місяця, консольні релізи."""
+    if is_junk_article(article):
+        return False
+    blob = article_text_blob(article)
+    if any(k in blob for k in PLATFORM_KEYWORDS):
+        return True
+    if any(k in blob for k in MONTHLY_LINEUP_KEYWORDS):
+        return True
+    return False
+
+def passes_content_filter(article: dict, *, relaxed: bool = False) -> bool:
+    """Джерела PS/Xbox — ширше; Eurogamer/VG247 — за ключовими словами (relaxed — м'якше)."""
+    if is_junk_article(article):
+        return False
+    if article.get("source") in _PS_XBOX_RSS_SOURCES:
+        return True
+    if relaxed and is_gaming_related(article.get("title", ""), article.get("summary", "")):
+        blob = article_text_blob(article)
+        if any(k in blob for k in ("playstation", "ps5", "ps4", "xbox", "game pass", "ps plus")):
+            return True
+    return is_platform_focus_article(article)
+
+def posts_last_24h(conn: sqlite3.Connection) -> int:
+    return count_posts_since(conn, 24)
+
+def needs_daily_post(conn: sqlite3.Connection) -> bool:
+    return posts_last_24h(conn) < MIN_POSTS_PER_DAY
+
+def is_starving(conn: sqlite3.Connection) -> bool:
+    return hours_since_last_post(conn) >= FORCE_POST_AFTER_HOURS
+
+def effective_post_gap_seconds(conn: sqlite3.Connection) -> int:
+    """Якщо давно не було поста — скорочуємо паузу для гарантії MIN_POSTS_PER_DAY."""
+    if needs_daily_post(conn) and is_starving(conn):
+        return 0
+    if needs_daily_post(conn):
+        return min(NEWS_MIN_POST_GAP, 2 * 3600)
+    return NEWS_MIN_POST_GAP
+
+def should_force_post(conn: sqlite3.Connection) -> bool:
+    return needs_daily_post(conn) and is_starving(conn)
+
+def platform_priority_score(article: dict) -> float:
+    blob = article_text_blob(article)
+    score = freshness_boost(article)
+    if any(k in blob for k in MONTHLY_LINEUP_KEYWORDS):
+        score += 6.0
+    if any(k in blob for k in ("ps plus", "ps+", "playstation plus", "game pass", "games with gold")):
+        score += 5.0
+    if any(k in blob for k in ("ps5", "ps4", "xbox series", "xbox one")):
+        score += 2.0
+    return score
+
+def sort_platform_content(articles: list[dict]) -> list[dict]:
+    def key(a):
+        pd = a.get("pub_date")
+        ts = pd.timestamp() if pd else 0
+        return (platform_priority_score(a), ts)
+    return sorted(articles, key=key, reverse=True)
+
+def is_ps_xbox_giveaway(article: dict) -> bool:
+    if not is_quality_giveaway(article):
+        return False
+    return giveaway_store_key(article.get("url", "")) in ("ps", "xbox")
+
+def giveaway_store_key(url: str) -> str:
+    url = (url or "").lower()
+    for key, domain in GIVEAWAY_STORE_PRIORITY:
+        if domain in url:
+            return key
+    return "other"
+
+def recent_giveaway_stores(conn: sqlite3.Connection, days: int = 7) -> set[str]:
+    since = time.time() - days * 86400
+    rows = conn.execute(
+        "SELECT url FROM posted WHERE category = 'giveaway' AND posted_at > ?",
+        (since,),
+    ).fetchall()
+    return {giveaway_store_key(r[0]) for r in rows if r[0]}
+
+def is_quality_giveaway(article: dict) -> bool:
+    """Skip obscure indie-aggregator spam; keep major store deals."""
+    url = (article.get("url") or "").lower()
+    if any(skip in url for skip in GIVEAWAY_STORE_SKIP):
+        return False
+    if any(domain in url for _, domain in GIVEAWAY_STORE_PRIORITY):
+        return True
+    return giveaway_store_key(url) == "other" and "free" in (article.get("title") or "").lower()
+
+def pick_diverse_giveaway(giveaways: list[dict], conn: sqlite3.Connection) -> Optional[dict]:
+    """Pick one giveaway, preferring a store not used in the last week."""
+    recent = recent_giveaway_stores(conn)
+    by_store: dict[str, list[dict]] = {}
+    for g in giveaways:
+        if not is_quality_giveaway(g):
+            continue
+        by_store.setdefault(giveaway_store_key(g.get("url", "")), []).append(g)
+
+    for key, _domain in GIVEAWAY_STORE_PRIORITY:
+        if key in by_store and key not in recent:
+            return by_store[key][0]
+
+    for key, _domain in GIVEAWAY_STORE_PRIORITY:
+        if key in by_store:
+            return by_store[key][0]
+
+    return None
+
+def required_gap_seconds(category: str) -> int:
+    if category == "giveaway":
+        return MIN_HOURS_BETWEEN_GIVEAWAYS * 3600
+    return NEWS_MIN_POST_GAP
+
+def classify_rss_category(title: str, summary: str = "") -> str:
+    """Визначити тип матеріалу за заголовком (новина / патч / трейлер / реліз)."""
+    t = f"{title} {summary}".lower()
+    if any(w in t for w in ("trailer", "gameplay trailer", "cinematic", "трейлер")):
+        return "trailer"
+    if any(w in t for w in ("patch", "hotfix", "dlc", "update ", "updated", "оновлення", "патч")):
+        return "update"
+    if any(w in t for w in ("release date", "releases on", "launching", "coming to", "реліз", "вихід")):
+        return "release"
+    return "news"
+
+def freshness_boost(article: dict) -> float:
+    pd = article.get("pub_date")
+    if not pd:
+        return 0.0
+    age_h = (datetime.now(timezone.utc) - pd).total_seconds() / 3600
+    if age_h <= 3:
+        return 3.0
+    if age_h <= 12:
+        return 1.5
+    return 0.0
+
+def sort_content(articles: list[dict]) -> list[dict]:
+    def key(a):
+        pd = a.get("pub_date")
+        ts = pd.timestamp() if pd else 0
+        return (freshness_boost(a), ts)
+    return sorted(articles, key=key, reverse=True)
+
+def can_post_giveaway(conn: sqlite3.Connection) -> bool:
+    if count_posts_since(conn, 24, "giveaway") >= MAX_GIVEAWAYS_PER_DAY:
+        return False
+    if count_posts_since(conn, 168, "giveaway") >= MAX_GIVEAWAYS_PER_WEEK:
+        return False
+    if hours_since_last_category(conn, "giveaway") < MIN_HOURS_BETWEEN_GIVEAWAYS:
+        return False
+    return True
+
+def select_articles_for_cycle(
+    articles: list[dict], conn: sqlite3.Connection, *, force: bool = False,
+) -> list[dict]:
+    """
+    Новини PS / PS+ / Xbox. force=True — розширений вибір для гарантії поста на день.
+    """
+    if not force and posts_last_24h(conn) >= MAX_POSTS_PER_DAY:
+        log.info("Daily post cap reached (%d)", MAX_POSTS_PER_DAY)
+        return []
+
+    giveaways = [
+        a for a in articles
+        if a.get("category") == "giveaway" and is_ps_xbox_giveaway(a)
+    ]
+
+    def _content(*, relaxed: bool) -> list[dict]:
+        return sort_platform_content([
+            a for a in articles
+            if a.get("category") in CONTENT_CATEGORIES
+            and passes_content_filter(a, relaxed=relaxed)
+        ])
+
+    content = _content(relaxed=False)
+    if content:
+        log.info(
+            "Selected %s (score %.1f): %s",
+            content[0].get("category"), platform_priority_score(content[0]),
+            content[0].get("title", "")[:55],
+        )
+        return content[:MAX_CANDIDATES_FORCE if force else 1]
+
+    hours_no_content = hours_since_last_content_post(conn)
+    giveaway_ok = hours_no_content >= GIVEAWAY_IF_NO_NEWS_HOURS or force
+
+    if giveaway_ok and can_post_giveaway(conn) and giveaways:
+        pick = pick_diverse_giveaway(giveaways, conn)
+        if pick:
+            log.info(
+                "Giveaway (no PS/Xbox news %.0fh, force=%s): %s",
+                hours_no_content, force, pick.get("title", "")[:55],
+            )
+            return [pick]
+
+    if not force:
+        return []
+
+    relaxed = _content(relaxed=True)
+    if relaxed:
+        log.info("Force mode: relaxed PS/Xbox pick: %s", relaxed[0].get("title", "")[:55])
+        return relaxed[:MAX_CANDIDATES_FORCE]
+
+    ps_only = sort_platform_content([
+        a for a in articles
+        if a.get("source") in _PS_XBOX_RSS_SOURCES
+        and a.get("category") in CONTENT_CATEGORIES
+        and not is_junk_article(a)
+    ])
+    if ps_only:
+        log.info("Force mode: PS/Xbox RSS source: %s", ps_only[0].get("title", "")[:55])
+        return ps_only[:MAX_CANDIDATES_FORCE]
+
+    if giveaways:
+        pick = pick_diverse_giveaway(giveaways, conn)
+        if pick:
+            log.info("Force mode: giveaway fallback: %s", pick.get("title", "")[:55])
+            return [pick]
+
+    log.warning("Force mode: no candidates in queue (%d articles)", len(articles))
+    return []
+
 # ──────────────────────── Helpers ─────────────────────────────────────────────
 
 def make_hash(*parts: str) -> str:
     text = "|".join(str(p) for p in parts)
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
-def truncate(text: str, limit: int = MAX_POST_LENGTH) -> str:
+def truncate(text: str, limit: int = PHOTO_CAPTION_MAX) -> str:
     if not text:
         return ""
     text = text.strip()
@@ -260,12 +525,113 @@ def clean_html(text: str) -> str:
     text = re.sub(r"&quot;", '"', text)
     text = re.sub(r"&#\d+;", "", text)
     text = re.sub(r"\s+", " ", text)
+    text = re.sub(
+        r"read the full article on [\w.]+\.?\s*",
+        "", text, flags=re.IGNORECASE,
+    )
+    text = re.sub(r"plus or minus\??\s*", "", text, flags=re.IGNORECASE)
     return text.strip()
 
 def is_gaming_related(title: str, description: str = "") -> bool:
     """Check if an article is gaming-related."""
     combined = (title + " " + description).lower()
     return any(kw in combined for kw in GAMING_KEYWORDS)
+
+_INVALID_SLUGS = frozenset({"[]", "{}", "null", "none", "undefined"})
+
+def normalize_article_url(url: str) -> str:
+    """Return a clean http(s) URL or empty string."""
+    if not url:
+        return ""
+    url = url.strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    if not url.startswith(("http://", "https://")):
+        return ""
+    return url
+
+def normalize_store_url(url: str) -> str:
+    """Fix known-bad store URLs (Epic slugs, locale, GamerPower leftovers)."""
+    url = normalize_article_url(url)
+    if not url:
+        return ""
+    if "gamerpower.com" in url:
+        return ""  # force re-resolve; never post intermediary pages
+    if "/p/[]" in url or url.rstrip("/").endswith("/p"):
+        return "https://store.epicgames.com/uk/free-games"
+    # Epic without /uk/ → Ukrainian store (GamerPower redirects often omit locale)
+    m = re.match(r"(https://store\.epicgames\.com)/p/([\w\-]+)/?$", url, re.I)
+    if m:
+        return f"{m.group(1)}/uk/p/{m.group(2)}"
+    return url
+
+def strip_urls_from_text(text: str) -> str:
+    """Remove URLs from AI/RSS text so users don't click wrong links in the body."""
+    if not text:
+        return ""
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+def pick_epic_slug(product_slug: object, url_slug: object) -> str:
+    """Epic API sometimes returns productSlug as the literal string '[]'."""
+    for raw in (product_slug, url_slug):
+        if raw is None:
+            continue
+        slug = str(raw).strip().lower()
+        if not slug or slug in _INVALID_SLUGS:
+            continue
+        if re.fullmatch(r"[\w\-]+", slug):
+            return slug
+    return ""
+
+def epic_store_url(el: dict) -> str:
+    title = (el.get("title") or "").lower()
+    # Mystery-game slugs from Epic API often point to invalid promo pages
+    if "mystery" in title:
+        return "https://store.epicgames.com/uk/free-games"
+    slug = pick_epic_slug(el.get("productSlug"), el.get("urlSlug"))
+    if slug:
+        return f"https://store.epicgames.com/uk/p/{slug}"
+    return "https://store.epicgames.com/uk/free-games"
+
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+}
+
+async def resolve_final_url(client: httpx.AsyncClient, url: str) -> str:
+    """
+    Follow redirects so GamerPower /open/... links become direct Steam/Epic/etc. URLs.
+    """
+    url = normalize_article_url(url)
+    if not url:
+        return ""
+    if "gamerpower.com" not in url:
+        return normalize_store_url(url)
+
+    try:
+        resp = await client.get(
+            url, follow_redirects=True, timeout=20, headers=_BROWSER_HEADERS
+        )
+        final = normalize_store_url(str(resp.url))
+        if final and "gamerpower.com" not in final:
+            return final
+        # Some pages use HTML/JS redirect — parse store link from body
+        if resp.status_code == 200 and resp.text:
+            for pattern in (
+                r'https://store\.steampowered\.com/app/\d+[^\s"\'<>]*',
+                r'https://store\.epicgames\.com(?:/uk)?/p/[\w\-]+',
+                r'https://[\w\-]+\.itch\.io/[\w\-]+',
+            ):
+                m = re.search(pattern, resp.text)
+                if m:
+                    return normalize_store_url(m.group(0))
+    except Exception as exc:
+        log.warning("Redirect resolve failed for %s: %s", url, exc)
+    return ""
 
 def extract_image_from_rss_entry(entry_xml: ET.Element, ns: dict) -> Optional[str]:
     """Try to extract an image URL from an RSS entry XML element."""
@@ -345,7 +711,13 @@ def parse_rss_date(date_str: Optional[str]) -> Optional[datetime]:
             pass
     return None
 
-async def fetch_rss(client: httpx.AsyncClient, source: dict) -> list[dict]:
+async def fetch_rss(
+    client: httpx.AsyncClient,
+    source: dict,
+    max_age_hours: int = RSS_MAX_AGE_HOURS,
+    *,
+    relaxed_filter: bool = False,
+) -> list[dict]:
     """Fetch and parse RSS feed. Returns list of article dicts."""
     data = await fetch_url(client, source["url"])
     if not data:
@@ -374,7 +746,7 @@ async def fetch_rss(client: httpx.AsyncClient, source: dict) -> list[dict]:
                 link_el = entry.find("{http://www.w3.org/2005/Atom}link[@rel='alternate']")
                 if link_el is None:
                     link_el = entry.find("{http://www.w3.org/2005/Atom}link")
-                url = link_el.get("href", "") if link_el is not None else ""
+                url = normalize_article_url(link_el.get("href", "") if link_el is not None else "")
                 summary = clean_html(atom_text("summary") or atom_text("content"))
                 pub_date = parse_rss_date(atom_text("published") or atom_text("updated"))
                 img = extract_image_from_rss_entry(entry, ns)
@@ -394,7 +766,11 @@ async def fetch_rss(client: httpx.AsyncClient, source: dict) -> list[dict]:
                     return el.text.strip() if el is not None and el.text else ""
 
                 title   = rss_text("title")
-                url     = rss_text("link") or rss_text("guid")
+                url     = normalize_article_url(rss_text("link"))
+                if not url:
+                    guid = rss_text("guid")
+                    if guid.startswith("http"):
+                        url = normalize_article_url(guid)
                 summary = clean_html(rss_text("description"))
                 pub_str = rss_text("pubDate") or rss_text("dc:date")
                 pub_date = parse_rss_date(pub_str)
@@ -408,25 +784,29 @@ async def fetch_rss(client: httpx.AsyncClient, source: dict) -> list[dict]:
     except ET.ParseError as exc:
         log.warning("RSS parse error for %s: %s", source["name"], exc)
 
-    # Filter to last 48 hours (generous window to not miss slower days)
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
     recent = []
     for a in articles:
         if not a.get("title") or not a.get("url"):
             continue
-        if a["pub_date"] and a["pub_date"] < cutoff:
+        pd = a.get("pub_date")
+        if pd and pd < cutoff:
             continue
-        if not is_gaming_related(a["title"], a.get("summary", "")):
+        if not pd and max_age_hours < RSS_MAX_AGE_FORCE_HOURS:
             continue
+        if not passes_content_filter(a, relaxed=relaxed_filter):
+            continue
+        a["category"] = classify_rss_category(a["title"], a.get("summary", ""))
         recent.append(a)
 
     return recent
 
 # ──────────────────────── Giveaway Fetcher ────────────────────────────────────
 
-async def fetch_gamerpower_giveaways(client: httpx.AsyncClient) -> list[dict]:
-    """Fetch free game giveaways from GamerPower API (free, no key needed)."""
-    data = await fetch_url(client, GAMERPOWER_URL)
+async def _fetch_gamerpower_platform(
+    client: httpx.AsyncClient, api_url: str, platform_label: str,
+) -> list[dict]:
+    data = await fetch_url(client, api_url)
     if not data:
         return []
     try:
@@ -436,13 +816,15 @@ async def fetch_gamerpower_giveaways(client: httpx.AsyncClient) -> list[dict]:
     except json.JSONDecodeError:
         return []
 
-    giveaways = []
-    for item in items[:20]:
+    pending: list[dict] = []
+    for item in items[:8]:
         if item.get("status") != "Active":
             continue
         title    = item.get("title", "")
         desc     = clean_html(item.get("description", ""))
-        url      = item.get("open_giveaway_url") or item.get("giveaway_url", "")
+        url      = normalize_article_url(
+            item.get("open_giveaway_url") or item.get("giveaway_url") or ""
+        )
         image    = item.get("image", "")
         platform = item.get("platforms", "PC")
         worth    = item.get("worth", "")
@@ -453,18 +835,50 @@ async def fetch_gamerpower_giveaways(client: httpx.AsyncClient) -> list[dict]:
 
         summary = f"{desc[:300]}{worth_str}{end_str}" if desc else f"{worth_str}{end_str}"
 
-        giveaways.append({
+        pending.append({
             "title":    title,
             "url":      url,
             "summary":  summary,
             "image":    image,
-            "platform": platform.lower(),
-            "source":   "GamerPower",
+            "platform": platform_label,
+            "source":   f"GamerPower ({platform_label})",
             "category": "giveaway",
             "pub_date": datetime.now(timezone.utc),
             "image_fallback": "https://www.gamerpower.com/images/gamerpower-logo.png",
         })
+
+    giveaways: list[dict] = []
+    if pending:
+        resolved = await asyncio.gather(
+            *[resolve_final_url(client, g["url"]) for g in pending],
+            return_exceptions=True,
+        )
+        for g, final in zip(pending, resolved):
+            if isinstance(final, str) and final:
+                g["url"] = normalize_store_url(final)
+            if g.get("url") and is_ps_xbox_giveaway(g):
+                giveaways.append(g)
+            elif g.get("url"):
+                log.debug("Giveaway skipped (not PS/Xbox store): %s", g.get("title", "")[:50])
+            else:
+                log.warning("Giveaway skipped (no store URL): %s", g.get("title", "")[:50])
+
     return giveaways
+
+async def fetch_ps_xbox_giveaways(client: httpx.AsyncClient) -> list[dict]:
+    """Безкоштовні ігри лише PlayStation / Xbox."""
+    ps, xbox = await asyncio.gather(
+        _fetch_gamerpower_platform(client, GAMERPOWER_PS, "PlayStation"),
+        _fetch_gamerpower_platform(client, GAMERPOWER_XBOX, "Xbox"),
+        return_exceptions=True,
+    )
+    merged: list[dict] = []
+    for batch in (ps, xbox):
+        if isinstance(batch, list):
+            merged.extend(batch)
+        elif isinstance(batch, Exception):
+            log.warning("GamerPower error: %s", batch)
+    return merged
 
 async def fetch_epic_free_games(client: httpx.AsyncClient) -> list[dict]:
     """Fetch free Epic Games Store games via their public promotions API."""
@@ -501,8 +915,9 @@ async def fetch_epic_free_games(client: httpx.AsyncClient) -> list[dict]:
             continue
 
         title = el.get("title", "")
-        slug  = el.get("productSlug") or el.get("urlSlug") or ""
-        url   = f"https://store.epicgames.com/uk/p/{slug}" if slug else "https://store.epicgames.com/uk/free-games"
+        if "mystery" in title.lower():
+            continue
+        url   = epic_store_url(el)
         desc  = clean_html(el.get("description", ""))
 
         image = ""
@@ -529,6 +944,8 @@ async def fetch_epic_free_games(client: httpx.AsyncClient) -> list[dict]:
             "pub_date": datetime.now(timezone.utc),
             "image_fallback": "https://store.epicgames.com/static/images/og-epic-games-store.png",
         })
+        if len(games) >= 3:
+            break
     return games
 
 async def fetch_steam_free_games(client: httpx.AsyncClient) -> list[dict]:
@@ -547,7 +964,7 @@ async def fetch_steam_free_games(client: httpx.AsyncClient) -> list[dict]:
 
     games = []
     specials = payload.get("specials", {}).get("items", [])
-    for item in specials[:5]:
+    for item in specials[:3]:
         if item.get("final_price", 1) != 0:
             continue
         title = item.get("name", "")
@@ -570,17 +987,18 @@ async def fetch_steam_free_games(client: httpx.AsyncClient) -> list[dict]:
 # ──────────────────────── RAWG Releases Fetcher ───────────────────────────────
 
 async def fetch_rawg_releases(client: httpx.AsyncClient) -> list[dict]:
-    """Fetch upcoming/new game releases from RAWG API."""
+    """Релізи цього місяця — лише PlayStation / Xbox (RAWG)."""
     if not RAWG_KEY:
         return []
-    today    = datetime.now(timezone.utc).date()
-    in_7days = today + timedelta(days=7)
+    today = datetime.now(timezone.utc).date()
+    in_range = today + timedelta(days=45)  # поточний + наступний місяць
     url = (
         f"https://api.rawg.io/api/games"
         f"?key={RAWG_KEY}"
-        f"&dates={today},{in_7days}"
-        f"&ordering=-added"
-        f"&page_size=10"
+        f"&dates={today},{in_range}"
+        f"&platforms=187,186,1,18"
+        f"&ordering=released"
+        f"&page_size=15"
     )
     data = await fetch_url(client, url)
     if not data:
@@ -592,22 +1010,29 @@ async def fetch_rawg_releases(client: httpx.AsyncClient) -> list[dict]:
 
     releases = []
     for game in payload.get("results", []):
+        plat_names = [
+            p["platform"]["name"]
+            for p in game.get("platforms", [])
+            if p.get("platform")
+        ]
+        plat_lower = " ".join(plat_names).lower()
+        if not any(px in plat_lower for px in RAWG_PS_XBOX):
+            continue
+
         title    = game.get("name", "")
         slug     = game.get("slug", "")
         rel_date = game.get("released", "")
         rating   = game.get("metacritic")
         image    = game.get("background_image", "")
-        url      = f"https://rawg.io/games/{slug}" if slug else "https://rawg.io"
+        game_url = f"https://rawg.io/games/{slug}" if slug else "https://rawg.io"
 
-        platforms = ", ".join(
-            p["platform"]["name"] for p in game.get("platforms", [])[:4]
-        )
+        platforms = ", ".join(plat_names[:4])
         rating_str   = f"⭐ Metacritic: {rating}\n" if rating else ""
-        platform_str = f"🖥️ Платформи: {platforms}\n" if platforms else ""
+        platform_str = f"🎮 Платформи: {platforms}\n" if platforms else ""
 
         releases.append({
             "title":    f"🚀 Реліз: {title}",
-            "url":      url,
+            "url":      game_url,
             "summary":  f"{rating_str}{platform_str}📅 Дата виходу: {rel_date}",
             "image":    image,
             "source":   "RAWG",
@@ -617,13 +1042,70 @@ async def fetch_rawg_releases(client: httpx.AsyncClient) -> list[dict]:
         })
     return releases
 
-# ──────────────────────── Gemini AI Rewriter ─────────────────────────────────
+# ──────────────────────── Hashtags ─────────────────────────────────────────────
 
-def _gemini_rewrite(title: str, summary: str, category: str, source: str, url: str) -> Optional[str]:
-    """
-    Use Gemini Flash to rewrite an article into an engaging Ukrainian Telegram post.
-    Returns the rewritten text, or None on failure (caller falls back to plain format).
-    """
+BASE_HASHTAGS = ("#PlayStation", "#Xbox", "#Gaming")
+
+def pick_hashtags(article: dict) -> str:
+    """2–4 хештеги (однакові для UA та RU блоків)."""
+    tags = list(BASE_HASHTAGS)
+    blob = f"{article.get('title', '')} {article.get('url', '')} {article.get('platform', '')}".lower()
+    if any(x in blob for x in ("ps plus", "ps+", "playstation plus")):
+        tags.append("#PSPlus")
+    if any(x in blob for x in ("playstation", "ps4", "ps5", "ps ")):
+        tags.append("#PS5")
+    if any(x in blob for x in ("game pass", "xbox")):
+        tags.append("#GamePass")
+    elif "nintendo" in blob or "switch" in blob:
+        tags.append("#Nintendo")
+    elif "epic" in blob:
+        tags.append("#EpicGames")
+    elif "steam" in blob:
+        tags.append("#Steam")
+    return " ".join(tags[:4])
+
+def _clip(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+# ──────────────────────── Gemini: bilingual post template ─────────────────────
+
+_POST_JSON_KEYS = (
+    "title_ua", "title_ru", "facts_ua", "facts_ru",
+    "description_ua", "description_ru", "opinion_ua", "opinion_ru",
+    "hashtags",
+)
+
+def cyrillic_ratio(text: str) -> float:
+    letters = [c for c in (text or "") if c.isalpha()]
+    if not letters:
+        return 0.0
+    cyr = sum(1 for c in letters if "\u0400" <= c <= "\u04FF")
+    return cyr / len(letters)
+
+def is_mostly_english(text: str) -> bool:
+    t = (text or "").strip()
+    if len(t) < 12:
+        return False
+    return cyrillic_ratio(t) < 0.35
+
+def content_is_fully_localized(content: dict, min_ratio: float = 0.35) -> bool:
+    for key in (
+        "title_ua", "title_ru", "description_ua", "description_ru",
+        "opinion_ua", "opinion_ru",
+    ):
+        val = (content.get(key) or "").strip()
+        if not val or cyrillic_ratio(val) < min_ratio:
+            return False
+    return True
+
+def _gemini_bilingual_post(
+    title: str, summary: str, category: str, source: str, url: str,
+    *, strict: bool = False,
+) -> Optional[dict]:
+    """Повертає структурований пост UA+RU для єдиного шаблону."""
     if not GEMINI_KEY:
         return None
     try:
@@ -634,30 +1116,41 @@ def _gemini_rewrite(title: str, summary: str, category: str, source: str, url: s
         return None
 
     cat_hints = {
-        "giveaway": "Це безкоштовна роздача гри. Зроби акцент на тому, що гра безкоштовна, і що треба поспішати.",
-        "release":  "Це новина про реліз або дату виходу гри. Підкресли дату і платформи.",
-        "update":   "Це патч або оновлення гри. Коротко перелічи найцікавіше що додали/виправили.",
-        "news":     "Це загальна ігрова новина. Подай її захопливо.",
+        "giveaway": "Безкоштовна роздача. Акцент: забери гру безкоштовно, обмежений час.",
+        "release":  "Реліз або дата виходу. Вкажи дату та платформи у facts.",
+        "update":   "Патч/DLC. У facts — що змінилось.",
+        "trailer":  "Трейлер. У facts — гра та платформи.",
+        "news":     "Ігрова новина. Коротко та цікаво.",
     }
     hint = cat_hints.get(category, cat_hints["news"])
+    strict_note = (
+        "\nКРИТИЧНО: усі поля ЛИШЕ українською або російською. "
+        "Заборонено залишати англійські речення з оригіналу."
+        if strict
+        else ""
+    )
 
-    prompt = f"""Ти — редактор україномовного Telegram-каналу про відеоігри.
-Твоє завдання: перетворити нижченаведену англомовну новину на короткий, живий пост УКРАЇНСЬКОЮ мовою для Telegram-каналу.
+    prompt = f"""Ти — редактор Telegram-каналу про PlayStation, PS Plus та Xbox / Game Pass.
+Переклади та адаптуй новину у ДВОХ мовах. Жодного англійського тексту в полях JSON.{strict_note}
 
-Правила:
-1. Пиши виключно УКРАЇНСЬКОЮ мовою.
-2. Починай одразу з суті — без вступних фраз типу "Ось новина" або "Привіт".
-3. Обсяг: 2–4 речення (максимум 300 символів тексту без заголовку).
-4. Додавай 1–2 доречних емодзі в тексті — не переборщуй.
-5. НЕ додавай посилань, хештегів, підписів "#реклама" чи будь-яких HTML-тегів — тільки чистий текст.
-6. НЕ вигадуй деталей яких немає в оригіналі.
-7. {hint}
+Контекст: {hint}
 
-Оригінальний заголовок: {title}
-Короткий опис: {summary[:600] if summary else '(немає)'}
+Оригінал (англійською — переклади повністю):
+Заголовок: {title}
+Опис: {summary[:700] if summary else '(немає)'}
 Джерело: {source}
 
-Виведи ТІЛЬКИ готовий текст посту українською — без жодних пояснень, заголовків чи обгортки."""
+Поверни JSON:
+- title_ua, title_ru — короткий заголовок КИРИЛИЦЕЮ (до 100 символів), переклад з англійського
+- facts_ua, facts_ru — 2–4 пункти через "• " (дата, PS Plus / Game Pass, платформи)
+- description_ua, description_ru — 2–3 речення КИРИЛИЦЕЮ, суть новини
+- opinion_ua, opinion_ru — 1–2 речення думки редактора КИРИЛИЦЕЮ
+- hashtags — 2–4 хештеги
+
+Правила:
+- title_ua — українська, title_ru — російська; не копіюй англійський заголовок.
+- description та opinion — тільки кирилиця, без англійських фраз.
+- Не вигадуй фактів. Без URL у полях."""
 
     try:
         client = genai.Client(api_key=GEMINI_KEY)
@@ -665,125 +1158,261 @@ def _gemini_rewrite(title: str, summary: str, category: str, source: str, url: s
             model=GEMINI_MODEL,
             contents=prompt,
             config=gtypes.GenerateContentConfig(
-                max_output_tokens=400,
-                temperature=0.7,
+                max_output_tokens=1400,
+                temperature=0.75,
+                response_mime_type="application/json",
             ),
         )
-        text = (response.text or "").strip()
-        if len(text) < 20:
+        raw = (response.text or "").strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+        data = json.loads(raw)
+        if not isinstance(data, dict):
             return None
-        return text
+        article_stub = {"title": title, "url": url, "category": category, "source": source}
+        return normalize_post_content(data, article_stub)
     except Exception as exc:
-        log.warning("Gemini rewrite failed: %s", exc)
+        log.warning("Gemini bilingual post failed: %s", exc)
         return None
 
+def normalize_post_content(content: dict, article: dict) -> dict:
+    """Гарантує повний шаблон UA/RU без англійських вставок."""
+    out = {k: str(content.get(k) or "").strip() for k in _POST_JSON_KEYS}
 
-# ──────────────────────── Message Formatter ───────────────────────────────────
+    if is_mostly_english(out["title_ua"]):
+        out["title_ua"] = ""
+    if is_mostly_english(out["title_ru"]):
+        out["title_ru"] = ""
+    if is_mostly_english(out["description_ua"]):
+        out["description_ua"] = ""
+    if is_mostly_english(out["description_ru"]):
+        out["description_ru"] = ""
 
-def format_post(article: dict, ai_body: Optional[str] = None) -> str:
-    cat      = article.get("category", "news")
-    emoji    = CATEGORY_EMOJI.get(cat, "🎮")
-    source   = article.get("source", "")
-    title    = article.get("title", "Без назви")
-    summary  = article.get("summary", "")
-    url      = article.get("url", "")
+    if not out["title_ua"]:
+        out["title_ua"] = "Ігрова новина PS / Xbox"
+    out["title_ua"] = _clip(out["title_ua"], 120)
+    if not out["title_ru"]:
+        out["title_ru"] = "Новость PS / Xbox"
+    out["title_ru"] = _clip(out["title_ru"], 120)
 
-    # Platform emoji for giveaways
-    platform = article.get("platform", "")
-    plat_em  = PLATFORM_EMOJI.get(platform, "") if platform else ""
+    if not out["facts_ua"]:
+        out["facts_ua"] = f"• Джерело: {article.get('source', '—')}"
+    if not out["facts_ru"]:
+        out["facts_ru"] = f"• Источник: {article.get('source', '—')}"
 
-    lines = []
-    lines.append(f"{emoji}{plat_em} <b>{title}</b>")
-    lines.append("")
+    if not out["description_ua"]:
+        out["description_ua"] = "Деталі новини — за посиланням нижче."
+    if not out["description_ru"]:
+        out["description_ru"] = "Подробности новости — по ссылке ниже."
 
-    if ai_body:
-        lines.append(ai_body)
-    elif summary:
-        lines.append(summary[:600])
+    if not out["opinion_ua"] or is_mostly_english(out["opinion_ua"]):
+        out["opinion_ua"] = "На мій погляд, це варта уваги новина для власників консолі."
+    if not out["opinion_ru"] or is_mostly_english(out["opinion_ru"]):
+        out["opinion_ru"] = "На мой взгляд, это стоит внимания владельцам консоли."
 
-    if url:
-        lines.append("")
-        lines.append(f"🔗 <a href='{url}'>Читати повністю</a>")
+    out["hashtags"] = out["hashtags"] or pick_hashtags(article)
+    return out
 
-    if source:
-        lines.append(f"\n📰 <i>Джерело: {source}</i>")
+def is_valid_bilingual_post(text: str, min_ratio: float = 0.35) -> bool:
+    if "🇺🇦" not in text or "🇷🇺" not in text:
+        return False
+    if "Твоя думка" not in text or "Твоё мнение" not in text:
+        return False
+    if "Заклик до дії" in text or "Призыв к действию" in text:
+        return False
+    if "#" not in text:
+        return False
+    parts = text.split("🇷🇺", 1)
+    ua_part, ru_part = parts[0], parts[1] if len(parts) > 1 else ""
+    return cyrillic_ratio(ua_part) >= min_ratio and cyrillic_ratio(ru_part) >= min_ratio
 
-    text = "\n".join(lines)
-    return truncate(text, 1024)
+def _generate_bilingual_content(article: dict, *, force: bool = False) -> Optional[dict]:
+    """Gemini з повтором; force — м'якша перевірка мови для гарантії поста."""
+    title = article.get("title", "")
+    summary = article.get("summary", "")
+    category = article.get("category", "news")
+    source = article.get("source", "")
+    url = article.get("url", "")
+    min_ratio = 0.25 if force else 0.35
+
+    if not GEMINI_KEY:
+        log.warning("GEMINI_KEY не заданий — пост пропущено: %s", title[:50])
+        return None
+
+    attempts = (False, True, True) if force else (False, True)
+    for strict in attempts:
+        content = _gemini_bilingual_post(
+            title, summary, category, source, url, strict=strict,
+        )
+        if content:
+            content = normalize_post_content(content, article)
+            if content_is_fully_localized(content, min_ratio=min_ratio):
+                return content
+            log.warning("Gemini not localized (strict=%s, force=%s): %s", strict, force, title[:50])
+    return None
+
+def build_bilingual_post(article: dict, content: dict) -> str:
+    """Єдиний шаблон: UA блок → роздільник → RU блок → хештеги."""
+    url = normalize_store_url(article.get("url", ""))
+    cat = article.get("category", "news")
+    emoji = CATEGORY_EMOJI.get(cat, "🎮")
+    hashtags = (content.get("hashtags") or pick_hashtags(article)).strip()
+
+    ua_block = f"""🇺🇦 Українська версія
+
+{emoji} {content.get('title_ua', '')}
+
+📌 Ключові факти:
+{content.get('facts_ua', '—')}
+
+📰 Опис:
+{content.get('description_ua', '')}
+
+💭 Твоя думка:
+{content.get('opinion_ua', '')}
+
+🔗 Посилання:
+{url}
+
+# Хештеги:
+{hashtags}"""
+
+    ru_block = f"""🇷🇺 Русская версия
+
+{emoji} {content.get('title_ru', '')}
+
+📌 Ключевые факты:
+{content.get('facts_ru', '—')}
+
+📰 Описание:
+{content.get('description_ru', '')}
+
+💭 Твоё мнение:
+{content.get('opinion_ru', '')}
+
+🔗 Ссылка:
+{url}
+
+# Хештеги:
+{hashtags}"""
+
+    separator = "\n\n" + "─" * 22 + "\n\n"
+    text = f"{ua_block}{separator}{ru_block}"
+
+    if len(text) > TEXT_MESSAGE_MAX:
+        for key in ("description_ua", "description_ru", "facts_ua", "facts_ru"):
+            content[key] = _clip(str(content.get(key, "")), 180)
+        return build_bilingual_post(article, content)
+
+    return text
 
 # ──────────────────────── Telegram Poster ─────────────────────────────────────
 
-async def send_post(bot: Bot, article: dict, conn: sqlite3.Connection) -> bool:
+async def finalize_article_url(client: httpx.AsyncClient, article: dict) -> None:
+    """Ensure article URL is the final store/article page before posting."""
+    url = normalize_store_url(article.get("url", ""))
+    if not url or "gamerpower.com" in url:
+        resolved = await resolve_final_url(client, article.get("url", "") or url)
+        url = normalize_store_url(resolved)
+    article["url"] = url
+
+async def send_post(
+    bot: Bot,
+    article: dict,
+    conn: sqlite3.Connection,
+    client: Optional[httpx.AsyncClient] = None,
+    *,
+    force: bool = False,
+) -> bool:
     """Send a single article as a Telegram post. Returns True on success."""
-    h = make_hash(article.get("url", ""), article.get("title", ""))
+    if client:
+        await finalize_article_url(client, article)
+
+    url   = normalize_store_url(article.get("url", ""))
+    title = article.get("title", "")
+    if not url:
+        log.warning("Skip post without valid URL: %s", title[:60])
+        return False
+
+    h = make_hash(url, title)
     if is_posted(conn, h):
         return False
 
-    # Run Gemini rewrite in a thread (blocking SDK call) so we don't block the event loop
-    ai_body: Optional[str] = None
-    if GEMINI_KEY:
-        loop = asyncio.get_event_loop()
-        try:
-            ai_body = await loop.run_in_executor(
-                None,
-                _gemini_rewrite,
-                article.get("title", ""),
-                article.get("summary", ""),
-                article.get("category", "news"),
-                article.get("source", ""),
-                article.get("url", ""),
-            )
-            if ai_body:
-                log.info("Gemini rewrote: %s", article.get("title", "")[:60])
-        except Exception as exc:
-            log.warning("Gemini executor error: %s", exc)
+    min_ratio = 0.25 if force else 0.35
+    loop = asyncio.get_event_loop()
+    try:
+        content = await loop.run_in_executor(
+            None, lambda: _generate_bilingual_content(article, force=force),
+        )
+    except Exception as exc:
+        log.warning("Gemini executor error: %s", exc)
+        content = None
 
-    caption = format_post(article, ai_body=ai_body)
-    image   = article.get("image") or article.get("image_fallback") or ""
-    url     = article.get("url", "")
-    title   = article.get("title", "")
+    if not content:
+        log.warning("Skip post (no UA/RU translation, force=%s): %s", force, title[:60])
+        return False
+
+    text = build_bilingual_post(article, content)
+    if not is_valid_bilingual_post(text, min_ratio=min_ratio):
+        log.warning("Skip post (invalid template, force=%s): %s", force, title[:60])
+        return False
+
+    image = article.get("image") or article.get("image_fallback") or ""
+    send_kw = {"chat_id": CHANNEL_ID}
+    full_text = text[:TEXT_MESSAGE_MAX]
 
     try:
+        # Повний пост текстом (UA+RU) — не обрізаний підпис до фото
+        await bot.send_message(
+            text=full_text,
+            disable_web_page_preview=True,
+            **send_kw,
+        )
         if image:
-            await bot.send_photo(
-                chat_id    = CHANNEL_ID,
-                photo      = image,
-                caption    = caption,
-                parse_mode = ParseMode.HTML,
-            )
-        else:
-            # No image — send as text with a link preview
-            await bot.send_message(
-                chat_id             = CHANNEL_ID,
-                text                = caption,
-                parse_mode          = ParseMode.HTML,
-                disable_web_page_preview = False,
-            )
+            try:
+                await bot.send_photo(
+                    photo=image,
+                    caption=f"🖼 {content.get('title_ua', title)[:100]}",
+                    **send_kw,
+                )
+            except TelegramError as img_exc:
+                log.warning("Photo attach failed (text post OK): %s", img_exc)
+
         mark_posted(conn, h, title, url, article.get("category", "news"), article.get("source", ""))
-        log.info("Posted: [%s] %s", article.get("category"), title[:80])
+        log.info(
+            "Posted v%s bilingual [%s] %s | %d chars | localized:%s",
+            BOT_VERSION,
+            article.get("category"),
+            title[:50],
+            len(full_text),
+            content_is_fully_localized(content),
+        )
         return True
     except TelegramError as exc:
         log.error("Telegram error posting '%s': %s", title[:60], exc)
-        # If image caused error — retry as text-only
-        if image:
-            try:
-                await bot.send_message(
-                    chat_id    = CHANNEL_ID,
-                    text       = caption,
-                    parse_mode = ParseMode.HTML,
-                    disable_web_page_preview=False,
-                )
-                mark_posted(conn, h, title, url, article.get("category", "news"), article.get("source", ""))
-                return True
-            except TelegramError as exc2:
-                log.error("Retry without image also failed: %s", exc2)
         return False
 
 # ──────────────────────── Dedup & Priority Sort ───────────────────────────────
 
+def _dedup_key(a: dict) -> str:
+    """Collapse same game from GamerPower + Epic/Steam APIs."""
+    url = (a.get("url") or "").lower()
+    m = re.search(r"steampowered\.com/app/(\d+)", url)
+    if m:
+        return f"steam:{m.group(1)}"
+    m = re.search(r"epicgames\.com/(?:uk/)?p/([\w\-]+)", url)
+    if m and m.group(1) not in ("[]",):
+        return f"epic:{m.group(1)}"
+    m = re.search(r"gog\.com/game/([\w\-_]+)", url)
+    if m:
+        return f"gog:{m.group(1)}"
+    title_key = re.sub(r"[^a-zA-Z0-9]", "", (a.get("title") or "")).lower()[:50]
+    return f"{a.get('category')}:{title_key}"
+
 def deduplicate(articles: list[dict], conn: sqlite3.Connection) -> list[dict]:
     seen_hashes = set()
-    seen_titles = set()
+    seen_keys = set()
     result = []
     for a in articles:
         h = make_hash(a.get("url", ""), a.get("title", ""))
@@ -791,43 +1420,30 @@ def deduplicate(articles: list[dict], conn: sqlite3.Connection) -> list[dict]:
             continue
         if h in seen_hashes:
             continue
-        # Fuzzy title dedup — skip nearly identical titles
-        title_key = re.sub(r"[^a-zA-Z0-9А-ЯҐЄІЇа-яґєії]", "", a.get("title", "")).lower()[:60]
-        if title_key and title_key in seen_titles:
+        dkey = _dedup_key(a)
+        if dkey in seen_keys:
             continue
         seen_hashes.add(h)
-        seen_titles.add(title_key)
+        seen_keys.add(dkey)
         result.append(a)
     return result
 
-CATEGORY_PRIORITY = {"giveaway": 0, "release": 1, "news": 2, "update": 3}
-
-def prioritize(articles: list[dict]) -> list[dict]:
-    """Sort articles: giveaways first, then releases, then news. Newest first within category."""
-    def sort_key(a):
-        cat_p = CATEGORY_PRIORITY.get(a.get("category", "news"), 5)
-        pd    = a.get("pub_date")
-        ts    = pd.timestamp() if pd else 0
-        return (cat_p, -ts)
-    return sorted(articles, key=sort_key)
-
 # ──────────────────────── Main Polling Loop ───────────────────────────────────
 
-async def collect_all_news(client: httpx.AsyncClient) -> list[dict]:
-    """Fetch all sources concurrently and return merged article list."""
-    tasks = []
-
-    # RSS feeds
-    for source in RSS_SOURCES:
-        tasks.append(fetch_rss(client, source))
-
-    # Giveaways
-    tasks.append(fetch_gamerpower_giveaways(client))
-    tasks.append(fetch_epic_free_games(client))
-    tasks.append(fetch_steam_free_games(client))
-
-    # Upcoming releases
-    tasks.append(fetch_rawg_releases(client))
+async def collect_all_news(
+    client: httpx.AsyncClient,
+    *,
+    max_age_hours: int = RSS_MAX_AGE_HOURS,
+    relaxed_filter: bool = False,
+) -> list[dict]:
+    """PS/Xbox RSS + релізи; роздачі лише PS/Xbox (вибір у select_articles_for_cycle)."""
+    tasks = [
+        fetch_rss(client, source, max_age_hours, relaxed_filter=relaxed_filter)
+        for source in RSS_SOURCES
+    ]
+    tasks.append(fetch_ps_xbox_giveaways(client))
+    if RAWG_KEY:
+        tasks.append(fetch_rawg_releases(client))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -851,55 +1467,79 @@ async def run_bot():
 
     try:
         me = await bot.get_me()
-        log.info("Bot started: @%s | Channel: %s", me.username, CHANNEL_ID)
+        log.info("Bot started v%s: @%s | Channel: %s", BOT_VERSION, me.username, CHANNEL_ID)
     except TelegramError as exc:
         log.error("Cannot connect to Telegram: %s", exc)
         return
 
-    # Track last time we actually posted (for the fallback mechanism)
-    last_post_time: float = time.time() - (FALLBACK_HOURS * 3600 / 2)
-
+    log.info(
+        "Limits: gap %dh, max %d/day, min %d/day | force after %dh | RSS %dh/%dh h",
+        NEWS_MIN_POST_GAP // 3600, MAX_POSTS_PER_DAY, MIN_POSTS_PER_DAY,
+        FORCE_POST_AFTER_HOURS, RSS_MAX_AGE_HOURS, RSS_MAX_AGE_FORCE_HOURS,
+    )
     log.info("Starting polling loop — check interval: %d min", CHECK_INTERVAL // 60)
 
-    async with httpx.AsyncClient(
-        headers={"User-Agent": "GamingNewsBot/1.0 (Telegram Channel Bot)"},
-        timeout=30,
-    ) as client:
+    async with httpx.AsyncClient(headers=_BROWSER_HEADERS, timeout=30) as client:
         while True:
             try:
-                log.info("Fetching all news sources...")
-                articles = await collect_all_news(client)
-                articles = deduplicate(articles, conn)
-                articles = prioritize(articles)
+                force_mode = should_force_post(conn)
+                relaxed = force_mode or needs_daily_post(conn)
+                rss_hours = RSS_MAX_AGE_FORCE_HOURS if force_mode else RSS_MAX_AGE_HOURS
 
-                log.info("Found %d new articles after dedup", len(articles))
+                log.info(
+                    "Fetching sources (rss %dh, relaxed=%s, force=%s, posts_24h=%d)...",
+                    rss_hours, relaxed, force_mode, posts_last_24h(conn),
+                )
+                articles = await collect_all_news(
+                    client, max_age_hours=rss_hours, relaxed_filter=relaxed,
+                )
+                articles = deduplicate(articles, conn)
+
+                platform_queued = sum(
+                    1 for a in articles
+                    if a.get("category") in CONTENT_CATEGORIES
+                    and passes_content_filter(a, relaxed=relaxed)
+                )
+                log.info(
+                    "Queue: %d total | PS/Xbox content: %d | giveaways: %d",
+                    len(articles),
+                    platform_queued,
+                    sum(1 for a in articles if a.get("category") == "giveaway"),
+                )
 
                 hours_since = hours_since_last_post(conn)
-                is_fallback = hours_since >= FALLBACK_HOURS
-                post_count  = 0
-                max_posts_per_cycle = 5  # don't spam
+                gap_sec = effective_post_gap_seconds(conn)
+                must_post = force_mode or hours_since * 3600 >= gap_sec
 
-                for article in articles:
-                    if post_count >= max_posts_per_cycle:
-                        break
+                if not must_post:
+                    log.info(
+                        "Skip cycle: %.1f h since last (gap %d h, need daily=%s)",
+                        hours_since, gap_sec // 3600, needs_daily_post(conn),
+                    )
+                else:
+                    if force_mode:
+                        log.info(
+                            "Daily guarantee: %.1f h without post, %d posts in 24h",
+                            hours_since, posts_last_24h(conn),
+                        )
 
-                    # Respect minimum gap between posts (except on fallback)
-                    if post_count > 0 and not is_fallback:
-                        await asyncio.sleep(MIN_POST_GAP)
+                    candidates = select_articles_for_cycle(articles, conn, force=force_mode)
+                    post_count = 0
+                    for article in candidates:
+                        posted = await send_post(
+                            bot, article, conn, client, force=force_mode,
+                        )
+                        if posted:
+                            post_count += 1
+                            break
 
-                    posted = await send_post(bot, article, conn)
-                    if posted:
-                        post_count += 1
-                        last_post_time = time.time()
-                        is_fallback = False
-                        # Small delay between consecutive posts in same cycle
-                        if post_count < max_posts_per_cycle:
-                            await asyncio.sleep(5)
+                    if post_count == 0:
+                        log.warning(
+                            "Nothing posted (candidates=%d, force=%s) — check GEMINI_KEY / queue",
+                            len(candidates), force_mode,
+                        )
 
-                if post_count == 0 and is_fallback:
-                    log.warning("No new news found — hours since last post: %.1f h", hours_since)
-
-                log.info("Cycle done. Posted: %d. Next check in %d min.", post_count, CHECK_INTERVAL // 60)
+                log.info("Cycle done. Next check in %d min.", CHECK_INTERVAL // 60)
 
             except Exception as exc:
                 log.error("Unexpected error in main loop: %s", exc, exc_info=True)
