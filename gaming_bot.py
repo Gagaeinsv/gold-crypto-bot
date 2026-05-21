@@ -1,5 +1,5 @@
 """
-Gaming News Telegram Channel Bot (v2.0.1)
+Gaming News Telegram Channel Bot (v2.0.2)
 -----------------------------------------
 Фокус: PlayStation, PS Plus, Xbox / Game Pass — ігри місяця, підписки, релізи.
 Пости: шаблон UA + RU (Gemini). Кілька разів на день, без спаму.
@@ -48,7 +48,7 @@ GEMINI_KEY      = os.getenv("GEMINI_KEY", "")             # https://aistudio.goo
 ADMIN_ID        = int(os.getenv("ADMIN_ID", "0"))
 
 GEMINI_MODEL    = "gemini-2.5-flash"
-BOT_VERSION     = "2.0.1"
+BOT_VERSION     = "2.0.2"
 
 def _env_int(key: str, default: int) -> int:
     try:
@@ -66,7 +66,12 @@ MAX_GIVEAWAYS_PER_DAY  = _env_int("MAX_GIVEAWAYS_PER_DAY", 1)
 MAX_GIVEAWAYS_PER_WEEK = _env_int("MAX_GIVEAWAYS_PER_WEEK", 2)
 MIN_HOURS_BETWEEN_GIVEAWAYS = _env_int("MIN_HOURS_BETWEEN_GIVEAWAYS", 48)
 GIVEAWAY_IF_NO_NEWS_HOURS = _env_int("GIVEAWAY_IF_NO_NEWS_HOURS", 24)  # роздача лише якщо N год без новин
-FALLBACK_HOURS  = _env_int("FALLBACK_HOURS", 72)
+MIN_POSTS_PER_DAY = _env_int("MIN_POSTS_PER_DAY", 1)           # мінімум постів на добу
+FORCE_POST_AFTER_HOURS = _env_int("FORCE_POST_AFTER_HOURS", 20)  # якщо стільки год без поста — обовʼязково
+RSS_MAX_AGE_HOURS = _env_int("RSS_MAX_AGE_HOURS", 48)
+RSS_MAX_AGE_FORCE_HOURS = _env_int("RSS_MAX_AGE_FORCE_HOURS", 168)  # 7 днів у «голодному» режимі
+FALLBACK_HOURS  = _env_int("FALLBACK_HOURS", 20)
+MAX_CANDIDATES_FORCE = 8
 PHOTO_CAPTION_MAX = 1024
 TEXT_MESSAGE_MAX  = 4000
 
@@ -283,13 +288,37 @@ def is_platform_focus_article(article: dict) -> bool:
         return True
     return False
 
-def passes_content_filter(article: dict) -> bool:
-    """Джерела PS/Xbox — ширше; Eurogamer/VG247 — лише за ключовими словами."""
+def passes_content_filter(article: dict, *, relaxed: bool = False) -> bool:
+    """Джерела PS/Xbox — ширше; Eurogamer/VG247 — за ключовими словами (relaxed — м'якше)."""
     if is_junk_article(article):
         return False
     if article.get("source") in _PS_XBOX_RSS_SOURCES:
         return True
+    if relaxed and is_gaming_related(article.get("title", ""), article.get("summary", "")):
+        blob = article_text_blob(article)
+        if any(k in blob for k in ("playstation", "ps5", "ps4", "xbox", "game pass", "ps plus")):
+            return True
     return is_platform_focus_article(article)
+
+def posts_last_24h(conn: sqlite3.Connection) -> int:
+    return count_posts_since(conn, 24)
+
+def needs_daily_post(conn: sqlite3.Connection) -> bool:
+    return posts_last_24h(conn) < MIN_POSTS_PER_DAY
+
+def is_starving(conn: sqlite3.Connection) -> bool:
+    return hours_since_last_post(conn) >= FORCE_POST_AFTER_HOURS
+
+def effective_post_gap_seconds(conn: sqlite3.Connection) -> int:
+    """Якщо давно не було поста — скорочуємо паузу для гарантії MIN_POSTS_PER_DAY."""
+    if needs_daily_post(conn) and is_starving(conn):
+        return 0
+    if needs_daily_post(conn):
+        return min(NEWS_MIN_POST_GAP, 2 * 3600)
+    return NEWS_MIN_POST_GAP
+
+def should_force_post(conn: sqlite3.Connection) -> bool:
+    return needs_daily_post(conn) and is_starving(conn)
 
 def platform_priority_score(article: dict) -> float:
     blob = article_text_blob(article)
@@ -400,49 +429,74 @@ def can_post_giveaway(conn: sqlite3.Connection) -> bool:
         return False
     return True
 
-def select_articles_for_cycle(articles: list[dict], conn: sqlite3.Connection) -> list[dict]:
+def select_articles_for_cycle(
+    articles: list[dict], conn: sqlite3.Connection, *, force: bool = False,
+) -> list[dict]:
     """
-    Спочатку новини PS / PS+ / Xbox. Роздача — лише якщо давно не було контент-постів.
+    Новини PS / PS+ / Xbox. force=True — розширений вибір для гарантії поста на день.
     """
-    if count_posts_since(conn, 24) >= MAX_POSTS_PER_DAY:
+    if not force and posts_last_24h(conn) >= MAX_POSTS_PER_DAY:
         log.info("Daily post cap reached (%d)", MAX_POSTS_PER_DAY)
         return []
-
-    content = [
-        a for a in articles
-        if a.get("category") in CONTENT_CATEGORIES and passes_content_filter(a)
-    ]
-    content = sort_platform_content(content)
 
     giveaways = [
         a for a in articles
         if a.get("category") == "giveaway" and is_ps_xbox_giveaway(a)
     ]
 
+    def _content(*, relaxed: bool) -> list[dict]:
+        return sort_platform_content([
+            a for a in articles
+            if a.get("category") in CONTENT_CATEGORIES
+            and passes_content_filter(a, relaxed=relaxed)
+        ])
+
+    content = _content(relaxed=False)
     if content:
-        pick = content[0]
         log.info(
             "Selected %s (score %.1f): %s",
-            pick.get("category"), platform_priority_score(pick), pick.get("title", "")[:55],
+            content[0].get("category"), platform_priority_score(content[0]),
+            content[0].get("title", "")[:55],
         )
-        return [pick]
+        return content[:MAX_CANDIDATES_FORCE if force else 1]
 
     hours_no_content = hours_since_last_content_post(conn)
-    if (
-        hours_no_content >= GIVEAWAY_IF_NO_NEWS_HOURS
-        and can_post_giveaway(conn)
-        and giveaways
-    ):
+    giveaway_ok = hours_no_content >= GIVEAWAY_IF_NO_NEWS_HOURS or force
+
+    if giveaway_ok and can_post_giveaway(conn) and giveaways:
         pick = pick_diverse_giveaway(giveaways, conn)
         if pick:
             log.info(
-                "Giveaway (no PS/Xbox news %.0fh): %s",
-                hours_no_content, pick.get("title", "")[:55],
+                "Giveaway (no PS/Xbox news %.0fh, force=%s): %s",
+                hours_no_content, force, pick.get("title", "")[:55],
             )
             return [pick]
 
-    if hours_no_content >= GIVEAWAY_IF_NO_NEWS_HOURS and giveaways:
-        log.info("Giveaway skipped (rate limit), queue has %d", len(giveaways))
+    if not force:
+        return []
+
+    relaxed = _content(relaxed=True)
+    if relaxed:
+        log.info("Force mode: relaxed PS/Xbox pick: %s", relaxed[0].get("title", "")[:55])
+        return relaxed[:MAX_CANDIDATES_FORCE]
+
+    ps_only = sort_platform_content([
+        a for a in articles
+        if a.get("source") in _PS_XBOX_RSS_SOURCES
+        and a.get("category") in CONTENT_CATEGORIES
+        and not is_junk_article(a)
+    ])
+    if ps_only:
+        log.info("Force mode: PS/Xbox RSS source: %s", ps_only[0].get("title", "")[:55])
+        return ps_only[:MAX_CANDIDATES_FORCE]
+
+    if giveaways:
+        pick = pick_diverse_giveaway(giveaways, conn)
+        if pick:
+            log.info("Force mode: giveaway fallback: %s", pick.get("title", "")[:55])
+            return [pick]
+
+    log.warning("Force mode: no candidates in queue (%d articles)", len(articles))
     return []
 
 # ──────────────────────── Helpers ─────────────────────────────────────────────
@@ -657,7 +711,13 @@ def parse_rss_date(date_str: Optional[str]) -> Optional[datetime]:
             pass
     return None
 
-async def fetch_rss(client: httpx.AsyncClient, source: dict) -> list[dict]:
+async def fetch_rss(
+    client: httpx.AsyncClient,
+    source: dict,
+    max_age_hours: int = RSS_MAX_AGE_HOURS,
+    *,
+    relaxed_filter: bool = False,
+) -> list[dict]:
     """Fetch and parse RSS feed. Returns list of article dicts."""
     data = await fetch_url(client, source["url"])
     if not data:
@@ -724,15 +784,17 @@ async def fetch_rss(client: httpx.AsyncClient, source: dict) -> list[dict]:
     except ET.ParseError as exc:
         log.warning("RSS parse error for %s: %s", source["name"], exc)
 
-    # Останні 48 год; лише PS / Xbox тематика
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
     recent = []
     for a in articles:
         if not a.get("title") or not a.get("url"):
             continue
-        if a["pub_date"] and a["pub_date"] < cutoff:
+        pd = a.get("pub_date")
+        if pd and pd < cutoff:
             continue
-        if not passes_content_filter(a):
+        if not pd and max_age_hours < RSS_MAX_AGE_FORCE_HOURS:
+            continue
+        if not passes_content_filter(a, relaxed=relaxed_filter):
             continue
         a["category"] = classify_rss_category(a["title"], a.get("summary", ""))
         recent.append(a)
@@ -1029,13 +1091,13 @@ def is_mostly_english(text: str) -> bool:
         return False
     return cyrillic_ratio(t) < 0.35
 
-def content_is_fully_localized(content: dict) -> bool:
+def content_is_fully_localized(content: dict, min_ratio: float = 0.35) -> bool:
     for key in (
         "title_ua", "title_ru", "description_ua", "description_ru",
         "opinion_ua", "opinion_ru",
     ):
         val = (content.get(key) or "").strip()
-        if not val or is_mostly_english(val):
+        if not val or cyrillic_ratio(val) < min_ratio:
             return False
     return True
 
@@ -1152,7 +1214,7 @@ def normalize_post_content(content: dict, article: dict) -> dict:
     out["hashtags"] = out["hashtags"] or pick_hashtags(article)
     return out
 
-def is_valid_bilingual_post(text: str) -> bool:
+def is_valid_bilingual_post(text: str, min_ratio: float = 0.35) -> bool:
     if "🇺🇦" not in text or "🇷🇺" not in text:
         return False
     if "Твоя думка" not in text or "Твоё мнение" not in text:
@@ -1163,29 +1225,31 @@ def is_valid_bilingual_post(text: str) -> bool:
         return False
     parts = text.split("🇷🇺", 1)
     ua_part, ru_part = parts[0], parts[1] if len(parts) > 1 else ""
-    return cyrillic_ratio(ua_part) >= 0.35 and cyrillic_ratio(ru_part) >= 0.35
+    return cyrillic_ratio(ua_part) >= min_ratio and cyrillic_ratio(ru_part) >= min_ratio
 
-def _generate_bilingual_content(article: dict) -> Optional[dict]:
-    """Gemini з повтором; без англомовного fallback."""
+def _generate_bilingual_content(article: dict, *, force: bool = False) -> Optional[dict]:
+    """Gemini з повтором; force — м'якша перевірка мови для гарантії поста."""
     title = article.get("title", "")
     summary = article.get("summary", "")
     category = article.get("category", "news")
     source = article.get("source", "")
     url = article.get("url", "")
+    min_ratio = 0.25 if force else 0.35
 
     if not GEMINI_KEY:
-        log.warning("GEMINI_KEY не заданий — пост без перекладу пропущено: %s", title[:50])
+        log.warning("GEMINI_KEY не заданий — пост пропущено: %s", title[:50])
         return None
 
-    for strict in (False, True):
+    attempts = (False, True, True) if force else (False, True)
+    for strict in attempts:
         content = _gemini_bilingual_post(
             title, summary, category, source, url, strict=strict,
         )
         if content:
             content = normalize_post_content(content, article)
-            if content_is_fully_localized(content):
+            if content_is_fully_localized(content, min_ratio=min_ratio):
                 return content
-            log.warning("Gemini post not localized (strict=%s): %s", strict, title[:50])
+            log.warning("Gemini not localized (strict=%s, force=%s): %s", strict, force, title[:50])
     return None
 
 def build_bilingual_post(article: dict, content: dict) -> str:
@@ -1258,6 +1322,8 @@ async def send_post(
     article: dict,
     conn: sqlite3.Connection,
     client: Optional[httpx.AsyncClient] = None,
+    *,
+    force: bool = False,
 ) -> bool:
     """Send a single article as a Telegram post. Returns True on success."""
     if client:
@@ -1273,20 +1339,23 @@ async def send_post(
     if is_posted(conn, h):
         return False
 
+    min_ratio = 0.25 if force else 0.35
     loop = asyncio.get_event_loop()
     try:
-        content = await loop.run_in_executor(None, _generate_bilingual_content, article)
+        content = await loop.run_in_executor(
+            None, lambda: _generate_bilingual_content(article, force=force),
+        )
     except Exception as exc:
         log.warning("Gemini executor error: %s", exc)
         content = None
 
     if not content:
-        log.warning("Skip post (no UA/RU translation): %s", title[:60])
+        log.warning("Skip post (no UA/RU translation, force=%s): %s", force, title[:60])
         return False
 
     text = build_bilingual_post(article, content)
-    if not is_valid_bilingual_post(text):
-        log.warning("Skip post (invalid bilingual template): %s", title[:60])
+    if not is_valid_bilingual_post(text, min_ratio=min_ratio):
+        log.warning("Skip post (invalid template, force=%s): %s", force, title[:60])
         return False
 
     image = article.get("image") or article.get("image_fallback") or ""
@@ -1361,9 +1430,17 @@ def deduplicate(articles: list[dict], conn: sqlite3.Connection) -> list[dict]:
 
 # ──────────────────────── Main Polling Loop ───────────────────────────────────
 
-async def collect_all_news(client: httpx.AsyncClient) -> list[dict]:
+async def collect_all_news(
+    client: httpx.AsyncClient,
+    *,
+    max_age_hours: int = RSS_MAX_AGE_HOURS,
+    relaxed_filter: bool = False,
+) -> list[dict]:
     """PS/Xbox RSS + релізи; роздачі лише PS/Xbox (вибір у select_articles_for_cycle)."""
-    tasks = [fetch_rss(client, source) for source in RSS_SOURCES]
+    tasks = [
+        fetch_rss(client, source, max_age_hours, relaxed_filter=relaxed_filter)
+        for source in RSS_SOURCES
+    ]
     tasks.append(fetch_ps_xbox_giveaways(client))
     if RAWG_KEY:
         tasks.append(fetch_rawg_releases(client))
@@ -1396,22 +1473,32 @@ async def run_bot():
         return
 
     log.info(
-        "Limits: news every %dh, max %d/day | giveaway if no news %dh | gv max %d/day",
-        NEWS_MIN_POST_GAP // 3600, MAX_POSTS_PER_DAY,
-        GIVEAWAY_IF_NO_NEWS_HOURS, MAX_GIVEAWAYS_PER_DAY,
+        "Limits: gap %dh, max %d/day, min %d/day | force after %dh | RSS %dh/%dh h",
+        NEWS_MIN_POST_GAP // 3600, MAX_POSTS_PER_DAY, MIN_POSTS_PER_DAY,
+        FORCE_POST_AFTER_HOURS, RSS_MAX_AGE_HOURS, RSS_MAX_AGE_FORCE_HOURS,
     )
     log.info("Starting polling loop — check interval: %d min", CHECK_INTERVAL // 60)
 
     async with httpx.AsyncClient(headers=_BROWSER_HEADERS, timeout=30) as client:
         while True:
             try:
-                log.info("Fetching all news sources...")
-                articles = await collect_all_news(client)
+                force_mode = should_force_post(conn)
+                relaxed = force_mode or needs_daily_post(conn)
+                rss_hours = RSS_MAX_AGE_FORCE_HOURS if force_mode else RSS_MAX_AGE_HOURS
+
+                log.info(
+                    "Fetching sources (rss %dh, relaxed=%s, force=%s, posts_24h=%d)...",
+                    rss_hours, relaxed, force_mode, posts_last_24h(conn),
+                )
+                articles = await collect_all_news(
+                    client, max_age_hours=rss_hours, relaxed_filter=relaxed,
+                )
                 articles = deduplicate(articles, conn)
 
                 platform_queued = sum(
                     1 for a in articles
-                    if a.get("category") in CONTENT_CATEGORIES and passes_content_filter(a)
+                    if a.get("category") in CONTENT_CATEGORIES
+                    and passes_content_filter(a, relaxed=relaxed)
                 )
                 log.info(
                     "Queue: %d total | PS/Xbox content: %d | giveaways: %d",
@@ -1421,32 +1508,36 @@ async def run_bot():
                 )
 
                 hours_since = hours_since_last_post(conn)
-                is_fallback = hours_since >= FALLBACK_HOURS
+                gap_sec = effective_post_gap_seconds(conn)
+                must_post = force_mode or hours_since * 3600 >= gap_sec
 
-                if hours_since * 3600 < MIN_POST_GAP and not is_fallback:
+                if not must_post:
                     log.info(
-                        "Skip cycle: %.1f h since last post (min %d h)",
-                        hours_since, MIN_POST_GAP // 3600,
+                        "Skip cycle: %.1f h since last (gap %d h, need daily=%s)",
+                        hours_since, gap_sec // 3600, needs_daily_post(conn),
                     )
                 else:
-                    to_post = select_articles_for_cycle(articles, conn)
-                    if is_fallback and not to_post and articles:
-                        fallback_pool = [
-                            a for a in articles
-                            if a.get("category") in CONTENT_CATEGORIES and passes_content_filter(a)
-                        ]
-                        if fallback_pool:
-                            to_post = [sort_platform_content(fallback_pool)[0]]
-                            log.info("Fallback: repost best PS/Xbox item from queue")
+                    if force_mode:
+                        log.info(
+                            "Daily guarantee: %.1f h without post, %d posts in 24h",
+                            hours_since, posts_last_24h(conn),
+                        )
 
+                    candidates = select_articles_for_cycle(articles, conn, force=force_mode)
                     post_count = 0
-                    for article in to_post[:MAX_POSTS_PER_CYCLE]:
-                        posted = await send_post(bot, article, conn, client)
+                    for article in candidates:
+                        posted = await send_post(
+                            bot, article, conn, client, force=force_mode,
+                        )
                         if posted:
                             post_count += 1
+                            break
 
                     if post_count == 0:
-                        log.info("Nothing to post this cycle")
+                        log.warning(
+                            "Nothing posted (candidates=%d, force=%s) — check GEMINI_KEY / queue",
+                            len(candidates), force_mode,
+                        )
 
                 log.info("Cycle done. Next check in %d min.", CHECK_INTERVAL // 60)
 
