@@ -1231,6 +1231,84 @@ def db_analytics_report() -> str:
     )
 
 
+def _fmt_sqlite_ts(dt: str | None, *, with_time: bool) -> str:
+    if dt is None or not str(dt).strip():
+        return "—"
+    s = str(dt).strip().replace("T", " ")
+    parts = s.split()
+    if not parts:
+        return "—"
+    day = parts[0][:10]
+    if not with_time:
+        return day
+    if len(parts) < 2:
+        return day
+    t = parts[1]
+    if "." in t:
+        t = t.split(".", 1)[0]
+    seg = t.split(":")
+    return f"{day} {seg[0]}:{seg[1]}" if len(seg) >= 2 else f"{day} {t}"
+
+
+def db_recent_users_rows(limit: int = 20) -> list[sqlite3.Row]:
+    lim = max(1, min(int(limit), 100))
+    with db_connect() as c:
+        return list(
+            c.execute(
+                "SELECT chat_id, username, first_name, plan, "
+                "COALESCE(is_premium, 0) AS tg_premium, "
+                "COALESCE(language_code, '') AS language_code, "
+                "joined_at, last_active "
+                "FROM users ORDER BY datetime(COALESCE(joined_at, '1970-01-01')) DESC "
+                "LIMIT ?",
+                (lim,),
+            ).fetchall()
+        )
+
+
+def _split_telegram_text(text: str, max_len: int = 3900) -> list[str]:
+    if len(text) <= max_len:
+        return [text]
+    chunks: list[str] = []
+    rest = text
+    while rest:
+        if len(rest) <= max_len:
+            chunks.append(rest)
+            break
+        cut = rest.rfind("\n", 0, max_len)
+        if cut < max_len // 2:
+            cut = max_len
+        chunks.append(rest[:cut].rstrip("\n"))
+        rest = rest[cut:].lstrip("\n")
+    return chunks
+
+
+def db_admin_users_report(limit: int = 20) -> list[str]:
+    rows = db_recent_users_rows(limit=limit)
+    if not rows:
+        return ["📭 База користувачів порожня."]
+    hdr = f"📋 Останні {len(rows)} користувачів (joined_at ↓):\n"
+    blocks: list[str] = []
+    for i, r in enumerate(rows, 1):
+        cid = int(r["chat_id"])
+        fn = (r["first_name"] or "").strip()
+        un = (r["username"] or "").strip()
+        plan = r["plan"] or ""
+        prem = bool(int(r["tg_premium"]))
+        lg = (r["language_code"] or "").strip() or "—"
+        handle = "@" + un if un else f"id {cid}"
+        prem_txt = " 💎Premium" if prem else ""
+        blocks.append(
+            f"{i}. {fn}{prem_txt}\n"
+            f"   {handle} • plan {plan} • lang {lg}\n"
+            f"   chat_id={cid}\n"
+            f"   joined {_fmt_sqlite_ts(r['joined_at'], with_time=False)} • "
+            f"last {_fmt_sqlite_ts(r['last_active'], with_time=True)}"
+        )
+    body = hdr + "\n\n" + "\n\n".join(blocks)
+    return _split_telegram_text(body)
+
+
 def db_save_post(pair: str, post_type: str, score: int,
                  sentiment: str, price: float, message_id: int) -> None:
     with db_connect() as c:
@@ -3680,6 +3758,47 @@ async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await msg.reply_text(db_analytics_report())
 
 
+async def cmd_admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Last N users snapshot (SQLite). Admin only."""
+    msg = update.effective_message
+    user = update.effective_user
+    if msg is None or user is None:
+        return
+    if user.id != ADMIN_ID:
+        log.info(
+            "admin_users denied user_id=%s chat_id=%s ADMIN_ID=%s",
+            user.id,
+            update.effective_chat.id if update.effective_chat else None,
+            ADMIN_ID,
+        )
+        return
+    chat = update.effective_chat
+    if chat is None or chat.type != ChatType.PRIVATE:
+        await msg.reply_text(
+            "⚠️ Команда /admin_users працює лише в приватному чаті з ботом.",
+        )
+        return
+    lim = 20
+    if context.args:
+        try:
+            lim = max(1, min(int(context.args[0]), 100))
+        except ValueError:
+            await msg.reply_text(
+                "❌ Формат: /admin_users [кількість 1–100]\nЗа замовчуванням: 20",
+            )
+            return
+    try:
+        chunks = db_admin_users_report(limit=lim)
+    except sqlite3.Error as e:
+        await msg.reply_text(f"❌ Помилка БД: {e}")
+        return
+    for i, chunk in enumerate(chunks):
+        if i == 0:
+            await msg.reply_text(chunk)
+        else:
+            await msg.reply_text(chunk)
+
+
 async def cmd_give(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Usage: /give <chat_id> <plan> <months>"""
     if update.effective_chat.id != ADMIN_ID:
@@ -5794,6 +5913,7 @@ def main() -> None:
     app.add_handler(CommandHandler("chart",        cmd_chartanalysis))
     app.add_handler(CommandHandler("admin",        cmd_admin))
     app.add_handler(CommandHandler("admin_stats", cmd_admin_stats))
+    app.add_handler(CommandHandler("admin_users", cmd_admin_users))
     app.add_handler(CommandHandler("give",         cmd_give))
     app.add_handler(CommandHandler("forcepost",    cmd_forcepost))
     app.add_handler(CommandHandler("forcearticle", cmd_forcearticle))
