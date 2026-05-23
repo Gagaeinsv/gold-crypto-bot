@@ -38,6 +38,7 @@ from textwrap import dedent
 import requests
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Update
+from telegram.constants import ChatType
 from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
@@ -264,7 +265,17 @@ if NOWPAYMENTS_API_KEY and PUBLIC_BASE_URL.strip() and PUBLIC_BASE_URL.lower().s
         "NOWPayments: PUBLIC_BASE_URL uses http:// — the API commonly rejects non-HTTPS ipn_callback_url "
         "(400 Bad Request). Use https:// behind a reverse proxy (port 443) and update PUBLIC_BASE_URL."
     )
-ADMIN_ID     = int(os.getenv("ADMIN_ID", "123456789"))
+def _parse_admin_id(raw: str | None) -> int:
+    """Robust ADMIN_ID parsing (quotes / whitespace from .env)."""
+    s = (raw or "").strip().strip('"').strip("'").split("#", 1)[0].strip()
+    try:
+        return int(s or "123456789", 10)
+    except ValueError:
+        log.error("ADMIN_ID invalid %r — using fallback 123456789", raw)
+        return 123456789
+
+
+ADMIN_ID = _parse_admin_id(os.getenv("ADMIN_ID", "123456789"))
 CHANNEL_ID   = os.getenv("CHANNEL_ID",  "@your_channel")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "@your_bot")
 
@@ -1206,16 +1217,17 @@ def db_analytics_report() -> str:
             "GROUP BY lng ORDER BY n DESC LIMIT 8"
         ).fetchall()
 
-    langs = ", ".join(f"`{r['lng']}`: {r['n']}" for r in rows) or "_нема даних_"
+    langs = ", ".join(f"{r['lng']}: {r['n']}" for r in rows) or "(немає даних)"
     pct_prem = (100.0 * tg_prem / total) if total else 0.0
+    # Plain text (no Markdown) so Telegram never drops the reply on parse errors.
     return (
-        "📊 *Аналітика бота*\n\n"
-        f"👥 Усього користувачів: *{total}*\n"
-        f"🔥 DAU (≈24г за `datetime('now')`): *{dau}*\n"
-        f"📈 MAU (≈30д): *{mau}*\n\n"
-        f"💎 З Telegram Premium: *{tg_prem}* (~{pct_prem:.1f}%)\n"
+        "📊 Аналітика бота\n\n"
+        f"👥 Усього користувачів: {total}\n"
+        f"🔥 DAU (~24 год, server local time): {dau}\n"
+        f"📈 MAU (~30 д): {mau}\n\n"
+        f"💎 Telegram Premium: {tg_prem} (~{pct_prem:.1f}%)\n"
         f"🌍 Топ мов: {langs}\n\n"
-        "_DAU/MAU базуються на `last_active` (оновлюється на кожен приватний апдейт)._"
+        "DAU/MAU беруться з last_active після активності у приватних чатах."
     )
 
 
@@ -3646,12 +3658,26 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """DAU / MAU / langs / Telegram Premium counts (SQLite). Admin only."""
-    if update.effective_chat.id != ADMIN_ID:
+    msg = update.effective_message
+    user = update.effective_user
+    if msg is None or user is None:
         return
-    await update.message.reply_text(
-        db_analytics_report(),
-        parse_mode="Markdown",
-    )
+    # Use user id, not chat id — private chat IDs match users, groups/saved messages do not.
+    if user.id != ADMIN_ID:
+        log.info(
+            "admin_stats denied: user_id=%s chat_id=%s ADMIN_ID=%s",
+            user.id,
+            update.effective_chat.id if update.effective_chat else None,
+            ADMIN_ID,
+        )
+        return
+    chat = update.effective_chat
+    if chat is None or chat.type != ChatType.PRIVATE:
+        await msg.reply_text(
+            "⚠️ Команда /admin_stats працює лише в приватному чаті з ботом.",
+        )
+        return
+    await msg.reply_text(db_analytics_report())
 
 
 async def cmd_give(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
