@@ -33,6 +33,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from datetime import UTC, date, datetime, timedelta
 from email.utils import parsedate_to_datetime
+from textwrap import dedent
 
 import requests
 from dotenv import load_dotenv
@@ -146,7 +147,7 @@ def _openrouter_configured() -> bool:
     return bool(_openrouter_keys_merged())
 # Google Gemini — deep analysis, chart vision, Groq 429 fallback (works alongside OpenRouter)
 GEMINI_KEY   = os.getenv("GEMINI_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 try:
     _deep_out_cap = int(os.getenv("DEEP_ANALYSIS_MAX_OUTPUT_TOKENS", "8192").strip())
 except ValueError:
@@ -162,13 +163,20 @@ CHART_VISION_MAX_OUTPUT_TOKENS = max(1024, min(_cv_out_cap, 65536))
 
 
 def _gemini_thinking_kw() -> dict:
-    """Gemini 2.5 can spend max_output_tokens on internal reasoning; visible text truncates early."""
+    """Prefer disabling internal reasoning so visible output uses the token budget."""
     import google.genai.types as gtypes
 
     v = os.getenv("GEMINI_DISABLE_THINKING", "1").strip().lower()
     if v in ("0", "false", "no", "off"):
         return {}
-    return {"thinking_config": gtypes.ThinkingConfig(thinking_budget=0)}
+    try:
+        return {"thinking_config": gtypes.ThinkingConfig(thinking_budget=0)}
+    except TypeError:
+        # Gemini 3.x SDKs may replace thinking_budget with thinking_level.
+        try:
+            return {"thinking_config": gtypes.ThinkingConfig(thinking_level="LOW")}
+        except TypeError:
+            return {}
 
 
 def _gemini_candidate_visible_text(candidate) -> str:
@@ -1905,7 +1913,7 @@ def _gemini_text(prompt: str, max_tokens: int = 500) -> str:
 
 
 def _gemini_json_analysis(prompt: str) -> str:
-    """Ask Gemini for a JSON trading signal. Groq fallback after OpenRouter."""
+    """Ask Gemini for a JSON trading signal (AI_ROUTE_SIGNAL_JSON)."""
     import google.genai as genai
     import google.genai.types as gtypes
 
@@ -1914,7 +1922,7 @@ def _gemini_json_analysis(prompt: str) -> str:
         model=GEMINI_MODEL,
         contents=prompt,
         config=gtypes.GenerateContentConfig(
-            max_output_tokens=300,
+            max_output_tokens=480,
             response_mime_type="application/json",
             **_gemini_thinking_kw(),
         ),
@@ -2039,7 +2047,7 @@ def _invoke_signal_json_llm(analysis_prompt: str, groq_model: str) -> str:
                     timeout=GROQ_TIMEOUT,
                     messages=[{"role": "user", "content": analysis_prompt}],
                     temperature=0.3,
-                    max_tokens=280,
+                    max_tokens=420,
                 ).choices[0].message.content
             if step in ("openrouter_light", "openrouter_heavy", "openrouter_merged"):
                 return _openrouter_chat(
@@ -2197,6 +2205,75 @@ def _sanitize_ai_trade_fields(ai: dict, fallback: dict, price: float, pair: str)
         ai["risk_reward"] = fallback.get("risk_reward") or f"1:{tp_hint / sl_hint:.1f}"
 
 
+def _elite_signal_analysis_prompt(
+    pair: str, cfg: dict, price: float, tech: dict, trend: str, vol: str, news_clip: str,
+) -> str:
+    """Shared instructions for Groq/OpenRouter/Gemini on AI_ROUTE_SIGNAL_JSON (JSON-shaped signal)."""
+    tb = "unavailable"
+    if tech.get("ok"):
+        tb = (
+            f"RSI={tech['rsi']}({tech['rsi_zone']}), MACD={tech['macd_cross']}, "
+            f"EMA20={tech['ema20']}, EMA50={tech['ema50']}, "
+            f"Support={tech['support1']}, Resistance={tech['resist1']}"
+        )
+
+    headline = dedent("""
+        You are an elite, data-driven Crypto & Forex Trading Signal Agent tuned for Gemini-class analysis.
+        Your sole purpose is to analyse the MARKET INPUT (technicals + price snapshot + trimmed news headline) and produce
+        a precise, actionable signal for the Telegram bot downstream.
+
+        ### CORE EXECUTION RULES
+        1. NO PREAMBLES OR SMALLTALK — conclusions live only inside the JSON.
+        2. STRICT TRADING LOGIC — use only quantifiable facts from MARKET INPUT. If data are insufficient or contradictory
+           for a high-probability setup, treat it as HOLD: sentiment must be neutral, recommendation avoid, subdued confidence,
+           explain briefly in entry_reason (entry_reason + main_driver together ≤ 2 short sentences total).
+        3. NO HALLUCINATIONS — do not invent fills, ladders, unseen indicators, tweets, calendar events, or prices not justified
+           by MARKET INPUT. If unsure, downgrade confidence and HOLD per rule 2.
+        4. SL/TP DIRECTION MUST BE PHYSICALLY CONSISTENT — bullish (BUY stance): SL < entry < TP. Bearish (SELL stance): TP < entry < SL.
+        5. BREVITY — use concise institutional phrasing (e.g. RSI bearish divergence, pullback into EMA confluence).
+
+        ### OUTPUT CONTRACT (BOT JSON — HARD REQUIREMENT)
+        The bot parses one JSON object only — not plaintext lines like SIGNAL: / ENTRY ZONE:.
+        Respond with STRICT JSON matching this schema (no fences, no trailing commentary).
+        Gemini may already enforce application/json; still obey exactly.
+
+        Mandatory keys — all REQUIRED; optimal_entry, stop_loss, take_profit MUST be positive numbers (never null):
+          sentiment: bullish | bearish | neutral
+          confidence: integer 0-100 (NOT a fractional probability — map 0.85 styles to 85)
+          risk_level: low | medium | high | extreme
+          recommendation: enter_now | wait_for_pullback | wait | avoid
+              enter_now = high-conviction active signal
+              wait_for_pullback = favourable but needs better timing
+              wait = monitoring/sidelines
+              avoid = HOLD / no-trade when edge is inadequate (maps to insufficient data stance)
+          optimal_entry — one actionable working price anchored to current context (nearest confluence/pullback pivot).
+          stop_loss — primary protective stop respecting rule 4.
+          take_profit — primary target only (conceptual TP1; omit TP2 entirely from JSON).
+            On HOLD setups still populate realistic SL/TP around current price respecting risk_level (never null).
+          risk_reward — string like 1:2.5 from SL vs TP distances along the directional vector.
+          entry_reason — first nucleus of rationale.
+          main_driver — second reinforcing clause (combined cap above).
+
+        Stance mapping (mental model only — encode with JSON keys):
+        • BUY-style ⇒ sentiment bullish
+        • SELL-style ⇒ sentiment bearish
+        • SIGNAL: HOLD / insufficient data ⇒ sentiment neutral + recommendation avoid
+
+        Respond with NOTHING except that JSON object.
+        """
+    ).strip()
+    tail = (
+        f"\n\n=== MARKET INPUT ===\n"
+        f"Pair: {pair} ({cfg['name']})\n"
+        f"Current price (spot reference): {price}\n"
+        f"Trend label: {trend}\n"
+        f"Volatility label: {vol}\n"
+        f"Technicals snapshot: {tb}\n"
+        f"News/headlines (truncated): {news_clip}\n"
+    )
+    return headline + tail
+
+
 def groq_analysis(news_text: str, price: float, tech: dict,
                   trend: str, vol: str, pair: str, groq_model: str) -> dict:
     cfg     = PAIRS[pair]
@@ -2223,24 +2300,8 @@ def groq_analysis(news_text: str, price: float, tech: dict,
         "entry_reason": "fallback", "main_driver": "fallback",
     }
     try:
-        tb = "unavailable"
-        if tech.get("ok"):
-            tb = (f"RSI={tech['rsi']}({tech['rsi_zone']}), MACD={tech['macd_cross']}, "
-                  f"EMA20={tech['ema20']}, EMA50={tech['ema50']}, "
-                  f"Support={tech['support1']}, Resistance={tech['resist1']}")
-        analysis_prompt = (
-                f"You are a senior {cfg['name']} trader.\n"
-                f"Current price: {price}, Trend: {trend}, Volatility: {vol}\n"
-                f"Technicals: {tb}\nNews: {news_text[:300]}\n\n"
-                "Reply ONLY with valid JSON. Rules:\n"
-                "- sentiment: 'bullish' or 'bearish' or 'neutral'\n"
-                "- confidence: integer 0-100 (NOT a decimal like 0.85)\n"
-                "- risk_level: 'low' or 'medium' or 'high' or 'extreme'\n"
-                "- recommendation: 'enter_now' or 'wait_for_pullback' or 'wait' or 'avoid'\n"
-                "- If sentiment is bearish: stop_loss MUST be ABOVE entry, take_profit MUST be BELOW entry\n"
-                "- If sentiment is bullish: stop_loss MUST be BELOW entry, take_profit MUST be ABOVE entry\n"
-                "Keys: sentiment, confidence, risk_level, recommendation, "
-                "optimal_entry, stop_loss, take_profit, risk_reward, entry_reason, main_driver"
+        analysis_prompt = _elite_signal_analysis_prompt(
+            pair, cfg, price, tech, trend, vol, news_text[:300],
         )
         raw = _invoke_signal_json_llm(analysis_prompt, groq_model)
         m = re.search(r"\{.*\}", raw, re.DOTALL)
