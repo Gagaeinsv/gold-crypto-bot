@@ -46,6 +46,7 @@ from telegram.ext import (
     ContextTypes,
     MessageHandler,
     PreCheckoutQueryHandler,
+    TypeHandler,
     filters,
 )
 
@@ -452,6 +453,17 @@ def db_connect() -> sqlite3.Connection:
     return conn
 
 
+def _migrate_users_analytics_columns(c: sqlite3.Connection) -> None:
+    """Add language_code / is_premium for existing SQLite DBs (CREATE only covers fresh installs)."""
+    cols = {row[1] for row in c.execute("PRAGMA table_info(users)").fetchall()}
+    if "language_code" not in cols:
+        c.execute("ALTER TABLE users ADD COLUMN language_code TEXT")
+    if "is_premium" not in cols:
+        c.execute(
+            "ALTER TABLE users ADD COLUMN is_premium INTEGER NOT NULL DEFAULT 0"
+        )
+
+
 def db_init() -> None:
     with db_connect() as c:
         c.executescript("""
@@ -464,7 +476,9 @@ def db_init() -> None:
                 sub_expires      TEXT,
                 total_paid_stars INTEGER DEFAULT 0,
                 joined_at        TEXT    DEFAULT (datetime('now')),
-                last_active      TEXT
+                last_active      TEXT,
+                language_code    TEXT,
+                is_premium       INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS payments (
                 id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -545,22 +559,58 @@ def db_init() -> None:
             );
         """)
 
+        _migrate_users_analytics_columns(c)
 
-def db_upsert_user(cid: int, username: str = "", fname: str = "") -> None:
+
+def db_upsert_user(
+    cid: int,
+    username: str = "",
+    fname: str = "",
+    *,
+    language_code: str | None = None,
+    is_premium: bool | None = None,
+) -> bool:
+    """
+    Upsert profile + bump last_active. Returns True if this call inserted a brand-new row.
+    Passing language_code/is_premium as None skips overwriting those columns on UPDATE.
+    """
+
+    def _lang_norm(raw: str | None) -> str:
+        z = (raw or "").strip()
+        return z if z else "en"
+
     with db_connect() as c:
-        row = c.execute("SELECT chat_id FROM users WHERE chat_id=?", (cid,)).fetchone()
+        row = c.execute("SELECT * FROM users WHERE chat_id=?", (cid,)).fetchone()
         if row is None:
             trial_ends = (datetime.now(UTC) + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d")
+            lang_ins = _lang_norm(language_code)
+            prem_ins = 1 if bool(is_premium if is_premium is not None else False) else 0
+
             c.execute(
-                "INSERT INTO users(chat_id,username,first_name,plan,trial_ends,last_active) "
-                "VALUES(?,?,?,'trial',?,datetime('now'))",
-                (cid, username, fname, trial_ends),
+                "INSERT INTO users(chat_id,username,first_name,plan,trial_ends,last_active,"
+                "language_code,is_premium) "
+                "VALUES(?,?,?,'trial',?,datetime('now'),?,?)",
+                (cid, username, fname, trial_ends, lang_ins, prem_ins),
             )
+            return True
+
+        nu = username if username else (row["username"] or "")
+        nf = fname if fname else (row["first_name"] or "")
+        if language_code is not None:
+            nlang = _lang_norm(language_code)
         else:
-            c.execute(
-                "UPDATE users SET last_active=datetime('now'),username=?,first_name=? WHERE chat_id=?",
-                (username, fname, cid),
-            )
+            nlang = _lang_norm(row["language_code"])
+        if is_premium is not None:
+            npm = 1 if is_premium else 0
+        else:
+            npm = int(row["is_premium"] or 0)
+
+        c.execute(
+            "UPDATE users SET last_active=datetime('now'),username=?,first_name=?,"
+            "language_code=?,is_premium=? WHERE chat_id=?",
+            (nu, nf, nlang, npm, cid),
+        )
+        return False
 
 
 def db_access(cid: int) -> dict:
@@ -1134,6 +1184,39 @@ def db_stats() -> dict:
         posts = c.execute("SELECT COUNT(*) FROM channel_posts").fetchone()[0]
     return dict(total=total, trial=trial, basic=basic, pro=pro, diamond=diamond,
                 expired=exp, total_stars=stars, posts=posts)
+
+
+def db_analytics_report() -> str:
+    """Short product analytics snapshot (SQLite last_active timestamps, server TZ)."""
+    with db_connect() as c:
+        total = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        dau = c.execute(
+            "SELECT COUNT(*) FROM users WHERE last_active IS NOT NULL "
+            "AND datetime(last_active) >= datetime('now', '-1 day')"
+        ).fetchone()[0]
+        mau = c.execute(
+            "SELECT COUNT(*) FROM users WHERE last_active IS NOT NULL "
+            "AND datetime(last_active) >= datetime('now', '-30 days')"
+        ).fetchone()[0]
+        tg_prem = c.execute(
+            "SELECT COUNT(*) FROM users WHERE COALESCE(is_premium, 0)=1",
+        ).fetchone()[0]
+        rows = c.execute(
+            "SELECT COALESCE(language_code, 'unset') AS lng, COUNT(*) AS n FROM users "
+            "GROUP BY lng ORDER BY n DESC LIMIT 8"
+        ).fetchall()
+
+    langs = ", ".join(f"`{r['lng']}`: {r['n']}" for r in rows) or "_нема даних_"
+    pct_prem = (100.0 * tg_prem / total) if total else 0.0
+    return (
+        "📊 *Аналітика бота*\n\n"
+        f"👥 Усього користувачів: *{total}*\n"
+        f"🔥 DAU (≈24г за `datetime('now')`): *{dau}*\n"
+        f"📈 MAU (≈30д): *{mau}*\n\n"
+        f"💎 З Telegram Premium: *{tg_prem}* (~{pct_prem:.1f}%)\n"
+        f"🌍 Топ мов: {langs}\n\n"
+        "_DAU/MAU базуються на `last_active` (оновлюється на кожен приватний апдейт)._"
+    )
 
 
 def db_save_post(pair: str, post_type: str, score: int,
@@ -3402,20 +3485,39 @@ def sub_info_text(acc: dict) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Command handlers
+#  Global activity + Command handlers
 # ═══════════════════════════════════════════════════════════════════
+
+async def global_activity_tracker(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Bump last_active (and profile) on every private chat update; sets user_data flag on first insert."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if user is None or chat is None or chat.type != "private":
+        return
+    cid = chat.id
+    lang = getattr(user, "language_code", "") or ""
+    pu = getattr(user, "is_premium", None)
+    prem_kw: dict[str, bool] = {}
+    if pu is not None:
+        prem_kw["is_premium"] = bool(pu)
+    inserted = db_upsert_user(
+        cid,
+        user.username or "",
+        user.first_name or "",
+        language_code=lang,
+        **prem_kw,
+    )
+    if inserted:
+        context.user_data["analytics_just_registered"] = True
+
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cid    = update.effective_chat.id
     u      = update.effective_user
     args   = context.args  # e.g. ["ref_123456"] or ["youtube"] or []
-    is_new = False
-
-    with db_connect() as c:
-        exists = c.execute("SELECT chat_id FROM users WHERE chat_id=?", (cid,)).fetchone()
-        is_new = exists is None
-
-    db_upsert_user(cid, u.username or "", u.first_name or "")
+    is_new = context.user_data.pop("analytics_just_registered", False)
 
     # ── Parse start parameter ────────────────────────────────
     source     = None
@@ -3500,7 +3602,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_refer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show referral link and stats."""
     cid = update.effective_chat.id
-    db_upsert_user(cid)
     stats = db_referral_stats(cid)
     ref_link = f"https://t.me/{BOT_USERNAME.lstrip('@')}?start=ref_{cid}"
 
@@ -3539,6 +3640,16 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"⭐ Basic: {s['basic']}\n💎 Pro: {s['pro']}\n💠 Diamond: {s['diamond']}\n❌ Expired: {s['expired']}\n\n"
         f"📨 Posts: {s['posts']}\n⭐ Stars: {s['total_stars']}\n\n"
         f"📡 *Traffic sources:*\n{utm_lines}",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """DAU / MAU / langs / Telegram Premium counts (SQLite). Admin only."""
+    if update.effective_chat.id != ADMIN_ID:
+        return
+    await update.message.reply_text(
+        db_analytics_report(),
         parse_mode="Markdown",
     )
 
@@ -5647,6 +5758,8 @@ def main() -> None:
     app = ApplicationBuilder().token(TOKEN).build()
     _APP_REF = app  # store reference for TV webhook handler
 
+    app.add_handler(TypeHandler(Update, global_activity_tracker), group=-1)
+
     app.add_handler(CommandHandler("start",        cmd_start))
     app.add_handler(CommandHandler("refer",        cmd_refer))
     app.add_handler(CommandHandler("stats",        cmd_stats))
@@ -5654,6 +5767,7 @@ def main() -> None:
     app.add_handler(CommandHandler("deepanalysis", cmd_deepanalysis))
     app.add_handler(CommandHandler("chart",        cmd_chartanalysis))
     app.add_handler(CommandHandler("admin",        cmd_admin))
+    app.add_handler(CommandHandler("admin_stats", cmd_admin_stats))
     app.add_handler(CommandHandler("give",         cmd_give))
     app.add_handler(CommandHandler("forcepost",    cmd_forcepost))
     app.add_handler(CommandHandler("forcearticle", cmd_forcearticle))
