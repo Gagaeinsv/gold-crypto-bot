@@ -603,6 +603,15 @@ def db_stats() -> dict:
                 total_stars=stars, posts=posts, pending_crypto=pending_crypto)
 
 
+def db_recent_users(limit: int = 20) -> list[sqlite3.Row]:
+    with db_connect() as c:
+        return c.execute(
+            "SELECT chat_id, username, first_name, plan, joined_at, last_active "
+            "FROM users ORDER BY joined_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+
 def db_save_post(pair: str, post_type: str, score: int,
                  sentiment: str, price: float, message_id: int) -> None:
     with db_connect() as c:
@@ -2200,6 +2209,43 @@ def kb_confirm(opt: float, pair: str) -> InlineKeyboardMarkup:
     ])
 
 
+def _short_date(value: str | None) -> str:
+    if not value:
+        return "немає"
+    return value.replace("T", " ").split(" ", 1)[0]
+
+
+def _short_time(value: str | None) -> str:
+    if not value:
+        return "немає"
+    cleaned = value.replace("T", " ").split(".", 1)[0]
+    parts = cleaned.rsplit(" ", 1)
+    time_part = parts[-1] if parts else cleaned
+    return time_part[:5] if ":" in time_part else cleaned
+
+
+def admin_users_text(rows: list[sqlite3.Row]) -> str:
+    if not rows:
+        return "📭 База даних користувачів порожня."
+
+    lines = ["📋 *СПИСОК КОРИСТУВАЧІВ \\(останні 20\\):*\n"]
+    premium_plans = (*PAID_PLANS, "admin")
+    for i, row in enumerate(rows, 1):
+        username = row["username"] or ""
+        first_name = row["first_name"] or "Без імені"
+        plan = row["plan"] or "none"
+        user_link = f"@{username}" if username else f"ID: `{row['chat_id']}`"
+        prem_badge = "💎" if plan in premium_plans else ""
+        lines.append(
+            f"{i}. {first_name} {prem_badge}\n"
+            f"   🔗 {user_link} | Тариф: `{plan}`\n"
+            f"   📅 Реєстрація: {_short_date(row['joined_at'])} | "
+            f"Активність: {_short_time(row['last_active'])}\n"
+            f"   📍 ID: `{row['chat_id']}`\n"
+        )
+    return "\n".join(lines)
+
+
 def sub_info_text(acc: dict) -> str:
     plan = acc["plan"];  dl = acc["days_left"]
     lines = [f"💳 *Plan: {PLAN_EMOJI.get(plan, '?')} {plan_label(plan)}*", ""]
@@ -2393,6 +2439,16 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"📡 *Traffic sources:*\n{utm_lines}",
         parse_mode="Markdown",
     )
+
+
+async def cmd_admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.id != ADMIN_ID:
+        return
+    try:
+        text = admin_users_text(db_recent_users(20))
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except sqlite3.Error as e:
+        await update.message.reply_text(f"❌ Помилка бази даних: {e}")
 
 
 async def cmd_give(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4044,6 +4100,7 @@ def main() -> None:
     app.add_handler(CommandHandler("deepanalysis", cmd_deepanalysis))
     app.add_handler(CommandHandler("chart",        cmd_chartanalysis))
     app.add_handler(CommandHandler("admin",        cmd_admin))
+    app.add_handler(CommandHandler("admin_users",  cmd_admin_users))
     app.add_handler(CommandHandler("give",         cmd_give))
     app.add_handler(CommandHandler("confirmcrypto", cmd_confirmcrypto))
     app.add_handler(CommandHandler("forcepost",    cmd_forcepost))
