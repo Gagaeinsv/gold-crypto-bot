@@ -421,7 +421,7 @@ CRYPTO_PAY_ALLOWED = frozenset({("pro", 3), ("diamond", 1), ("diamond", 3)})
 DB_PATH           = "users.db"
 # Planned channel *articles* (LLM body) — still wall-clock UTC here.
 ARTICLE_HOURS_UTC = [8, 14, 20]   # article posts — separate from analysis
-# Planned channel market analysis: код нижче — 1 пара на годину, локально Europe/Kyiv 09–18 (10 постів/день).
+# Planned channel market analysis: години 09–18 у зоні CHANNEL_ANALYSIS_TZ (за замовчуванням UTC) — див. константи після PAIRS.
 # Background job interval (seconds). Scheduled channel/article LLM fires when the calendar hour rolls.
 MONITOR_INTERVAL_SEC = max(15, int(os.getenv("MONITOR_INTERVAL_SEC", "60")))
 AUTO_COOLDOWN     = 30 * 60        # seconds between auto-signals
@@ -495,15 +495,16 @@ PAIRS: dict = {
 }
 DEFAULT_PAIR = "XAUUSD"
 
-# Канальні огляди (LLM): одна пара на календарну годину, локальний ранок o 09:00, 10 годин підряд, потім пауза до завтра.
-CHANNEL_ANALYSIS_TZ_NAME = "Europe/Kyiv"
+# Канальні огляди: 1 пара на календарну годину, стартова година 09:00 у зоні CHANNEL_ANALYSIS_TZ, 10 годин поспіль.
+# Часова зона за замовчуванням UTC (без прив’язки до міста); інша — через .env CHANNEL_ANALYSIS_TZ=… або правка рядка нижче.
+CHANNEL_ANALYSIS_TZ_NAME = (os.getenv("CHANNEL_ANALYSIS_TZ", "").strip() or "UTC")
 CHANNEL_ANALYSIS_LOCAL_START_HOUR = 9
 CHANNEL_ANALYSIS_HOURLY_SLOTS = 10  # години включно від START до START+SLOTS-1
 
 
 def channel_scheduled_analysis_pairs() -> list[str]:
     """
-    Порядок пар для порожніх слот-oв 0..N-1 під час годинникового каналу (Kyiv).
+    Порядок пар для черговості слотів 0…N−1 під час годинникового каналу.
 
     Якщо CHANNEL_ANALYSIS_PAIRS у `.env` заданий — лише він (доречно з телефона лишити порожнім).
     Інакше — усі ключі PAIRS у стабільному порядку (золото першим тощо).
@@ -532,7 +533,7 @@ def channel_articles_enabled() -> bool:
 
 
 def channel_analysis_local_datetime() -> datetime:
-    """Поточний «настінний» час для розкладу каналу (Kyiv або UTC fallback)."""
+    """Поточний час у зоні CHANNEL_ANALYSIS_TZ_NAME (розклад годинникових постів каналу)."""
     try:
         return datetime.now(ZoneInfo(CHANNEL_ANALYSIS_TZ_NAME))
     except Exception:
@@ -5484,7 +5485,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
         now_utc = datetime.now(UTC)
         h = now_utc.hour
 
-        # 2) Channel market analysis: 1 pair per local hour (Kyiv 09:00–18:59) = 10 LLM/day total.
+        # 2) Channel market analysis: 1 pair per calendar hour (09–18 in CHANNEL_ANALYSIS_TZ) → 10 LLM/day total.
         dt_ch = channel_analysis_local_datetime()
         d_ch, h_ch = dt_ch.date(), dt_ch.hour
         h0 = CHANNEL_ANALYSIS_LOCAL_START_HOUR
@@ -5498,8 +5499,9 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                 price = _prices.get(pair)
                 if not price:
                     log.warning(
-                        "Channel hourly: awaiting price for %s (slot Kyiv %02d)",
+                        "Channel hourly: awaiting price for %s (%s slot %02d)",
                         pair,
+                        CHANNEL_ANALYSIS_TZ_NAME,
                         h_ch,
                     )
                 else:
@@ -5539,7 +5541,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                             source="ai",
                         )
                         log.info(
-                            "Channel (%s local %s:%02d slot %d): %s published (score=%s)",
+                            "Channel hourly tz=%s date=%s %02d:00 slot=%d %s score=%s",
                             CHANNEL_ANALYSIS_TZ_NAME,
                             d_ch,
                             h_ch,
@@ -6185,8 +6187,8 @@ def main() -> None:
     log.info("DB initialised. Starting bot…")
     ch_pairs = channel_scheduled_analysis_pairs()
     log.info(
-        "Channel analysis: hourly %s %02d:00–%02d:59 → %d Groq posts/day "
-        "(optional CHANNEL_ANALYSIS_PAIRS in env; default all PAIRS in order)",
+        "Channel analysis: hourly in tz=%s, %02d:00–%02d:59 → %d Groq posts/day "
+        "(tz: default UTC unless CHANNEL_ANALYSIS_TZ set; pairs: CHANNEL_ANALYSIS_PAIRS or PAIRS order)",
         CHANNEL_ANALYSIS_TZ_NAME,
         CHANNEL_ANALYSIS_LOCAL_START_HOUR,
         CHANNEL_ANALYSIS_LOCAL_START_HOUR + CHANNEL_ANALYSIS_HOURLY_SLOTS - 1,
