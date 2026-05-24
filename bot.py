@@ -85,6 +85,9 @@ OPENROUTER_402_CREDIT_HOLD_SEC = max(60, _or402_hold)
 # Optional explicit pools (comma-separated API keys). Defaults use OPENROUTER_API_KEY / _2.
 OPENROUTER_KEYS_LIGHT = os.getenv("OPENROUTER_KEYS_LIGHT", "").strip()
 OPENROUTER_KEYS_HEAVY = os.getenv("OPENROUTER_KEYS_HEAVY", "").strip()
+# Конвенція два ключі без явних OPENROUTER_KEYS_*:
+#   OPENROUTER_API_KEY  — першим (типово оплачений акаунт)
+#   OPENROUTER_API_KEY_2 — після failover першого (типово «безкоштовний» / менший ліміт)
 
 _openrouter_rr_lock = threading.Lock()
 # Per-pool round-robin cursor (light / heavy / merged).
@@ -113,7 +116,10 @@ def _dedupe_api_keys(keys: list[str]) -> list[str]:
 
 
 def _openrouter_keys_light() -> list[str]:
-    """Short / low max_tokens jobs: monitor JSON, article fallback, etc."""
+    """
+    Короткі запити: спочатку OPENROUTER_API_KEY (paid), далі OPENROUTER_API_KEYS*, останній
+    fallback — OPENROUTER_API_KEY_2 (free/reserve), без дублікатів.
+    """
     if OPENROUTER_KEYS_LIGHT:
         return _dedupe_api_keys(
             [p.strip() for p in OPENROUTER_KEYS_LIGHT.split(",") if p.strip()]
@@ -122,6 +128,8 @@ def _openrouter_keys_light() -> list[str]:
     if OPENROUTER_API_KEY:
         keys.append(OPENROUTER_API_KEY)
     keys.extend(k for k in _openrouter_legacy_extra_keys() if k not in keys)
+    if OPENROUTER_API_KEY_2 and OPENROUTER_API_KEY_2 not in keys:
+        keys.append(OPENROUTER_API_KEY_2)
     return _dedupe_api_keys(keys)
 
 
@@ -135,7 +143,7 @@ def _openrouter_keys_heavy() -> list[str]:
         [k for k in (OPENROUTER_API_KEY, OPENROUTER_API_KEY_2) if k]
     )
     if len(duo) >= 2:
-        # Typical 2-account setup: try OPENROUTER_API_KEY first (often the funded one), then *_2 on failover.
+        # OPENROUTER_API_KEY (перший у .env) → OPENROUTER_API_KEY_2
         return duo
     if len(duo) == 1:
         # One explicit key configured — reuse the light/auxiliary pool for extra keys without dropping them.
