@@ -126,14 +126,24 @@ def _openrouter_keys_light() -> list[str]:
 
 
 def _openrouter_keys_heavy() -> list[str]:
-    """Long-form + vision on OpenRouter: deep analysis chart screenshots."""
+    """Long-form + vision on OpenRouter: deep analysis, chart screenshots (openrouter_heavy)."""
     if OPENROUTER_KEYS_HEAVY:
         return _dedupe_api_keys(
             [p.strip() for p in OPENROUTER_KEYS_HEAVY.split(",") if p.strip()]
         )
-    if OPENROUTER_API_KEY_2:
-        return [OPENROUTER_API_KEY_2]
-    # No dedicated heavy key — reuse light pool (same account / single key setups).
+    duo = _dedupe_api_keys(
+        [k for k in (OPENROUTER_API_KEY, OPENROUTER_API_KEY_2) if k]
+    )
+    if len(duo) >= 2:
+        # Typical 2-account setup: try OPENROUTER_API_KEY first (often the funded one), then *_2 on failover.
+        return duo
+    if len(duo) == 1:
+        # One explicit key configured — reuse the light/auxiliary pool for extra keys without dropping them.
+        out = duo.copy()
+        for k in _openrouter_keys_light():
+            if k not in out:
+                out.append(k)
+        return out
     return _openrouter_keys_light()
 
 
