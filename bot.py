@@ -163,6 +163,45 @@ except ValueError:
 # Chart screenshot multimodal replies; tight limits cut off before SL/TP/verdict sections.
 CHART_VISION_MAX_OUTPUT_TOKENS = max(1024, min(_cv_out_cap, 65536))
 
+# OpenRouter: separate output caps — balance is reserved using *requested* max_tokens, so a huge
+# DEEP_ANALYSIS_MAX_OUTPUT_TOKENS can HTTP 402 on low credits even if the reply is short.
+try:
+    _or_aff_margin = int(os.getenv("OPENROUTER_AFFORD_MARGIN", "32").strip())
+except ValueError:
+    _or_aff_margin = 32
+OPENROUTER_AFFORD_MARGIN = max(8, min(_or_aff_margin, 512))
+
+try:
+    _or_out_floor = int(os.getenv("OPENROUTER_OUTPUT_FLOOR", "96").strip())
+except ValueError:
+    _or_out_floor = 96
+OPENROUTER_OUTPUT_FLOOR = max(32, min(_or_out_floor, 4096))
+
+try:
+    _or_deep_cap = int(os.getenv("OPENROUTER_DEEP_MAX_TOKENS", "2048").strip())
+except ValueError:
+    _or_deep_cap = 2048
+OPENROUTER_DEEP_MAX_OUTPUT_TOKENS = max(
+    OPENROUTER_OUTPUT_FLOOR + 32, min(_or_deep_cap, 65536)
+)
+
+try:
+    _or_chart_cap = int(os.getenv("OPENROUTER_CHART_MAX_TOKENS", "2048").strip())
+except ValueError:
+    _or_chart_cap = 2048
+OPENROUTER_CHART_MAX_OUTPUT_TOKENS = max(
+    OPENROUTER_OUTPUT_FLOOR + 32, min(_or_chart_cap, 65536)
+)
+
+
+def openrouter_deep_effective_output_cap() -> int:
+    """OpenRouter Deep Analysis ceiling (does not shrink Gemini budgets)."""
+    return min(DEEP_ANALYSIS_MAX_OUTPUT_TOKENS, OPENROUTER_DEEP_MAX_OUTPUT_TOKENS)
+
+
+def openrouter_chart_effective_output_cap() -> int:
+    return min(CHART_VISION_MAX_OUTPUT_TOKENS, OPENROUTER_CHART_MAX_OUTPUT_TOKENS)
+
 
 def _gemini_thinking_kw() -> dict:
     """Prefer disabling internal reasoning so visible output uses the token budget."""
@@ -1983,6 +2022,21 @@ def _openrouter_vision_model() -> str:
     return v if v else OPENROUTER_MODEL
 
 
+def _openrouter_parse_affordable_output_cap(err_msg: str) -> int | None:
+    """
+    OpenRouter may return 402 with 'can only afford N' — use N to retry with a lower max_tokens.
+    """
+    if not err_msg:
+        return None
+    m = re.search(r"can\s+only\s+afford\s+(\d+)", err_msg, re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
 def _openrouter_chat(
     messages: list,
     *,
@@ -2022,26 +2076,55 @@ def _openrouter_chat(
     last_sc = 0
 
     for attempt, api_key in enumerate(order):
-        ok, text, sc, err = _openrouter_post_once(api_key, payload)
-        if ok:
-            if attempt > 0:
-                log.info(
-                    "OpenRouter: OK using key …%s (%s pool) after failover",
-                    api_key[-4:] if len(api_key) >= 4 else "****",
-                    scope,
-                )
-            return text
-        last_err, last_sc = err, sc
-        if sc == 402 and _openrouter_payment_starved_error(sc, err):
+        cap = max(OPENROUTER_OUTPUT_FLOOR, int(max_tokens))
+        did_shrink = False
+        inner_last_err, inner_last_sc = "", 0
+        for _bump in range(12):
+            post_payload = dict(payload)
+            post_payload["max_tokens"] = cap
+            ok, text, sc, err = _openrouter_post_once(api_key, post_payload)
+            if ok:
+                if attempt > 0 or did_shrink:
+                    log.info(
+                        "OpenRouter: OK using key …%s (%s pool) after failover/reduced tokens",
+                        api_key[-4:] if len(api_key) >= 4 else "****",
+                        scope,
+                    )
+                return text
+
+            inner_last_err, inner_last_sc = err, sc
+
+            afforded = _openrouter_parse_affordable_output_cap(err or "")
+            if afforded is not None:
+                nxt = max(OPENROUTER_OUTPUT_FLOOR, afforded - OPENROUTER_AFFORD_MARGIN)
+                if nxt < cap:
+                    log.warning(
+                        "OpenRouter: lowering max_tokens %s→%s (affordable=%s) key …%s",
+                        cap,
+                        nxt,
+                        afforded,
+                        api_key[-4:] if len(api_key) >= 4 else "****",
+                    )
+                    cap = nxt
+                    did_shrink = True
+                    continue
+
+            break
+
+        last_err, last_sc = inner_last_err, inner_last_sc
+        if (
+            inner_last_sc == 402
+            and _openrouter_payment_starved_error(inner_last_sc, inner_last_err)
+        ):
             _openrouter_hold_key_credit_low(api_key)
-        if not _openrouter_failover_eligible(sc, err):
-            raise RuntimeError(err or f"OpenRouter HTTP {sc}")
+        if not _openrouter_failover_eligible(inner_last_sc, inner_last_err):
+            raise RuntimeError(inner_last_err or f"OpenRouter HTTP {inner_last_sc}")
         if attempt < len(order) - 1:
             log.warning(
                 "OpenRouter key …%s HTTP %s — %s; trying next key (%s pool)",
                 api_key[-4:] if len(api_key) >= 4 else "****",
-                sc,
-                (err or "")[:160],
+                inner_last_sc,
+                (inner_last_err or "")[:160],
                 scope,
             )
 
@@ -2200,6 +2283,21 @@ def _ai_route_chart_vision() -> tuple[str, ...]:
 def _deep_route_step_allowed(step: str) -> bool:
     """Groq skipped for oversized deep prompts."""
     return step != "groq"
+
+
+def _format_ai_route_errors(errs: list[str], *, route: tuple[str, ...], gemini_hint: bool) -> str:
+    """Join multi-step failover errors instead of exposing only the last hop."""
+    if not errs:
+        return "No AI route steps produced a reply."
+    sep = "\n⇢ "
+    out = sep.join(str(e).strip() for e in errs if str(e).strip())
+    hint = ""
+    if gemini_hint and any(step == "gemini" for step in route) and not (GEMINI_KEY or "").strip():
+        hint = (
+            "\n\nGEMINI_KEY is unset — Gemini steps in AI_ROUTE_* are silently skipped "
+            "(no failover after OpenRouter if the route relied on Gemini)."
+        )
+    return out + hint
 
 
 def _chart_route_step_allowed(step: str) -> bool:
@@ -4178,7 +4276,7 @@ def _chart_vision_via_openrouter(
             }
         ],
         model=_openrouter_vision_model(),
-        max_tokens=CHART_VISION_MAX_OUTPUT_TOKENS,
+        max_tokens=openrouter_chart_effective_output_cap(),
         temperature=0.3,
         key_scope=key_scope,
     )
@@ -4186,8 +4284,14 @@ def _chart_vision_via_openrouter(
 
 def _invoke_chart_vision_route(photo_bytes: bytes, prompt: str, mime: str) -> str:
     errs: list[str] = []
-    for step in _ai_route_chart_vision():
+    route = _ai_route_chart_vision()
+    for step in route:
         if not _chart_route_step_allowed(step) or not _ai_backend_route_ready(step):
+            if _chart_route_step_allowed(step):
+                log.info(
+                    "AI_ROUTE_CHART_VISION: skipping %s (backend not configured or empty pool)",
+                    step,
+                )
             continue
         scope = _openrouter_scope_for_route_token(step)
         try:
@@ -4202,9 +4306,7 @@ def _invoke_chart_vision_route(photo_bytes: bytes, prompt: str, mime: str) -> st
             log.warning("AI_ROUTE_CHART_VISION step=%s failed: %s", step, str(e)[:260])
             continue
     raise RuntimeError(
-        errs[-1]
-        if errs
-        else "No vision-capable backend available for chart analysis.",
+        _format_ai_route_errors(errs, route=route, gemini_hint=True),
     )
 
 
@@ -4233,7 +4335,7 @@ def _openrouter_deep_analysis(pair: str, price: float, *, key_scope: str = "heav
 
     return _openrouter_chat(
         [{"role": "user", "content": prompt}],
-        max_tokens=DEEP_ANALYSIS_MAX_OUTPUT_TOKENS,
+        max_tokens=openrouter_deep_effective_output_cap(),
         temperature=0.35,
         key_scope=key_scope,
     )
@@ -4278,8 +4380,14 @@ def _gemini_deep_analysis(pair: str, price: float) -> str:
 
 def _deep_analysis_llm_call(pair: str, price: float) -> str:
     errs: list[str] = []
-    for step in _ai_route_deep():
+    route = _ai_route_deep()
+    for step in route:
         if not _deep_route_step_allowed(step) or not _ai_backend_route_ready(step):
+            if _deep_route_step_allowed(step):
+                log.info(
+                    "AI_ROUTE_DEEP: skipping %s (backend not configured or empty key pool)",
+                    step,
+                )
             continue
         try:
             if step == "gemini":
@@ -4296,9 +4404,7 @@ def _deep_analysis_llm_call(pair: str, price: float) -> str:
             )
             continue
     raise RuntimeError(
-        errs[-1]
-        if errs
-        else "No deep-analysis backend available for this route.",
+        _format_ai_route_errors(errs, route=route, gemini_hint=True),
     )
 
 
