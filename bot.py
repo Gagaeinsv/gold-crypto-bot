@@ -5578,9 +5578,12 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                                         + f"\n\n📡 *Auto-signal!*{priority_tag} Score: *{a['score']}/100*")
                                 await safe_send(context.bot, cid, text,
                                                 reply_markup=kb_main_for(cid, plan, pair))
-                                ps.last_signal_time  = time.time()
                                 ps.last_signal_score = a["score"]
-                                ps.persist(cid, pair)
+                            # Always advance cooldown after an LLM run; otherwise last_signal_time
+                            # stayed stale when score < threshold → full_analysis every MONITOR tick
+                            # (huge token burn for all Pro/Diamond users × pairs).
+                            ps.last_signal_time = time.time()
+                            ps.persist(cid, pair)
 
 
 # ═══════════════════════════════════════════════════════════════════
