@@ -2285,6 +2285,21 @@ def _deep_route_step_allowed(step: str) -> bool:
     return step != "groq"
 
 
+def _format_ai_route_errors(errs: list[str], *, route: tuple[str, ...], gemini_hint: bool) -> str:
+    """Join multi-step failover errors instead of exposing only the last hop."""
+    if not errs:
+        return "No AI route steps produced a reply."
+    sep = "\n⇢ "
+    out = sep.join(str(e).strip() for e in errs if str(e).strip())
+    hint = ""
+    if gemini_hint and any(step == "gemini" for step in route) and not (GEMINI_KEY or "").strip():
+        hint = (
+            "\n\nGEMINI_KEY is unset — Gemini steps in AI_ROUTE_* are silently skipped "
+            "(no failover after OpenRouter if the route relied on Gemini)."
+        )
+    return out + hint
+
+
 def _chart_route_step_allowed(step: str) -> bool:
     """Groq skipped — no multimodal path for chart in this codebase."""
     return step != "groq"
@@ -4269,8 +4284,14 @@ def _chart_vision_via_openrouter(
 
 def _invoke_chart_vision_route(photo_bytes: bytes, prompt: str, mime: str) -> str:
     errs: list[str] = []
-    for step in _ai_route_chart_vision():
+    route = _ai_route_chart_vision()
+    for step in route:
         if not _chart_route_step_allowed(step) or not _ai_backend_route_ready(step):
+            if _chart_route_step_allowed(step):
+                log.info(
+                    "AI_ROUTE_CHART_VISION: skipping %s (backend not configured or empty pool)",
+                    step,
+                )
             continue
         scope = _openrouter_scope_for_route_token(step)
         try:
@@ -4285,9 +4306,7 @@ def _invoke_chart_vision_route(photo_bytes: bytes, prompt: str, mime: str) -> st
             log.warning("AI_ROUTE_CHART_VISION step=%s failed: %s", step, str(e)[:260])
             continue
     raise RuntimeError(
-        errs[-1]
-        if errs
-        else "No vision-capable backend available for chart analysis.",
+        _format_ai_route_errors(errs, route=route, gemini_hint=True),
     )
 
 
@@ -4361,8 +4380,14 @@ def _gemini_deep_analysis(pair: str, price: float) -> str:
 
 def _deep_analysis_llm_call(pair: str, price: float) -> str:
     errs: list[str] = []
-    for step in _ai_route_deep():
+    route = _ai_route_deep()
+    for step in route:
         if not _deep_route_step_allowed(step) or not _ai_backend_route_ready(step):
+            if _deep_route_step_allowed(step):
+                log.info(
+                    "AI_ROUTE_DEEP: skipping %s (backend not configured or empty key pool)",
+                    step,
+                )
             continue
         try:
             if step == "gemini":
@@ -4379,9 +4404,7 @@ def _deep_analysis_llm_call(pair: str, price: float) -> str:
             )
             continue
     raise RuntimeError(
-        errs[-1]
-        if errs
-        else "No deep-analysis backend available for this route.",
+        _format_ai_route_errors(errs, route=route, gemini_hint=True),
     )
 
 
