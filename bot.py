@@ -494,6 +494,37 @@ PAIRS: dict = {
 }
 DEFAULT_PAIR = "XAUUSD"
 
+
+def channel_scheduled_analysis_pairs() -> list[str]:
+    """
+    Pairs published to CHANNEL_ID when the hour hits CHANNEL_HOURS_UTC.
+    Each pair → full_analysis + groq_channel_post (one LLM request per pair per slot).
+
+    If CHANNEL_ANALYSIS_PAIRS is unset/empty → all keys in PAIRS (legacy, highest cost).
+    """
+    raw = os.getenv("CHANNEL_ANALYSIS_PAIRS", "").strip()
+    if not raw:
+        return list(PAIRS.keys())
+    picked: list[str] = []
+    for part in raw.split(","):
+        pid = part.strip().upper()
+        if pid in PAIRS and pid not in picked:
+            picked.append(pid)
+    if not picked:
+        log.warning(
+            "CHANNEL_ANALYSIS_PAIRS has no valid ids (valid: %s) — using all pairs",
+            ",".join(PAIRS.keys()),
+        )
+        return list(PAIRS.keys())
+    return picked
+
+
+def channel_articles_enabled() -> bool:
+    """Edu/news bot posts at ARTICLE_HOURS_UTC (~3 extra LLM generations/day)."""
+    v = os.getenv("CHANNEL_ARTICLES_ENABLED", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
 UNSPLASH_IMAGES = {
     "gold":        "https://images.unsplash.com/photo-1610375461246-83df859d849d?w=800&q=80",
     "bitcoin":     "https://images.unsplash.com/photo-1518546305927-5a555bb7020d?w=800&q=80",
@@ -5430,7 +5461,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
         #    using GROQ_MODEL_NEWS (high daily quota), not every monitor tick.
         if h in CHANNEL_HOURS_UTC and h != _last_channel_post_hour:
             _last_channel_post_hour = h
-            for pair in PAIRS:
+            for pair in channel_scheduled_analysis_pairs():
                 price = _prices.get(pair)
                 if not price:
                     continue
@@ -5457,7 +5488,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                     log.error("Channel post error (%s): %s", pair, e)
 
         # 3) Educational / news articles — Groq only in ARTICLE_HOURS_UTC, GROQ_MODEL_NEWS via groq_article().
-        if h in ARTICLE_HOURS_UTC and h != _last_article_hour:
+        if channel_articles_enabled() and h in ARTICLE_HOURS_UTC and h != _last_article_hour:
             _last_article_hour = h
             topic_type = "edu" if _article_index % 2 == 0 else "news"
             if topic_type == "edu":
@@ -6087,6 +6118,15 @@ def main() -> None:
     global _APP_REF
     db_init()
     log.info("DB initialised. Starting bot…")
+    ch_pairs = channel_scheduled_analysis_pairs()
+    log.info(
+        "Channel scheduled analysis: %s — %d pair(s) × %d UTC slot(s)/day (narrow with CHANNEL_ANALYSIS_PAIRS)",
+        ",".join(ch_pairs),
+        len(ch_pairs),
+        len(CHANNEL_HOURS_UTC),
+    )
+    if not channel_articles_enabled():
+        log.info("Channel articles disabled via CHANNEL_ARTICLES_ENABLED=0")
     log.info(
         "Groq: channel/articles=%s | user signals=%s | monitor interval=%ss",
         GROQ_MODEL_NEWS,
