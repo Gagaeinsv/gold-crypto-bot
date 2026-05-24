@@ -193,16 +193,32 @@ OPENROUTER_CHART_MAX_OUTPUT_TOKENS = max(
     OPENROUTER_OUTPUT_FLOOR + 32, min(_or_chart_cap, 65536)
 )
 
+# Last line of defence: clip every OpenRouter completion request unless explicitly raised via .env.
+# Prevents stray 8192 max_tokens burns when upstream env vars are misconfigured or an old compose file pins them high.
+try:
+    _ohard = int(os.getenv("OPENROUTER_HARD_OUTPUT_CAP", "1536").strip())
+except ValueError:
+    _ohard = 1536
+OPENROUTER_HARD_OUTPUT_CAP = max(
+    OPENROUTER_OUTPUT_FLOOR + 64, min(_ohard, 65536)
+)
+
 
 def openrouter_deep_effective_output_cap() -> int:
     """OpenRouter Deep Analysis ceiling (does not shrink Gemini budgets)."""
-    return min(DEEP_ANALYSIS_MAX_OUTPUT_TOKENS, OPENROUTER_DEEP_MAX_OUTPUT_TOKENS)
+    return min(
+        DEEP_ANALYSIS_MAX_OUTPUT_TOKENS,
+        OPENROUTER_DEEP_MAX_OUTPUT_TOKENS,
+        OPENROUTER_HARD_OUTPUT_CAP,
+    )
 
 
 def openrouter_chart_effective_output_cap() -> int:
-    return min(CHART_VISION_MAX_OUTPUT_TOKENS, OPENROUTER_CHART_MAX_OUTPUT_TOKENS)
-
-
+    return min(
+        CHART_VISION_MAX_OUTPUT_TOKENS,
+        OPENROUTER_CHART_MAX_OUTPUT_TOKENS,
+        OPENROUTER_HARD_OUTPUT_CAP,
+    )
 def _gemini_thinking_kw() -> dict:
     """Prefer disabling internal reasoning so visible output uses the token budget."""
     import google.genai.types as gtypes
@@ -2028,13 +2044,31 @@ def _openrouter_parse_affordable_output_cap(err_msg: str) -> int | None:
     """
     if not err_msg:
         return None
-    m = re.search(r"can\s+only\s+afford\s+(\d+)", err_msg, re.IGNORECASE)
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except ValueError:
-        return None
+    for pat in (
+        r"can\s+only\s+afford\s+(\d+)",
+        r"only\s+afford\s+(\d+)",
+        r"afford\s+(\d+)\s*(?:tokens?|output\b)",
+        r"must\s+(?:have|contain)\s+<=\s*(\d+)\s*tokens?",
+    ):
+        m = re.search(pat, err_msg, re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                return None
+    return None
+
+
+def _openrouter_suggests_fewer_max_tokens(http_status: int, err_msg: str) -> bool:
+    """Heuristic credit / budget errors where lowering max_tokens can help."""
+    m = (err_msg or "").lower()
+    if http_status == 402:
+        return True
+    if "fewer max_tokens" in m or "more credits" in m or "requires more credits" in m:
+        return True
+    if "cannot afford" in m or "can't afford" in m:
+        return True
+    return False
 
 
 def _openrouter_chat(
@@ -2076,7 +2110,10 @@ def _openrouter_chat(
     last_sc = 0
 
     for attempt, api_key in enumerate(order):
-        cap = max(OPENROUTER_OUTPUT_FLOOR, int(max_tokens))
+        cap = max(
+            OPENROUTER_OUTPUT_FLOOR,
+            min(int(max_tokens), OPENROUTER_HARD_OUTPUT_CAP),
+        )
         did_shrink = False
         inner_last_err, inner_last_sc = "", 0
         for _bump in range(12):
@@ -2103,6 +2140,21 @@ def _openrouter_chat(
                         cap,
                         nxt,
                         afforded,
+                        api_key[-4:] if len(api_key) >= 4 else "****",
+                    )
+                    cap = nxt
+                    did_shrink = True
+                    continue
+
+            # If API wording changes and we couldn't parse afford, bisect downwards on credit errors.
+            if _openrouter_suggests_fewer_max_tokens(sc, err or "") and cap > OPENROUTER_OUTPUT_FLOOR + 48:
+                nxt = max(OPENROUTER_OUTPUT_FLOOR, cap // 2)
+                if nxt < cap:
+                    log.warning(
+                        "OpenRouter: bisect max_tokens %s→%s (HTTP %s) key …%s",
+                        cap,
+                        nxt,
+                        sc,
                         api_key[-4:] if len(api_key) >= 4 else "****",
                     )
                     cap = nxt
