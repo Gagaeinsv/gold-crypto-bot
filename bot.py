@@ -4543,6 +4543,33 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
+
+def _looks_like_gemini_spend_cap(text: str) -> bool:
+    t = (text or "").lower()
+    return (
+        "resource_exhausted" in t
+        or "spending cap" in t
+        or "ai.studio/spend" in t
+        or "monthly spending cap" in t
+    )
+
+
+def _format_user_visible_llm_failure(exc: BaseException) -> str:
+    """Long multi-backend errors were truncated to 200 chars — users only saw the first hop."""
+    raw = str(exc).strip() or repr(exc)
+    if len(raw) > 3800:
+        raw = raw[:1900].rstrip() + "\n…\n" + raw[-1900:].lstrip()
+    tip = ""
+    if _looks_like_gemini_spend_cap(raw):
+        tip = (
+            "\n\n—\n💡 Це ліміт витрат Google AI Studio (Gemini), не тариф у Telegram-боті. "
+            "Керування cap: https://ai.studio/spend\n"
+            "Після помилки Gemini бот намагається OpenRouter, якщо він у ланцюжку AI_ROUTE_DEEP "
+            "і є ключі/кредити — нижче може бути друга причина."
+        )
+    return f"❌ {raw}{tip}"
+
+
 async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair: str) -> None:
     """Execute deep analysis for the given pair and user."""
     cfg = PAIRS[pair]
@@ -4576,7 +4603,7 @@ async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair:
         await reply("⏱ Analysis timed out (120s). Please try again.", parse_mode="Markdown")
         return
     except Exception as e:
-        await reply(f"❌ Error: {str(e)[:200]}")
+        await reply(_format_user_visible_llm_failure(e))
         log.error("Deep analysis error: %s", e)
         return
 
@@ -4767,9 +4794,7 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
 
     except Exception as e:
-        await update.message.reply_text(
-            f"❌ Analysis failed: {str(e)[:150]}\n\nTry again in a moment."
-        )
+        await update.message.reply_text(_format_user_visible_llm_failure(e))
         log.error("Chart analysis error: %s", e)
 
 
