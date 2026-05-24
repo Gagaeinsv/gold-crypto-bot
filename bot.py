@@ -85,6 +85,9 @@ OPENROUTER_402_CREDIT_HOLD_SEC = max(60, _or402_hold)
 # Optional explicit pools (comma-separated API keys). Defaults use OPENROUTER_API_KEY / _2.
 OPENROUTER_KEYS_LIGHT = os.getenv("OPENROUTER_KEYS_LIGHT", "").strip()
 OPENROUTER_KEYS_HEAVY = os.getenv("OPENROUTER_KEYS_HEAVY", "").strip()
+# Конвенція два ключі без явних OPENROUTER_KEYS_*:
+#   OPENROUTER_API_KEY  — першим (типово оплачений акаунт)
+#   OPENROUTER_API_KEY_2 — після failover першого (типово «безкоштовний» / менший ліміт)
 
 _openrouter_rr_lock = threading.Lock()
 # Per-pool round-robin cursor (light / heavy / merged).
@@ -113,7 +116,10 @@ def _dedupe_api_keys(keys: list[str]) -> list[str]:
 
 
 def _openrouter_keys_light() -> list[str]:
-    """Short / low max_tokens jobs: monitor JSON, article fallback, etc."""
+    """
+    Короткі запити: спочатку OPENROUTER_API_KEY (paid), далі OPENROUTER_API_KEYS*, останній
+    fallback — OPENROUTER_API_KEY_2 (free/reserve), без дублікатів.
+    """
     if OPENROUTER_KEYS_LIGHT:
         return _dedupe_api_keys(
             [p.strip() for p in OPENROUTER_KEYS_LIGHT.split(",") if p.strip()]
@@ -122,18 +128,30 @@ def _openrouter_keys_light() -> list[str]:
     if OPENROUTER_API_KEY:
         keys.append(OPENROUTER_API_KEY)
     keys.extend(k for k in _openrouter_legacy_extra_keys() if k not in keys)
+    if OPENROUTER_API_KEY_2 and OPENROUTER_API_KEY_2 not in keys:
+        keys.append(OPENROUTER_API_KEY_2)
     return _dedupe_api_keys(keys)
 
 
 def _openrouter_keys_heavy() -> list[str]:
-    """Long-form + vision on OpenRouter: deep analysis chart screenshots."""
+    """Long-form + vision on OpenRouter: deep analysis, chart screenshots (openrouter_heavy)."""
     if OPENROUTER_KEYS_HEAVY:
         return _dedupe_api_keys(
             [p.strip() for p in OPENROUTER_KEYS_HEAVY.split(",") if p.strip()]
         )
-    if OPENROUTER_API_KEY_2:
-        return [OPENROUTER_API_KEY_2]
-    # No dedicated heavy key — reuse light pool (same account / single key setups).
+    duo = _dedupe_api_keys(
+        [k for k in (OPENROUTER_API_KEY, OPENROUTER_API_KEY_2) if k]
+    )
+    if len(duo) >= 2:
+        # OPENROUTER_API_KEY (перший у .env) → OPENROUTER_API_KEY_2
+        return duo
+    if len(duo) == 1:
+        # One explicit key configured — reuse the light/auxiliary pool for extra keys without dropping them.
+        out = duo.copy()
+        for k in _openrouter_keys_light():
+            if k not in out:
+                out.append(k)
+        return out
     return _openrouter_keys_light()
 
 
@@ -193,16 +211,32 @@ OPENROUTER_CHART_MAX_OUTPUT_TOKENS = max(
     OPENROUTER_OUTPUT_FLOOR + 32, min(_or_chart_cap, 65536)
 )
 
+# Last line of defence: clip every OpenRouter completion request unless explicitly raised via .env.
+# Prevents stray 8192 max_tokens burns when upstream env vars are misconfigured or an old compose file pins them high.
+try:
+    _ohard = int(os.getenv("OPENROUTER_HARD_OUTPUT_CAP", "1536").strip())
+except ValueError:
+    _ohard = 1536
+OPENROUTER_HARD_OUTPUT_CAP = max(
+    OPENROUTER_OUTPUT_FLOOR + 64, min(_ohard, 65536)
+)
+
 
 def openrouter_deep_effective_output_cap() -> int:
     """OpenRouter Deep Analysis ceiling (does not shrink Gemini budgets)."""
-    return min(DEEP_ANALYSIS_MAX_OUTPUT_TOKENS, OPENROUTER_DEEP_MAX_OUTPUT_TOKENS)
+    return min(
+        DEEP_ANALYSIS_MAX_OUTPUT_TOKENS,
+        OPENROUTER_DEEP_MAX_OUTPUT_TOKENS,
+        OPENROUTER_HARD_OUTPUT_CAP,
+    )
 
 
 def openrouter_chart_effective_output_cap() -> int:
-    return min(CHART_VISION_MAX_OUTPUT_TOKENS, OPENROUTER_CHART_MAX_OUTPUT_TOKENS)
-
-
+    return min(
+        CHART_VISION_MAX_OUTPUT_TOKENS,
+        OPENROUTER_CHART_MAX_OUTPUT_TOKENS,
+        OPENROUTER_HARD_OUTPUT_CAP,
+    )
 def _gemini_thinking_kw() -> dict:
     """Prefer disabling internal reasoning so visible output uses the token budget."""
     import google.genai.types as gtypes
@@ -2028,13 +2062,31 @@ def _openrouter_parse_affordable_output_cap(err_msg: str) -> int | None:
     """
     if not err_msg:
         return None
-    m = re.search(r"can\s+only\s+afford\s+(\d+)", err_msg, re.IGNORECASE)
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except ValueError:
-        return None
+    for pat in (
+        r"can\s+only\s+afford\s+(\d+)",
+        r"only\s+afford\s+(\d+)",
+        r"afford\s+(\d+)\s*(?:tokens?|output\b)",
+        r"must\s+(?:have|contain)\s+<=\s*(\d+)\s*tokens?",
+    ):
+        m = re.search(pat, err_msg, re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                return None
+    return None
+
+
+def _openrouter_suggests_fewer_max_tokens(http_status: int, err_msg: str) -> bool:
+    """Heuristic credit / budget errors where lowering max_tokens can help."""
+    m = (err_msg or "").lower()
+    if http_status == 402:
+        return True
+    if "fewer max_tokens" in m or "more credits" in m or "requires more credits" in m:
+        return True
+    if "cannot afford" in m or "can't afford" in m:
+        return True
+    return False
 
 
 def _openrouter_chat(
@@ -2076,7 +2128,10 @@ def _openrouter_chat(
     last_sc = 0
 
     for attempt, api_key in enumerate(order):
-        cap = max(OPENROUTER_OUTPUT_FLOOR, int(max_tokens))
+        cap = max(
+            OPENROUTER_OUTPUT_FLOOR,
+            min(int(max_tokens), OPENROUTER_HARD_OUTPUT_CAP),
+        )
         did_shrink = False
         inner_last_err, inner_last_sc = "", 0
         for _bump in range(12):
@@ -2103,6 +2158,21 @@ def _openrouter_chat(
                         cap,
                         nxt,
                         afforded,
+                        api_key[-4:] if len(api_key) >= 4 else "****",
+                    )
+                    cap = nxt
+                    did_shrink = True
+                    continue
+
+            # If API wording changes and we couldn't parse afford, bisect downwards on credit errors.
+            if _openrouter_suggests_fewer_max_tokens(sc, err or "") and cap > OPENROUTER_OUTPUT_FLOOR + 48:
+                nxt = max(OPENROUTER_OUTPUT_FLOOR, cap // 2)
+                if nxt < cap:
+                    log.warning(
+                        "OpenRouter: bisect max_tokens %s→%s (HTTP %s) key …%s",
+                        cap,
+                        nxt,
+                        sc,
                         api_key[-4:] if len(api_key) >= 4 else "****",
                     )
                     cap = nxt
@@ -4491,6 +4561,33 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
+
+def _looks_like_gemini_spend_cap(text: str) -> bool:
+    t = (text or "").lower()
+    return (
+        "resource_exhausted" in t
+        or "spending cap" in t
+        or "ai.studio/spend" in t
+        or "monthly spending cap" in t
+    )
+
+
+def _format_user_visible_llm_failure(exc: BaseException) -> str:
+    """Long multi-backend errors were truncated to 200 chars — users only saw the first hop."""
+    raw = str(exc).strip() or repr(exc)
+    if len(raw) > 3800:
+        raw = raw[:1900].rstrip() + "\n…\n" + raw[-1900:].lstrip()
+    tip = ""
+    if _looks_like_gemini_spend_cap(raw):
+        tip = (
+            "\n\n—\n💡 Це ліміт витрат Google AI Studio (Gemini), не тариф у Telegram-боті. "
+            "Керування cap: https://ai.studio/spend\n"
+            "Після помилки Gemini бот намагається OpenRouter, якщо він у ланцюжку AI_ROUTE_DEEP "
+            "і є ключі/кредити — нижче може бути друга причина."
+        )
+    return f"❌ {raw}{tip}"
+
+
 async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair: str) -> None:
     """Execute deep analysis for the given pair and user."""
     cfg = PAIRS[pair]
@@ -4524,7 +4621,7 @@ async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair:
         await reply("⏱ Analysis timed out (120s). Please try again.", parse_mode="Markdown")
         return
     except Exception as e:
-        await reply(f"❌ Error: {str(e)[:200]}")
+        await reply(_format_user_visible_llm_failure(e))
         log.error("Deep analysis error: %s", e)
         return
 
@@ -4715,9 +4812,7 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
 
     except Exception as e:
-        await update.message.reply_text(
-            f"❌ Analysis failed: {str(e)[:150]}\n\nTry again in a moment."
-        )
+        await update.message.reply_text(_format_user_visible_llm_failure(e))
         log.error("Chart analysis error: %s", e)
 
 
