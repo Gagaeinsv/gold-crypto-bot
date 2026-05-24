@@ -65,17 +65,39 @@ log = logging.getLogger("bot")
 # ─────────────────────── Config from .env ───────────────────────
 load_dotenv()
 
-TOKEN        = os.getenv("TOKEN",        "INSERT_TOKEN")
-NEWS_API     = os.getenv("NEWS_API",     "INSERT_NEWS_API")
-GROQ_KEY     = os.getenv("GROQ_KEY",     "INSERT_GROQ_KEY")
+
+def _strip_env_val(raw: str | None) -> str:
+    """Trim whitespace / outer quotes from `.env` values (пробіли навколо `=`, скопійовані лапки)."""
+    if raw is None:
+        return ""
+    s = raw.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        s = s[1:-1].strip()
+    return s
+
+
+def _env_first_nonempty(names: tuple[str, ...]) -> str:
+    for name in names:
+        v = _strip_env_val(os.getenv(name))
+        if v:
+            return v
+    return ""
+
+
+# Telegram / NewsAPI / Groq — див. альтернативні назви в `.env.example`
+TOKEN = _env_first_nonempty(("TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN")) or "INSERT_TOKEN"
+NEWS_API = _env_first_nonempty(("NEWS_API", "NEWSAPI_KEY", "NEWS_API_KEY")) or "INSERT_NEWS_API"
+GROQ_KEY = _env_first_nonempty(("GROQ_KEY", "GROQ_API_KEY")) or "INSERT_GROQ_KEY"
 # OpenRouter — role-based key pools (light vs heavy workloads). See OPENROUTER_KEYS_* and AI_ROUTE_*.
-OPENROUTER_API_KEY     = os.getenv("OPENROUTER_API_KEY", "").strip()
-OPENROUTER_API_KEY_2   = os.getenv("OPENROUTER_API_KEY_2", "").strip()
-OPENROUTER_API_KEYS    = os.getenv("OPENROUTER_API_KEYS", "").strip()  # optional comma-separated extra keys
-OPENROUTER_MODEL       = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
-OPENROUTER_VISION_MODEL = os.getenv("OPENROUTER_VISION_MODEL", "")  # if empty, uses OPENROUTER_MODEL
-OPENROUTER_SITE_URL    = os.getenv("OPENROUTER_SITE_URL", "")   # optional HTTP-Referer for OpenRouter rankings
-OPENROUTER_APP_TITLE   = os.getenv("OPENROUTER_APP_TITLE", "Gold Crypto Trading Bot")
+OPENROUTER_API_KEY = _strip_env_val(os.getenv("OPENROUTER_API_KEY"))
+OPENROUTER_API_KEY_2 = _strip_env_val(os.getenv("OPENROUTER_API_KEY_2"))
+OPENROUTER_API_KEYS = _strip_env_val(os.getenv("OPENROUTER_API_KEYS"))  # optional comma-separated extra keys
+OPENROUTER_MODEL = _strip_env_val(os.getenv("OPENROUTER_MODEL")) or "openai/gpt-4o-mini"
+OPENROUTER_VISION_MODEL = _strip_env_val(os.getenv("OPENROUTER_VISION_MODEL"))
+OPENROUTER_SITE_URL = _strip_env_val(os.getenv("OPENROUTER_SITE_URL"))
+OPENROUTER_APP_TITLE = (
+    _strip_env_val(os.getenv("OPENROUTER_APP_TITLE")) or "Gold Crypto Trading Bot"
+)
 OPENROUTER_API_URL     = "https://openrouter.ai/api/v1/chat/completions"
 try:
     _or402_hold = int(os.getenv("OPENROUTER_402_CREDIT_HOLD_SEC", "3600"))
@@ -83,8 +105,9 @@ except ValueError:
     _or402_hold = 3600
 OPENROUTER_402_CREDIT_HOLD_SEC = max(60, _or402_hold)
 # Optional explicit pools (comma-separated API keys). Defaults use OPENROUTER_API_KEY / _2.
-OPENROUTER_KEYS_LIGHT = os.getenv("OPENROUTER_KEYS_LIGHT", "").strip()
-OPENROUTER_KEYS_HEAVY = os.getenv("OPENROUTER_KEYS_HEAVY", "").strip()
+OPENROUTER_KEYS_LIGHT = _strip_env_val(os.getenv("OPENROUTER_KEYS_LIGHT"))
+OPENROUTER_KEYS_HEAVY = _strip_env_val(os.getenv("OPENROUTER_KEYS_HEAVY"))
+# Два ключі без OPENROUTER_KEYS_*: OPENROUTER_API_KEY (типово основний/оплачений) → потім OPENROUTER_API_KEY_2 (резерв).
 
 _openrouter_rr_lock = threading.Lock()
 # Per-pool round-robin cursor (light / heavy / merged).
@@ -113,7 +136,10 @@ def _dedupe_api_keys(keys: list[str]) -> list[str]:
 
 
 def _openrouter_keys_light() -> list[str]:
-    """Short / low max_tokens jobs: monitor JSON, article fallback, etc."""
+    """
+    Спочатку OPENROUTER_API_KEY, далі OPENROUTER_API_KEYS*, наприкінці OPENROUTER_API_KEY_2 (ресерв).
+    Якщо задано OPENROUTER_KEYS_LIGHT — використовується лише він.
+    """
     if OPENROUTER_KEYS_LIGHT:
         return _dedupe_api_keys(
             [p.strip() for p in OPENROUTER_KEYS_LIGHT.split(",") if p.strip()]
@@ -122,18 +148,28 @@ def _openrouter_keys_light() -> list[str]:
     if OPENROUTER_API_KEY:
         keys.append(OPENROUTER_API_KEY)
     keys.extend(k for k in _openrouter_legacy_extra_keys() if k not in keys)
+    if OPENROUTER_API_KEY_2 and OPENROUTER_API_KEY_2 not in keys:
+        keys.append(OPENROUTER_API_KEY_2)
     return _dedupe_api_keys(keys)
 
 
 def _openrouter_keys_heavy() -> list[str]:
-    """Long-form + vision on OpenRouter: deep analysis chart screenshots."""
+    """Deep / multimodal на OpenRouter: за замовчуванням ключ 1 → ключ 2 (failover як у light)."""
     if OPENROUTER_KEYS_HEAVY:
         return _dedupe_api_keys(
             [p.strip() for p in OPENROUTER_KEYS_HEAVY.split(",") if p.strip()]
         )
-    if OPENROUTER_API_KEY_2:
-        return [OPENROUTER_API_KEY_2]
-    # No dedicated heavy key — reuse light pool (same account / single key setups).
+    duo = _dedupe_api_keys(
+        [k for k in (OPENROUTER_API_KEY, OPENROUTER_API_KEY_2) if k]
+    )
+    if len(duo) >= 2:
+        return duo
+    if len(duo) == 1:
+        out = duo.copy()
+        for k in _openrouter_keys_light():
+            if k not in out:
+                out.append(k)
+        return out
     return _openrouter_keys_light()
 
 
@@ -148,8 +184,8 @@ def _openrouter_keys_merged() -> list[str]:
 def _openrouter_configured() -> bool:
     return bool(_openrouter_keys_merged())
 # Google Gemini — deep analysis, chart vision, Groq 429 fallback (works alongside OpenRouter)
-GEMINI_KEY   = os.getenv("GEMINI_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_KEY = _env_first_nonempty(("GEMINI_KEY", "GEMINI_API_KEY"))
+GEMINI_MODEL = _strip_env_val(os.getenv("GEMINI_MODEL")) or "gemini-3.5-flash"
 try:
     _deep_out_cap = int(os.getenv("DEEP_ANALYSIS_MAX_OUTPUT_TOKENS", "8192").strip())
 except ValueError:
@@ -290,15 +326,16 @@ def _gemini_response_visible_text(response, *, context: str) -> str:
 
 
 # gemini | openrouter | auto  (auto prefers Gemini when GEMINI_KEY is set)
-DEEP_ANALYSIS_PROVIDER = os.getenv("DEEP_ANALYSIS_PROVIDER", "gemini").strip().lower()
-CHART_VISION_PROVIDER  = os.getenv("CHART_VISION_PROVIDER", "gemini").strip().lower()
-GOLD_API_KEY = os.getenv("GOLD_API_KEY", "")   # goldapi.io — spot price for XAU/XAG
-NOWPAYMENTS_API_KEY   = os.getenv("NOWPAYMENTS_API_KEY", "")
-NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "")
+DEEP_ANALYSIS_PROVIDER = (_strip_env_val(os.getenv("DEEP_ANALYSIS_PROVIDER")) or "gemini").lower()
+CHART_VISION_PROVIDER = (_strip_env_val(os.getenv("CHART_VISION_PROVIDER")) or "gemini").lower()
+GOLD_API_KEY = _env_first_nonempty(("GOLD_API_KEY",))
+NOWPAYMENTS_API_KEY = _strip_env_val(os.getenv("NOWPAYMENTS_API_KEY"))
+NOWPAYMENTS_IPN_SECRET = _strip_env_val(os.getenv("NOWPAYMENTS_IPN_SECRET"))
 NOWPAYMENTS_PAY_CURRENCY = (os.getenv("NOWPAYMENTS_PAY_CURRENCY", "usdttrc20").strip().lower() or "usdttrc20")
 # Public base URL of your server, used for NOWPayments IPN callback (must resolve for their servers).
 # NOWPayments often rejects http:// callbacks with HTTP 400; use HTTPS behind nginx/Caddy/Certbot.
-PUBLIC_BASE_URL       = os.getenv("PUBLIC_BASE_URL", "")
+_pbu = _strip_env_val(os.getenv("PUBLIC_BASE_URL"))
+PUBLIC_BASE_URL = _pbu.rstrip("/") if _pbu else ""
 if NOWPAYMENTS_API_KEY and PUBLIC_BASE_URL.strip() and PUBLIC_BASE_URL.lower().startswith("http://"):
     log.warning(
         "NOWPayments: PUBLIC_BASE_URL uses http:// — the API commonly rejects non-HTTPS ipn_callback_url "
@@ -314,9 +351,9 @@ def _parse_admin_id(raw: str | None) -> int:
         return 123456789
 
 
-ADMIN_ID = _parse_admin_id(os.getenv("ADMIN_ID", "123456789"))
-CHANNEL_ID   = os.getenv("CHANNEL_ID",  "@your_channel")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "@your_bot")
+ADMIN_ID = _parse_admin_id(_env_first_nonempty(("ADMIN_ID", "TELEGRAM_ADMIN_ID")) or "123456789")
+CHANNEL_ID = _env_first_nonempty(("CHANNEL_ID", "TELEGRAM_CHANNEL_ID")) or "@your_channel"
+BOT_USERNAME = _env_first_nonempty(("BOT_USERNAME", "TELEGRAM_BOT_USERNAME")) or "@your_bot"
 
 
 def bot_telegram_url() -> str:
@@ -341,9 +378,13 @@ def bot_link_html() -> str:
 
 # Groq: use a high-quota model for channel + articles vs a stronger model for per-user signals
 # (free tier: 8b ≈ 14k req/day, 70b ≈ 1k req/day — see Groq dashboard).
-GROQ_MODEL_NEWS    = os.getenv("GROQ_MODEL_NEWS", "llama-3.1-8b-instant")
-GROQ_MODEL_SIGNALS = os.getenv("GROQ_MODEL_SIGNALS", "llama-3.3-70b-versatile")
-_LEGACY_GROQ_MODEL  = os.getenv("GROQ_MODEL", "").strip()
+GROQ_MODEL_NEWS = (
+    _strip_env_val(os.getenv("GROQ_MODEL_NEWS")) or "llama-3.1-8b-instant"
+)
+GROQ_MODEL_SIGNALS = (
+    _strip_env_val(os.getenv("GROQ_MODEL_SIGNALS")) or "llama-3.3-70b-versatile"
+)
+_LEGACY_GROQ_MODEL = _strip_env_val(os.getenv("GROQ_MODEL"))
 if _LEGACY_GROQ_MODEL:
     log.warning(
         "GROQ_MODEL is deprecated; set GROQ_MODEL_NEWS (channel/articles) and "
@@ -5667,7 +5708,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 #  TradingView webhook  (aiohttp server alongside PTB)
 # ═══════════════════════════════════════════════════════════════════
 
-TV_WEBHOOK_SECRET = os.getenv("TV_WEBHOOK_SECRET", "change_this_secret_123")
+TV_WEBHOOK_SECRET = _strip_env_val(os.getenv("TV_WEBHOOK_SECRET")) or "change_this_secret_123"
 TV_WEBHOOK_PORT   = int(os.getenv("TV_WEBHOOK_PORT", "8080"))
 
 # Pine Script template printed at /forcepost --help
