@@ -17,6 +17,7 @@ Env: Groq/OpenRouter pools/Gemini; `AI_ROUTE_*`; OpenRouter pools; Gemini `GEMIN
 import asyncio
 import base64
 import concurrent.futures
+import copy
 import csv
 import io
 import json
@@ -1986,11 +1987,24 @@ def _openrouter_hold_key_credit_low(api_key: str) -> None:
 
 def _openrouter_failover_eligible(http_status: int, err_msg: str) -> bool:
     """Whether to try the next API key (quota / transient), not e.g. invalid JSON body."""
+    em = err_msg or ""
+    m_low = em.lower()
     if http_status == 400:
+        # Context / prompt-length limits vary by key or plan — try the next pooled key after shrink.
+        if "prompt tokens limit exceeded" in m_low:
+            return True
+        if "context length" in m_low or "context exceeded" in m_low:
+            return True
+        if (
+            ("token" in m_low or "tokens" in m_low)
+            and "limit" in m_low
+            and ("exceed" in m_low or "exceeded" in m_low or "too large" in m_low or "too long" in m_low)
+        ):
+            return True
         return False
     if http_status in (401, 402, 408, 429, 502, 503, 529):
         return True
-    m = (err_msg or "").lower()
+    m = em.lower()
     if "rate" in m and "limit" in m:
         return True
     if "quota" in m or "exceed" in m:
@@ -2077,6 +2091,95 @@ def _openrouter_parse_affordable_output_cap(err_msg: str) -> int | None:
     return None
 
 
+def _openrouter_parse_prompt_tokens_exceeded(err_msg: str) -> tuple[int, int] | None:
+    """
+    OpenRouter (and some gateways) reject oversized prompts:
+    \"Prompt tokens limit exceeded: 1174 > 885\" → used=1174, allowed=885.
+    """
+    if not err_msg:
+        return None
+    m = re.search(
+        r"prompt\s+tokens?\s+limit\s+exceeded[:\s]*(\d+)\s*>\s*(\d+)",
+        err_msg,
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    try:
+        return int(m.group(1)), int(m.group(2))
+    except ValueError:
+        return None
+
+
+def _openrouter_force_clip_prompt_for_chars(text: str, max_chars: int) -> str:
+    """Last resort: preserve OUTPUT FORMAT tail if present."""
+    if len(text) <= max_chars:
+        return text
+    sep_fmt = "═══ REQUIRED OUTPUT FORMAT ═══"
+    guard = "\n… [truncated for OpenRouter context limit] …\n"
+    if sep_fmt in text:
+        ix = text.index(sep_fmt)
+        tail = text[ix:]
+        room = max_chars - len(tail) - len(guard)
+        if room >= 280:
+            return text[:room].rstrip() + guard + tail
+        return (tail[-(max_chars - 40) :]).strip()
+    half = max(200, max_chars // 2 - len(guard) // 2)
+    return (
+        text[:half].rstrip()
+        + guard
+        + text[-half :].lstrip()
+    )
+
+
+def _openrouter_compact_deep_prompt_for_context(
+    body: str, allowed_prompt_tokens: int,
+) -> str:
+    """Shrink deep-analysis prompts when OpenRouter enforces tiny prompt/context caps."""
+    allowed_prompt_tokens = max(96, int(allowed_prompt_tokens))
+    # Conservative char budget; tokenizer counts symbols / multilingual text differently.
+    budget_chars = max(1400, int(allowed_prompt_tokens * 3))
+
+    sep_mac = "═══ MACRO & NEWS ═══"
+    sep_fmt = "═══ REQUIRED OUTPUT FORMAT ═══"
+    squeezed = body
+    if sep_mac in body and sep_fmt in body:
+        i_m_end = body.index(sep_mac) + len(sep_mac)
+        i_f = body.index(sep_fmt)
+        head = body[:i_m_end]
+        macro = body[i_m_end:i_f]
+        tail = body[i_f:]
+        overhead = len(head) + len(tail)
+        macro_budget = budget_chars - overhead - 56
+        macro_budget = max(64, macro_budget)
+        mc = macro.strip()
+        if len(mc) > macro_budget:
+            mc = mc[:macro_budget].rstrip() + "…"
+        squeezed = head + "\n" + mc + "\n\n" + tail
+
+    if len(squeezed) > budget_chars:
+        squeezed = _openrouter_force_clip_prompt_for_chars(squeezed, budget_chars)
+    return squeezed
+
+
+def _openrouter_try_shrink_single_user_prompt_messages(
+    messages: list, allowed_prompt_tokens: int,
+) -> list | None:
+    """If messages are a single string user prompt, return a shrunk copy or None."""
+    if len(messages) != 1:
+        return None
+    m0 = messages[0]
+    if not isinstance(m0, dict) or (m0.get("role") or "") != "user":
+        return None
+    txt = m0.get("content")
+    if not isinstance(txt, str):
+        return None
+    new_txt = _openrouter_compact_deep_prompt_for_context(txt, allowed_prompt_tokens)
+    if new_txt == txt:
+        return None
+    return [{"role": "user", "content": new_txt}]
+
+
 def _openrouter_suggests_fewer_max_tokens(http_status: int, err_msg: str) -> bool:
     """Heuristic credit / budget errors where lowering max_tokens can help."""
     m = (err_msg or "").lower()
@@ -2133,9 +2236,12 @@ def _openrouter_chat(
             min(int(max_tokens), OPENROUTER_HARD_OUTPUT_CAP),
         )
         did_shrink = False
+        shrunk_prompt = False
+        work_messages = copy.deepcopy(messages)
         inner_last_err, inner_last_sc = "", 0
-        for _bump in range(12):
+        for _bump in range(14):
             post_payload = dict(payload)
+            post_payload["messages"] = work_messages
             post_payload["max_tokens"] = cap
             ok, text, sc, err = _openrouter_post_once(api_key, post_payload)
             if ok:
@@ -2148,6 +2254,25 @@ def _openrouter_chat(
                 return text
 
             inner_last_err, inner_last_sc = err, sc
+
+            pt_lim = _openrouter_parse_prompt_tokens_exceeded(inner_last_err or "")
+            if pt_lim is not None and not shrunk_prompt:
+                used_prompt, prompt_cap = pt_lim
+                nxt_msgs = _openrouter_try_shrink_single_user_prompt_messages(
+                    work_messages,
+                    prompt_cap,
+                )
+                if nxt_msgs is not None:
+                    work_messages = nxt_msgs
+                    shrunk_prompt = True
+                    did_shrink = True
+                    log.warning(
+                        "OpenRouter: shrunk user prompt (~%s > cap %s reported) key …%s",
+                        used_prompt,
+                        prompt_cap,
+                        api_key[-4:] if len(api_key) >= 4 else "****",
+                    )
+                    continue
 
             afforded = _openrouter_parse_affordable_output_cap(err or "")
             if afforded is not None:
@@ -4572,19 +4697,37 @@ def _looks_like_gemini_spend_cap(text: str) -> bool:
     )
 
 
+def _looks_like_openrouter_prompt_cap(text: str) -> bool:
+    t = (text or "").lower()
+    return (
+        "prompt tokens limit exceeded" in t
+        or "openrouter" in t and "prompt token" in t and ("limit" in t or "exceed" in t)
+    )
+
+
 def _format_user_visible_llm_failure(exc: BaseException) -> str:
-    """Long multi-backend errors were truncated to 200 chars — users only saw the first hop."""
+    """Surface multi-backend failover chains (Gemini→OpenRouter) without useless truncation."""
     raw = str(exc).strip() or repr(exc)
     if len(raw) > 3800:
         raw = raw[:1900].rstrip() + "\n…\n" + raw[-1900:].lstrip()
-    tip = ""
+    tips: list[str] = []
     if _looks_like_gemini_spend_cap(raw):
-        tip = (
-            "\n\n—\n💡 Це ліміт витрат Google AI Studio (Gemini), не тариф у Telegram-боті. "
+        tips.append(
+            "—\n💡 Це ліміт витрат Google AI Studio (Gemini), не тариф у Telegram-боті. "
             "Керування cap: https://ai.studio/spend\n"
             "Після помилки Gemini бот намагається OpenRouter, якщо він у ланцюжку AI_ROUTE_DEEP "
-            "і є ключі/кредити — нижче може бути друга причина."
+            "або AI_ROUTE_CHART_VISION і є ключі та кредити — нижче може бути друга причина.",
         )
+    if _looks_like_openrouter_prompt_cap(raw):
+        tips.append(
+            "—\n💡 На OpenRouter у цього ключа малий ліміт prompt/context (часто новий або "
+            "\"free\" профіль із низьким лімітом). Перевір кредити та обмеження: "
+            "https://openrouter.ai/settings/credits\n"
+            "Для deep-промптів бот автоматично стискає блок новин; скріни графіка займають багато токенів — "
+            "на дуже малих лімітах використовуй інший ключ у OPENROUTER_API_KEY (основний) або "
+            "підніми spend cap у Gemini і тимчасово обійдись без OpenRouter.",
+        )
+    tip = ("\n\n" + "\n\n".join(tips)) if tips else ""
     return f"❌ {raw}{tip}"
 
 
