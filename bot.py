@@ -4562,29 +4562,78 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 
-def _looks_like_gemini_spend_cap(text: str) -> bool:
+def _looks_like_gemini_daily_requests_quota(text: str) -> bool:
+    """`generate_requests_per_model_per_day` — RPD quota, distinct from AI Studio monthly spend."""
     t = (text or "").lower()
     return (
-        "resource_exhausted" in t
-        or "spending cap" in t
-        or "ai.studio/spend" in t
-        or "monthly spending cap" in t
+        "generate_requests_per_model_per_day" in t
+        or (
+            "quota exceeded for metric" in t
+            and ("per_day" in t or "requests_per_day" in t or "requests per day" in t)
+        )
     )
 
 
+def _looks_like_gemini_ai_studio_monthly_cap(text: str) -> bool:
+    return (
+        "spending cap" in (text or "").lower()
+        or "monthly spending cap" in (text or "").lower()
+        or "ai.studio/spend" in (text or "").lower()
+    )
+
+
+def _looks_like_gemini_resource_exhausted_generic(text: str) -> bool:
+    return "resource_exhausted" in (text or "").lower()
+
+
+def _looks_like_openrouter_insufficient_credits(text: str) -> bool:
+    return "insufficient credits" in (text or "").lower()
+
+
 def _format_user_visible_llm_failure(exc: BaseException) -> str:
-    """Long multi-backend errors were truncated to 200 chars — users only saw the first hop."""
+    """Multi-backend Gemini→OpenRouter errors: pick the hint that matches the API wording."""
     raw = str(exc).strip() or repr(exc)
     if len(raw) > 3800:
         raw = raw[:1900].rstrip() + "\n…\n" + raw[-1900:].lstrip()
-    tip = ""
-    if _looks_like_gemini_spend_cap(raw):
-        tip = (
-            "\n\n—\n💡 Це ліміт витрат Google AI Studio (Gemini), не тариф у Telegram-боті. "
-            "Керування cap: https://ai.studio/spend\n"
-            "Після помилки Gemini бот намагається OpenRouter, якщо він у ланцюжку AI_ROUTE_DEEP "
-            "і є ключі/кредити — нижче може бути друга причина."
+    tips: list[str] = []
+    gemini_tip_done = False
+    if _looks_like_gemini_daily_requests_quota(raw):
+        gemini_tip_done = True
+        tips.append(
+            "—\n💡 Це **добова квота кількості запитів** (RPD) до Gemini для **моделі з тексту помилки** "
+            "(наприклад `gemini-2.5-flash`). Бот використовує `GEMINI_MODEL` з `.env`, який реально підхопив "
+            "сервер під час деплою — якщо в помилці інша версія моделі, ніж очікуєте, перевірте `.env`/рестарт процесу. "
+            "Різні `model id` зазвичай мають **окремі** денні лічильники; перехід на іншу версію може допомогти "
+            'після "вибивання" денного ліміту на одній із них.\n'
+            "Документація: https://ai.google.dev/gemini-api/docs/rate-limits та моніторинг: "
+            "https://ai.dev/rate-limit — це **не те саме**, що monthly spend cap у AI Studio.",
         )
+    elif _looks_like_gemini_ai_studio_monthly_cap(raw):
+        gemini_tip_done = True
+        tips.append(
+            "—\n💡 Це обмеження **місячних витрат (spend cap)** у Google AI Studio / билінгу Gemini, не тариф "
+            "у Telegram-боті. Перевір: https://ai.studio/spend",
+        )
+    elif _looks_like_gemini_resource_exhausted_generic(raw):
+        gemini_tip_done = True
+        tips.append(
+            "—\n💡 `RESOURCE_EXHAUSTED`: у Gemini це або **денна квота запитів**, або **місячний cap / тариф**. "
+            "Зістав текст помилки з https://ai.google.dev/gemini-api/docs/rate-limits та https://ai.studio/spend",
+        )
+
+    if gemini_tip_done and "⇢ openrouter" in raw:
+        tips.append(
+            "—\nПісля Gemini бот переходить на OpenRouter за `AI_ROUTE_*`, якщо він указаний далі "
+            "у ланцюжку й є активні ключі — рядки після ⇢ нижче — це вже помилки наступних бекендів.",
+        )
+
+    if _looks_like_openrouter_insufficient_credits(raw):
+        tips.append(
+            "—\n💡 OpenRouter: **Insufficient credits** — поповни баланс або змініть ключ "
+            "(https://openrouter.ai/settings/credits ).",
+        )
+
+    tip = ("\n\n" + "\n\n".join(tips)) if tips else ""
     return f"❌ {raw}{tip}"
 
 
