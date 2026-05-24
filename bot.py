@@ -33,6 +33,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from datetime import UTC, date, datetime, timedelta
 from email.utils import parsedate_to_datetime
+from zoneinfo import ZoneInfo
 from textwrap import dedent
 
 import requests
@@ -418,10 +419,10 @@ USD_DIAMOND_3   = 49.99
 # NOWPayments: Basic (incl. 3mo crypto) violates fair price vs gateway minimum — crypto only Pro 3mo + Diamond.
 CRYPTO_PAY_ALLOWED = frozenset({("pro", 3), ("diamond", 1), ("diamond", 3)})
 DB_PATH           = "users.db"
-CHANNEL_HOURS_UTC = [6, 12, 18]   # market analysis posts (UTC)
+# Planned channel *articles* (LLM body) — still wall-clock UTC here.
 ARTICLE_HOURS_UTC = [8, 14, 20]   # article posts — separate from analysis
-# Background job interval (seconds). Channel Groq runs only when the hour hits
-# CHANNEL_HOURS_UTC / ARTICLE_HOURS_UTC — not on every tick.
+# Planned channel market analysis: код нижче — 1 пара на годину, локально Europe/Kyiv 09–18 (10 постів/день).
+# Background job interval (seconds). Scheduled channel/article LLM fires when the calendar hour rolls.
 MONITOR_INTERVAL_SEC = max(15, int(os.getenv("MONITOR_INTERVAL_SEC", "60")))
 AUTO_COOLDOWN     = 30 * 60        # seconds between auto-signals
 
@@ -494,13 +495,18 @@ PAIRS: dict = {
 }
 DEFAULT_PAIR = "XAUUSD"
 
+# Канальні огляди (LLM): одна пара на календарну годину, локальний ранок o 09:00, 10 годин підряд, потім пауза до завтра.
+CHANNEL_ANALYSIS_TZ_NAME = "Europe/Kyiv"
+CHANNEL_ANALYSIS_LOCAL_START_HOUR = 9
+CHANNEL_ANALYSIS_HOURLY_SLOTS = 10  # години включно від START до START+SLOTS-1
+
 
 def channel_scheduled_analysis_pairs() -> list[str]:
     """
-    Pairs published to CHANNEL_ID when the hour hits CHANNEL_HOURS_UTC.
-    Each pair → full_analysis + groq_channel_post (one LLM request per pair per slot).
+    Порядок пар для порожніх слот-oв 0..N-1 під час годинникового каналу (Kyiv).
 
-    If CHANNEL_ANALYSIS_PAIRS is unset/empty → all keys in PAIRS (legacy, highest cost).
+    Якщо CHANNEL_ANALYSIS_PAIRS у `.env` заданий — лише він (доречно з телефона лишити порожнім).
+    Інакше — усі ключі PAIRS у стабільному порядку (золото першим тощо).
     """
     raw = os.getenv("CHANNEL_ANALYSIS_PAIRS", "").strip()
     if not raw:
@@ -520,9 +526,30 @@ def channel_scheduled_analysis_pairs() -> list[str]:
 
 
 def channel_articles_enabled() -> bool:
-    """Edu/news bot posts at ARTICLE_HOURS_UTC (~3 extra LLM generations/day)."""
-    v = os.getenv("CHANNEL_ARTICLES_ENABLED", "1").strip().lower()
-    return v not in ("0", "false", "no", "off")
+    """Edu/news за ARTICLE_HOURS_UTC. За замовчуванням вимкнено — у `.env` лише ключі; увімкнути явно CHANNEL_ARTICLES_ENABLED=1."""
+    v = os.getenv("CHANNEL_ARTICLES_ENABLED", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def channel_analysis_local_datetime() -> datetime:
+    """Поточний «настінний» час для розкладу каналу (Kyiv або UTC fallback)."""
+    try:
+        return datetime.now(ZoneInfo(CHANNEL_ANALYSIS_TZ_NAME))
+    except Exception:
+        log.warning(
+            "%r timezone unavailable — using UTC for channel hourly schedule",
+            CHANNEL_ANALYSIS_TZ_NAME,
+        )
+        return datetime.now(UTC)
+
+
+def post_type_for_channel_local_hour(local_hour: int) -> str:
+    """Morning/midday/evening підпис якщо промпт його використовує."""
+    if local_hour < 12:
+        return "morning"
+    if local_hour < 16:
+        return "midday"
+    return "evening"
 
 
 UNSPLASH_IMAGES = {
@@ -1613,8 +1640,8 @@ class UserState:
 USERS: dict[int, UserState] = {}
 _prices:      dict[str, float | None] = {p: None for p in PAIRS}
 _prev_prices: dict[str, float | None] = {p: None for p in PAIRS}
-_last_channel_post_hour: int = -1
-_last_article_hour:      int = -1
+_last_channel_analysis_slot: tuple[date, int] | None = None
+_last_article_hour:          int = -1
 _article_index:          int = 0
 
 
@@ -5440,7 +5467,7 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ═══════════════════════════════════════════════════════════════════
 
 async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
-    global _last_channel_post_hour, _last_article_hour, _article_index
+    global _last_channel_analysis_slot, _last_article_hour, _article_index
 
     if _monitor_lock.locked():
         log.warning("monitor: already running, skipping tick")
@@ -5457,35 +5484,73 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
         now_utc = datetime.now(UTC)
         h = now_utc.hour
 
-        # 2) Channel market-analysis posts — Groq only in CHANNEL_HOURS_UTC (~few times/day),
-        #    using GROQ_MODEL_NEWS (high daily quota), not every monitor tick.
-        if h in CHANNEL_HOURS_UTC and h != _last_channel_post_hour:
-            _last_channel_post_hour = h
-            for pair in channel_scheduled_analysis_pairs():
+        # 2) Channel market analysis: 1 pair per local hour (Kyiv 09:00–18:59) = 10 LLM/day total.
+        dt_ch = channel_analysis_local_datetime()
+        d_ch, h_ch = dt_ch.date(), dt_ch.hour
+        h0 = CHANNEL_ANALYSIS_LOCAL_START_HOUR
+        h1 = h0 + CHANNEL_ANALYSIS_HOURLY_SLOTS
+        if h0 <= h_ch < h1:
+            slot_key = (d_ch, h_ch)
+            if slot_key != _last_channel_analysis_slot:
+                slot_idx = h_ch - h0
+                pairs_ord = channel_scheduled_analysis_pairs()
+                pair = pairs_ord[slot_idx % len(pairs_ord)]
                 price = _prices.get(pair)
                 if not price:
-                    continue
-                try:
-                    a    = await asyncio.to_thread(
-                        full_analysis, price, _prev_prices.get(pair), pair, GROQ_MODEL_NEWS,
+                    log.warning(
+                        "Channel hourly: awaiting price for %s (slot Kyiv %02d)",
+                        pair,
+                        h_ch,
                     )
-                    text = groq_channel_post(a, post_type_for_hour(h))
-                    cfg  = PAIRS[pair]
-                    sent = await safe_send_photo(context.bot, CHANNEL_ID, cfg["image"], text)
-                    if not sent:
-                        await safe_send(context.bot, CHANNEL_ID, text)
-                    db_save_post(pair, post_type_for_hour(h),
-                                 a["score"], a["ai"].get("sentiment", "?"), price, 0)
-                    # Save to signals table for backtesting
-                    ai  = a["ai"]
-                    dr, _ = _direction(ai, a["trend"], a.get("tech"))
-                    sl  = ai.get("stop_loss") or round(price * (1 - cfg["sl_pct"] / 100), 2)
-                    tp  = ai.get("take_profit") or round(price * (1 + cfg["tp_pct"] / 100), 2)
-                    db_save_signal(pair, dr, price, float(sl), float(tp),
-                                   a["score"], ai.get("sentiment", "neutral"), source="ai")
-                    log.info("Channel: analysis %s published (score=%s)", pair, a["score"])
-                except Exception as e:
-                    log.error("Channel post error (%s): %s", pair, e)
+                else:
+                    pt = post_type_for_channel_local_hour(h_ch)
+                    try:
+                        a = await asyncio.to_thread(
+                            full_analysis,
+                            price,
+                            _prev_prices.get(pair),
+                            pair,
+                            GROQ_MODEL_NEWS,
+                        )
+                        text = groq_channel_post(a, pt)
+                        cfg = PAIRS[pair]
+                        sent = await safe_send_photo(context.bot, CHANNEL_ID, cfg["image"], text)
+                        if not sent:
+                            await safe_send(context.bot, CHANNEL_ID, text)
+                        db_save_post(pair, pt, a["score"], a["ai"].get("sentiment", "?"), price, 0)
+                        ai = a["ai"]
+                        dr, _ = _direction(ai, a["trend"], a.get("tech"))
+                        sl = ai.get("stop_loss") or round(
+                            price * (1 - cfg["sl_pct"] / 100),
+                            2,
+                        )
+                        tp = ai.get("take_profit") or round(
+                            price * (1 + cfg["tp_pct"] / 100),
+                            2,
+                        )
+                        db_save_signal(
+                            pair,
+                            dr,
+                            price,
+                            float(sl),
+                            float(tp),
+                            a["score"],
+                            ai.get("sentiment", "neutral"),
+                            source="ai",
+                        )
+                        log.info(
+                            "Channel (%s local %s:%02d slot %d): %s published (score=%s)",
+                            CHANNEL_ANALYSIS_TZ_NAME,
+                            d_ch,
+                            h_ch,
+                            slot_idx,
+                            pair,
+                            a["score"],
+                        )
+                    except Exception as e:
+                        log.error("Channel post error (%s): %s", pair, e)
+                    else:
+                        _last_channel_analysis_slot = slot_key
 
         # 3) Educational / news articles — Groq only in ARTICLE_HOURS_UTC, GROQ_MODEL_NEWS via groq_article().
         if channel_articles_enabled() and h in ARTICLE_HOURS_UTC and h != _last_article_hour:
@@ -6120,13 +6185,16 @@ def main() -> None:
     log.info("DB initialised. Starting bot…")
     ch_pairs = channel_scheduled_analysis_pairs()
     log.info(
-        "Channel scheduled analysis: %s — %d pair(s) × %d UTC slot(s)/day (narrow with CHANNEL_ANALYSIS_PAIRS)",
-        ",".join(ch_pairs),
-        len(ch_pairs),
-        len(CHANNEL_HOURS_UTC),
+        "Channel analysis: hourly %s %02d:00–%02d:59 → %d Groq posts/day "
+        "(optional CHANNEL_ANALYSIS_PAIRS in env; default all PAIRS in order)",
+        CHANNEL_ANALYSIS_TZ_NAME,
+        CHANNEL_ANALYSIS_LOCAL_START_HOUR,
+        CHANNEL_ANALYSIS_LOCAL_START_HOUR + CHANNEL_ANALYSIS_HOURLY_SLOTS - 1,
+        CHANNEL_ANALYSIS_HOURLY_SLOTS,
     )
+    log.info("Channel pair rotation base order: %s", ",".join(ch_pairs))
     if not channel_articles_enabled():
-        log.info("Channel articles disabled via CHANNEL_ARTICLES_ENABLED=0")
+        log.info("Channel articles off (enable with CHANNEL_ARTICLES_ENABLED=1)")
     log.info(
         "Groq: channel/articles=%s | user signals=%s | monitor interval=%ss",
         GROQ_MODEL_NEWS,
