@@ -1577,7 +1577,7 @@ def db_utm_stats() -> dict:
 
 class PairState:
     __slots__ = ("entry_price", "running", "waiting_entry_price",
-                 "sl_warning_sent", "last_signal_time", "last_signal_score")
+                 "sl_warning_sent", "last_signal_time", "last_signal_score", "last_check_time")
 
     def __init__(self) -> None:
         self.entry_price:         float | None = None
@@ -1586,6 +1586,7 @@ class PairState:
         self.sl_warning_sent:     bool         = False
         self.last_signal_time:    float        = 0.0
         self.last_signal_score:   int          = 0
+        self.last_check_time:     float        = 0.0
 
     @property
     def has_trade(self) -> bool:
@@ -2829,8 +2830,11 @@ def _direction(ai: dict, trend: str, tech: dict | None) -> tuple[str, str]:
     return "SELL", "📉"
 
 
+_analysis_cache: dict[str, dict] = {}
+ANALYSIS_CACHE_TTL = 15 * 60  # 15 minutes
+
 def full_analysis(price: float, prev: float | None, pair: str,
-                  groq_model: str | None = None) -> dict:
+                  groq_model: str | None = None, bypass_cache: bool = False) -> dict:
     """
     Run all data fetching in parallel using threads.
     Total time = max(slowest request) instead of sum of all requests.
@@ -2838,7 +2842,22 @@ def full_analysis(price: float, prev: float | None, pair: str,
     ``groq_model`` — Groq chat model id. Default: ``GROQ_MODEL_SIGNALS`` (user-facing).
     Channel / admin broadcast: pass ``GROQ_MODEL_NEWS`` (higher free-tier quota).
     """
+    global _analysis_cache
     import concurrent.futures as cf
+
+    now = time.time()
+    if not bypass_cache and pair in _analysis_cache:
+        cached = _analysis_cache[pair]
+        time_diff = now - cached["time"]
+        price_diff_pct = abs(price - cached["price"]) / cached["price"] * 100 if cached["price"] else 0
+
+        # Reuse cache if within TTL and price has not moved more than 0.5%
+        if time_diff < ANALYSIS_CACHE_TTL and price_diff_pct < 0.5:
+            log.info("Using cached full_analysis for %s (age: %d seconds, price diff: %.2f%%)",
+                     pair, int(time_diff), price_diff_pct)
+            res = cached["result"].copy()
+            res["price"] = price
+            return res
 
     ref   = prev or price
     diff  = (price - ref) / ref * 100
@@ -2875,8 +2894,16 @@ def full_analysis(price: float, prev: float | None, pair: str,
     ai    = groq_analysis(news, price, tech, trend, vol, pair, use_llm)
     score = _calc_score(tech, ai, econ, trend, vol)
 
-    return dict(pair=pair, price=price, trend=trend, vol=vol,
-                tech=tech, ai=ai, econ=econ, score=score)
+    result = dict(pair=pair, price=price, trend=trend, vol=vol,
+                  tech=tech, ai=ai, econ=econ, score=score)
+
+    # Save to global cache
+    _analysis_cache[pair] = {
+        "time": now,
+        "price": price,
+        "result": result
+    }
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -4064,7 +4091,7 @@ async def cmd_forcepost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     a    = await asyncio.to_thread(
-        full_analysis, price, _prev_prices.get(pair), pair, GROQ_MODEL_NEWS,
+        full_analysis, price, _prev_prices.get(pair), pair, GROQ_MODEL_NEWS, True,
     )
     text = groq_channel_post(a, post_type)
     try:
@@ -4647,42 +4674,92 @@ def _format_user_visible_llm_failure(exc: BaseException) -> str:
     return f"❌ {raw}{tip}"
 
 
+_deep_analysis_cache: dict[str, dict] = {}
+DEEP_ANALYSIS_CACHE_TTL = 15 * 60  # 15 minutes
+
 async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair: str) -> None:
     """Execute deep analysis for the given pair and user."""
+    global _deep_analysis_cache
     cfg = PAIRS[pair]
 
     async def reply(text, **kwargs):
         if hasattr(update_or_query, "message") and update_or_query.message:
-            await update_or_query.message.reply_text(text, **kwargs)
+            return await update_or_query.message.reply_text(text, **kwargs)
         else:
-            await context.bot.send_message(cid, text, **kwargs)
-
-    await reply(
-        f"🧠 *Deep Analysis* — {cfg['emoji']} {cfg['name']}\n\n"
-        f"Model: `{_deep_analysis_model_label()}`\n"
-        f"⏳ Gathering data from 4 timeframes + macro news…\n\n"
-        f"_This takes 30-60 seconds — please wait_",
-        parse_mode="Markdown",
-    )
+            return await context.bot.send_message(cid, text, **kwargs)
 
     price = get_price(pair)
     if not price:
         await reply("❌ Could not get current price.")
         return
 
-    try:
-        loop   = asyncio.get_event_loop()
-        result = await asyncio.wait_for(
-            loop.run_in_executor(None, _deep_analysis_llm_call, pair, price),
-            timeout=120,
+    now = time.time()
+    use_cache = False
+    result = ""
+
+    # Check cache
+    if pair in _deep_analysis_cache:
+        cached = _deep_analysis_cache[pair]
+        time_diff = now - cached["time"]
+        price_diff_pct = abs(price - cached["price"]) / cached["price"] * 100 if cached["price"] else 0
+
+        # Reuse cache if within TTL and price did not move significantly
+        if time_diff < DEEP_ANALYSIS_CACHE_TTL and price_diff_pct < 0.5:
+            log.info("Using cached deep analysis for %s (age: %d seconds, price diff: %.2f%%)",
+                     pair, int(time_diff), price_diff_pct)
+            result = cached["result"]
+            use_cache = True
+
+    if not use_cache:
+        # Send loading message
+        loading_msg = await reply(
+            f"🧠 *Deep Analysis* — {cfg['emoji']} {cfg['name']}\n\n"
+            f"Model: `{_deep_analysis_model_label()}`\n"
+            f"⏳ Gathering data from 4 timeframes + macro news…\n\n"
+            f"_This takes 30-60 seconds — please wait_",
+            parse_mode="Markdown",
         )
-    except asyncio.TimeoutError:
-        await reply("⏱ Analysis timed out (120s). Please try again.", parse_mode="Markdown")
-        return
-    except Exception as e:
-        await reply(_format_user_visible_llm_failure(e))
-        log.error("Deep analysis error: %s", e)
-        return
+
+        try:
+            loop   = asyncio.get_event_loop()
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, _deep_analysis_llm_call, pair, price),
+                timeout=120,
+            )
+            # Store in cache
+            _deep_analysis_cache[pair] = {
+                "time": now,
+                "price": price,
+                "result": result
+            }
+        except asyncio.TimeoutError:
+            msg_err = "⏱ Analysis timed out (120s). Please try again."
+            if loading_msg:
+                try:
+                    await loading_msg.edit_text(msg_err, parse_mode="Markdown")
+                except Exception:
+                    await reply(msg_err, parse_mode="Markdown")
+            else:
+                await reply(msg_err, parse_mode="Markdown")
+            return
+        except Exception as e:
+            msg_err = _format_user_visible_llm_failure(e)
+            if loading_msg:
+                try:
+                    await loading_msg.edit_text(msg_err)
+                except Exception:
+                    await reply(msg_err)
+            else:
+                await reply(msg_err)
+            log.error("Deep analysis error: %s", e)
+            return
+
+        # Delete loading message to keep chat clean
+        if loading_msg:
+            try:
+                await loading_msg.delete()
+            except Exception:
+                pass
 
     # Log usage (admin unlimited)
     if cid != ADMIN_ID:
@@ -4724,7 +4801,7 @@ async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair:
         if i < len(chunks) - 1:
             await asyncio.sleep(0.5)
 
-    log.info("Deep analysis: cid=%s %s model=%s price=%s", cid, pair, _deep_analysis_model_label(), price)
+    log.info("Deep analysis: cid=%s %s model=%s price=%s (cached=%s)", cid, pair, _deep_analysis_model_label(), price, use_cache)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -5331,7 +5408,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 loop.run_in_executor(
                     None,
                     lambda pr=price_val, prev=_prev_prices.get(pair), pk=pair: full_analysis(
-                        pr, prev, pk,
+                        pr, prev, pk, None, True
                     ),
                 ),
                 timeout=45,   # increased: parallel fetch ~15s + groq ~20s
@@ -5513,6 +5590,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                             _prev_prices.get(pair),
                             pair,
                             GROQ_MODEL_NEWS,
+                            True,
                         )
                         text = groq_channel_post(a, pt)
                         cfg = PAIRS[pair]
@@ -5615,21 +5693,25 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                         and not ps.has_trade and not ps.is_waiting):
                     cooldown   = AUTO_COOLDOWN // 2 if plan in ("diamond", "admin") else AUTO_COOLDOWN
                     score_min  = 65 if plan in ("diamond", "admin") else 75
+                    check_interval = 5 * 60 if plan in ("diamond", "admin") else 15 * 60
+
                     if time.time() - ps.last_signal_time > cooldown:
-                        prev = _prev_prices.get(pair)
-                        if prev:
-                            a = await asyncio.to_thread(
-                                full_analysis, price, prev, pair,
-                            )
-                            if a["score"] >= score_min and a["score"] > ps.last_signal_score:
-                                priority_tag = " 💠 *Priority*" if plan == "diamond" else ""
-                                text = (build_analysis_text(a)
-                                        + f"\n\n📡 *Auto-signal!*{priority_tag} Score: *{a['score']}/100*")
-                                await safe_send(context.bot, cid, text,
-                                                reply_markup=kb_main_for(cid, plan, pair))
-                                ps.last_signal_time  = time.time()
-                                ps.last_signal_score = a["score"]
-                                ps.persist(cid, pair)
+                        if time.time() - ps.last_check_time > check_interval:
+                            prev = _prev_prices.get(pair)
+                            if prev:
+                                ps.last_check_time = time.time()
+                                a = await asyncio.to_thread(
+                                    full_analysis, price, prev, pair,
+                                )
+                                if a["score"] >= score_min and a["score"] > ps.last_signal_score:
+                                    priority_tag = " 💠 *Priority*" if plan == "diamond" else ""
+                                    text = (build_analysis_text(a)
+                                            + f"\n\n📡 *Auto-signal!*{priority_tag} Score: *{a['score']}/100*")
+                                    await safe_send(context.bot, cid, text,
+                                                    reply_markup=kb_main_for(cid, plan, pair))
+                                    ps.last_signal_time  = time.time()
+                                    ps.last_signal_score = a["score"]
+                                    ps.persist(cid, pair)
 
 
 # ═══════════════════════════════════════════════════════════════════
