@@ -2522,14 +2522,23 @@ def _invoke_article_llm(prompt: str) -> str:
     )
 
 
-def _make_sl_tp(price: float, direction: str, sl_pct: float, tp_pct: float) -> tuple[float, float]:
-    """Calculate SL and TP correctly based on trade direction."""
+def _get_precision(pair: str) -> int:
+    """Get the decimal rounding precision for a given pair."""
+    return (
+        0 if pair in ("BTCUSD", "ETHUSD", "BNBUSD", "SOLUSD")
+        else 4 if pair in ("XRPUSD", "ADAUSD", "TONUSD") else 2
+    )
+
+
+def _make_sl_tp(price: float, direction: str, sl_pct: float, tp_pct: float, pair: str) -> tuple[float, float]:
+    """Calculate SL and TP correctly based on trade direction and asset precision."""
+    rd = _get_precision(pair)
     if direction == "SELL":
-        sl = round(price * (1 + sl_pct / 100), 2)   # SL above entry for SELL
-        tp = round(price * (1 - tp_pct / 100), 2)   # TP below entry for SELL
+        sl = round(price * (1 + sl_pct / 100), rd)   # SL above entry for SELL
+        tp = round(price * (1 - tp_pct / 100), rd)   # TP below entry for SELL
     else:  # BUY
-        sl = round(price * (1 - sl_pct / 100), 2)   # SL below entry for BUY
-        tp = round(price * (1 + tp_pct / 100), 2)   # TP above entry for BUY
+        sl = round(price * (1 - sl_pct / 100), rd)   # SL below entry for BUY
+        tp = round(price * (1 + tp_pct / 100), rd)   # TP above entry for BUY
     return sl, tp
 
 
@@ -2553,7 +2562,7 @@ def _groq_client():
     return Groq(api_key=GROQ_KEY)
 
 
-def _sanitize_ai_trade_fields(ai: dict, fallback: dict, price: float, pair: str) -> None:
+def _sanitize_ai_trade_fields(ai: dict, fallback: dict, price: float, pair: str, trend: str, tech: dict | None) -> None:
     """Fill/repair optimal_entry, SL, TP, R/R when model JSON used null (overwrites fallback)."""
     cfg = PAIRS[pair]
     sl_hint, tp_hint = cfg["sl_pct"], cfg["tp_pct"]
@@ -2571,10 +2580,7 @@ def _sanitize_ai_trade_fields(ai: dict, fallback: dict, price: float, pair: str)
         except (TypeError, ValueError):
             return None
 
-    rd = (
-        0 if pair in ("BTCUSD", "ETHUSD", "BNBUSD", "SOLUSD")
-        else 4 if pair in ("XRPUSD", "ADAUSD", "TONUSD") else 2
-    )
+    rd = _get_precision(pair)
 
     ent = as_float(ai.get("optimal_entry"))
     if ent is None or ent <= 0:
@@ -2582,9 +2588,10 @@ def _sanitize_ai_trade_fields(ai: dict, fallback: dict, price: float, pair: str)
 
     ai["optimal_entry"] = round(ent, rd)
     entry = float(ai["optimal_entry"])
-    sent = (ai.get("sentiment") or "neutral").lower()
-    direction = "SELL" if sent == "bearish" else "BUY"
-    sl_fb, tp_fb = _make_sl_tp(entry, direction, sl_hint, tp_hint)
+    
+    # Resolve actual direction using the bot's direction logic
+    direction, _ = _direction(ai, trend, tech)
+    sl_fb, tp_fb = _make_sl_tp(entry, direction, sl_hint, tp_hint, pair)
 
     sl = as_float(ai.get("stop_loss"))
     tp = as_float(ai.get("take_profit"))
@@ -2593,10 +2600,11 @@ def _sanitize_ai_trade_fields(ai: dict, fallback: dict, price: float, pair: str)
     if tp is None or tp <= 0:
         tp = tp_fb
 
-    if sent == "bearish" and (sl < entry or tp > entry):
-        sl, tp = _make_sl_tp(entry, "SELL", sl_hint, tp_hint)
-    elif sent == "bullish" and (sl > entry or tp < entry):
-        sl, tp = _make_sl_tp(entry, "BUY", sl_hint, tp_hint)
+    # Ensure physical consistency based on resolved direction
+    if direction == "SELL" and (sl < entry or tp > entry):
+        sl, tp = _make_sl_tp(entry, "SELL", sl_hint, tp_hint, pair)
+    elif direction == "BUY" and (sl > entry or tp < entry):
+        sl, tp = _make_sl_tp(entry, "BUY", sl_hint, tp_hint, pair)
 
     ai["stop_loss"] = round(float(sl), rd)
     ai["take_profit"] = round(float(tp), rd)
@@ -2689,12 +2697,12 @@ def groq_analysis(news_text: str, price: float, tech: dict,
                     tech.get("price_vs_ema20") == "above"])
         _sent_guess = "bullish" if bull >= 2 else ("bearish" if bull == 0 else "neutral")
     _dir_guess = "SELL" if _sent_guess == "bearish" or trend == "down" else "BUY"
-    _sl_fb, _tp_fb = _make_sl_tp(price, _dir_guess, sl_hint, tp_hint)
+    _sl_fb, _tp_fb = _make_sl_tp(price, _dir_guess, sl_hint, tp_hint, pair)
 
     fallback = {
         "sentiment": "neutral", "confidence": 35, "risk_level": "medium",
         "recommendation": "wait",
-        "optimal_entry": round(price * (0.998 if _dir_guess == "BUY" else 1.002), 2),
+        "optimal_entry": round(price * (0.998 if _dir_guess == "BUY" else 1.002), _get_precision(pair)),
         "stop_loss":      _sl_fb,
         "take_profit":    _tp_fb,
         "risk_reward":    f"1:{tp_hint / sl_hint:.1f}",
@@ -2710,7 +2718,7 @@ def groq_analysis(news_text: str, price: float, tech: dict,
             parsed = json.loads(m.group())
             parsed["confidence"] = _normalize_confidence(parsed.get("confidence", 35))
             merged = {**fallback, **parsed}
-            _sanitize_ai_trade_fields(merged, fallback, price, pair)
+            _sanitize_ai_trade_fields(merged, fallback, price, pair, trend, tech)
             return merged
     except Exception as e:
         log.warning("AI analysis failed (Groq+OpenRouter+Gemini): %s", e)
@@ -2999,17 +3007,18 @@ def groq_channel_post(a: dict, post_type: str) -> str:
 
     # TP1 / TP2 / TP3
     entry  = float(ai.get("optimal_entry") or price)
-    sl     = float(ai.get("stop_loss")     or _make_sl_tp(price, dr, cfg["sl_pct"], cfg["tp_pct"])[0])
+    sl     = float(ai.get("stop_loss")     or _make_sl_tp(price, dr, cfg["sl_pct"], cfg["tp_pct"], pair)[0])
     tp_pct = cfg["tp_pct"]
     sl_pct = cfg["sl_pct"]
+    rd     = _get_precision(pair)
     if dr == "BUY":
-        tp1 = round(entry * (1 + tp_pct * 0.5 / 100), 5)
-        tp2 = round(entry * (1 + tp_pct / 100), 5)
-        tp3 = round(entry * (1 + tp_pct * 1.8 / 100), 5)
+        tp1 = round(entry * (1 + tp_pct * 0.5 / 100), rd)
+        tp2 = round(entry * (1 + tp_pct / 100), rd)
+        tp3 = round(entry * (1 + tp_pct * 1.8 / 100), rd)
     else:
-        tp1 = round(entry * (1 - tp_pct * 0.5 / 100), 5)
-        tp2 = round(entry * (1 - tp_pct / 100), 5)
-        tp3 = round(entry * (1 - tp_pct * 1.8 / 100), 5)
+        tp1 = round(entry * (1 - tp_pct * 0.5 / 100), rd)
+        tp2 = round(entry * (1 - tp_pct / 100), rd)
+        tp3 = round(entry * (1 - tp_pct * 1.8 / 100), rd)
 
     verdict = (
         "✅ *Good entry opportunity*" if score >= 75 else
@@ -4265,6 +4274,13 @@ def _build_deep_prompt(pair: str, price: float, tf_data: dict,
     return f"""You are a senior proprietary trader and technical analyst with 15+ years experience in {cfg['name']}.
 You have access to real multi-timeframe data. Your task is to produce an IMMEDIATELY ACTIONABLE trading report.
 
+═══ GENERAL TRADING LOGIC RULES ═══
+- All trade setups (SETUP A and SETUP B) MUST be mathematically and physically consistent with their direction:
+  - If Direction is BUY: Stop Loss MUST be strictly LESS than the Entry zone price, and all TP targets (TP1, TP2, TP3) MUST be strictly GREATER than the Entry zone price.
+  - If Direction is SELL: Stop Loss MUST be strictly GREATER than the Entry zone price, and all TP targets (TP1, TP2, TP3) MUST be strictly LESS than the Entry zone price.
+  - The TP levels must be logical: TP1 is closest to Entry, TP2 is further, TP3 is furthest.
+  Failure to follow these rules is a critical error.
+
 ═══ LIVE MARKET DATA ═══
 Asset: {cfg['name']}
 Current Price: {fmt_price(price, pair)}
@@ -5441,8 +5457,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ps.running         = True
         ps.sl_warning_sent = False
         ps.persist(cid, pair)
-        sl = ai.get("stop_loss") or round(price_val * (1 - cfg["sl_pct"] / 100), 2)
-        tp = ai.get("take_profit") or round(price_val * (1 + cfg["tp_pct"] / 100), 2)
+        sl_fb, tp_fb = _make_sl_tp(price_val, dr, cfg["sl_pct"], cfg["tp_pct"], pair)
+        sl = ai.get("stop_loss") or sl_fb
+        tp = ai.get("take_profit") or tp_fb
         # Save to signals table for backtesting
         db_save_signal(
             pair, dr, price_val, float(sl), float(tp),
@@ -5600,14 +5617,9 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                         db_save_post(pair, pt, a["score"], a["ai"].get("sentiment", "?"), price, 0)
                         ai = a["ai"]
                         dr, _ = _direction(ai, a["trend"], a.get("tech"))
-                        sl = ai.get("stop_loss") or round(
-                            price * (1 - cfg["sl_pct"] / 100),
-                            2,
-                        )
-                        tp = ai.get("take_profit") or round(
-                            price * (1 + cfg["tp_pct"] / 100),
-                            2,
-                        )
+                        sl_fb, tp_fb = _make_sl_tp(price, dr, cfg["sl_pct"], cfg["tp_pct"], pair)
+                        sl = ai.get("stop_loss") or sl_fb
+                        tp = ai.get("take_profit") or tp_fb
                         db_save_signal(
                             pair,
                             dr,
