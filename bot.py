@@ -4505,8 +4505,10 @@ Respond ONLY in this exact structure. Use the actual numbers from the data above
 Be precise. Use exact prices from the data. No vague statements."""
 
 
-def _deep_analysis_model_label() -> str:
+def _deep_analysis_model_label(pair: str | None = None, cid: int | None = None) -> str:
     """First configured backend named in AI_ROUTE_DEEP (excluding Groq here)."""
+    if pair == "XAUUSD" and cid == ADMIN_ID:
+        return "Qwen 2.5 72B"
     for step in _ai_route_deep():
         if not _deep_route_step_allowed(step) or not _ai_backend_route_ready(step):
             continue
@@ -4698,10 +4700,10 @@ def _gemini_deep_analysis(pair: str, price: float) -> str:
     return _gemini_response_visible_text(response, context="deep_analysis")
 
 
-def _deep_analysis_llm_call(pair: str, price: float) -> str:
-    if pair == "XAUUSD":
+def _deep_analysis_llm_call(pair: str, price: float, cid: int | None = None) -> str:
+    if pair == "XAUUSD" and cid == ADMIN_ID:
         try:
-            log.info("Running premium Qwen 2.5 72B Deep Analysis for Gold (XAUUSD)")
+            log.info("Running premium Qwen 2.5 72B Deep Analysis for Gold (XAUUSD) for Admin")
             with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
                 f_tf    = pool.submit(_get_multi_tf_data, pair)
                 f_macro = pool.submit(_get_macro_context, pair)
@@ -4909,7 +4911,7 @@ async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair:
         # Send loading message
         loading_msg = await reply(
             f"🧠 *Deep Analysis* — {cfg['emoji']} {cfg['name']}\n\n"
-            f"Model: `{_deep_analysis_model_label()}`\n"
+            f"Model: `{_deep_analysis_model_label(pair, cid)}`\n"
             f"⏳ Gathering data from 4 timeframes + macro news…\n\n"
             f"_This takes 30-60 seconds — please wait_",
             parse_mode="Markdown",
@@ -4918,7 +4920,7 @@ async def _run_deepanalysis(update_or_query, context, cid: int, acc: dict, pair:
         try:
             loop   = asyncio.get_event_loop()
             result = await asyncio.wait_for(
-                loop.run_in_executor(None, _deep_analysis_llm_call, pair, price),
+                loop.run_in_executor(None, _deep_analysis_llm_call, pair, price, cid),
                 timeout=120,
             )
             # Store in cache
