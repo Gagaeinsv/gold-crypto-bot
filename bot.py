@@ -387,6 +387,9 @@ if _LEGACY_GROQ_MODEL:
     )
     GROQ_MODEL_SIGNALS = _LEGACY_GROQ_MODEL
 GROQ_TIMEOUT = 20
+XAU_VOLATILITY_THRESHOLD = float(os.getenv("XAU_VOLATILITY_THRESHOLD", "0.20"))
+ADMIN_MODEL              = os.getenv("ADMIN_MODEL", "qwen/qwen-2.5-72b-instruct")
+ADMIN_MACRO_MODEL        = os.getenv("ADMIN_MACRO_MODEL", "perplexity/sonar")
 
 # Long-form deep analysis & chart vision: see DEEP_ANALYSIS_PROVIDER / CHART_VISION_PROVIDER (default: gemini).
 
@@ -1642,6 +1645,7 @@ class UserState:
 USERS: dict[int, UserState] = {}
 _prices:      dict[str, float | None] = {p: None for p in PAIRS}
 _prev_prices: dict[str, float | None] = {p: None for p in PAIRS}
+_price_history: dict[str, list[tuple[float, float]]] = {p: [] for p in PAIRS}
 _last_channel_analysis_slot: tuple[date, int] | None = None
 _last_article_hour:          int = -1
 _article_index:          int = 0
@@ -2437,6 +2441,21 @@ def _chart_route_step_allowed(step: str) -> bool:
 
 def _invoke_signal_json_llm(analysis_prompt: str, groq_model: str) -> str:
     """Trading-signal JSON: order from AI_ROUTE_SIGNAL_JSON (Groq / OpenRouter / Gemini)."""
+    if "/" in groq_model:
+        return _openrouter_chat(
+            [
+                {
+                    "role": "user",
+                    "content": analysis_prompt
+                    + "\n\nReply with ONLY valid JSON, no markdown code fences.",
+                }
+            ],
+            model=groq_model,
+            max_tokens=450,
+            temperature=0.25,
+            key_scope="heavy",
+        )
+
     errs: list[str] = []
     for step in _ai_route_signal_json():
         if not _ai_backend_route_ready(step):
@@ -2519,6 +2538,135 @@ def _invoke_article_llm(prompt: str) -> str:
         errs[-1]
         if errs
         else "No AI backend available for articles — configure Groq/OpenRouter/Gemini for this route."
+    )
+
+
+def _get_price_change_pct(pair: str, lookback_seconds: int = 300) -> float:
+    """Calculate percentage price change for a pair over a lookback window using _price_history."""
+    history = _price_history.get(pair, [])
+    if not history:
+        return 0.0
+    now = time.time()
+    target_time = now - lookback_seconds
+    
+    closest_t = None
+    closest_price = None
+    min_diff = float('inf')
+    for t, p in history:
+        diff = abs(t - target_time)
+        if diff < min_diff:
+            min_diff = diff
+            closest_t = t
+            closest_price = p
+            
+    if closest_price is None or min_diff > 60:
+        return 0.0
+        
+    current_price = _prices.get(pair)
+    if not current_price:
+        return 0.0
+        
+    return (current_price - closest_price) / closest_price * 100
+
+
+def _query_perplexity_macro(pair: str) -> str:
+    """Query Perplexity Sonar via OpenRouter to get recent news and macro sentiment for Gold (XAUUSD)."""
+    macro_prompt = (
+        f"Search for recent breaking news, macroeconomic events, Fed announcements, "
+        f"and geopolitical updates impacting {pair} (Gold) in the last 1 to 4 hours. "
+        f"Provide a concise summary of the key market drivers, current price sentiment (bullish/bearish/neutral), "
+        f"and any critical upcoming events. Keep the response within 200 words."
+    )
+    try:
+        res = _openrouter_chat(
+            [{"role": "user", "content": macro_prompt}],
+            model=ADMIN_MACRO_MODEL,
+            max_tokens=300,
+            temperature=0.2,
+            key_scope="heavy",
+        )
+        return res.strip()
+    except Exception as e:
+        log.warning("Perplexity Sonar news query failed: %s", e)
+        return "No recent macro news available due to query error."
+
+
+def _run_hybrid_analysis(pair: str, price: float, tech: dict, trend: str, vol: str) -> dict:
+    """Run Perplexity Sonar first for macro news, then Qwen 2.5 72B for technical + macro analysis."""
+    macro_context = _query_perplexity_macro(pair)
+    log.info("Perplexity Sonar context: %s", macro_context[:200])
+    
+    cfg = PAIRS[pair]
+    sl_hint = cfg["sl_pct"]
+    tp_hint = cfg["tp_pct"]
+    
+    _sent_guess = "neutral"
+    if tech.get("ok"):
+        bull = sum([tech.get("macd_cross") == "bullish",
+                    tech.get("ema_trend")  == "up",
+                    tech.get("price_vs_ema20") == "above"])
+        _sent_guess = "bullish" if bull >= 2 else ("bearish" if bull == 0 else "neutral")
+    _dir_guess = "SELL" if _sent_guess == "bearish" or trend == "down" else "BUY"
+    _sl_fb, _tp_fb = _make_sl_tp(price, _dir_guess, sl_hint, tp_hint, pair)
+    
+    fallback = {
+        "sentiment": "neutral", "confidence": 35, "risk_level": "medium",
+        "recommendation": "wait",
+        "optimal_entry": round(price * (0.998 if _dir_guess == "BUY" else 1.002), _get_precision(pair)),
+        "stop_loss":      _sl_fb,
+        "take_profit":    _tp_fb,
+        "risk_reward":    f"1:{tp_hint / sl_hint:.1f}",
+        "entry_reason": "fallback", "main_driver": "fallback",
+    }
+    
+    try:
+        analysis_prompt = _elite_signal_analysis_prompt(
+            pair, cfg, price, tech, trend, vol, macro_context,
+        )
+        raw = _invoke_signal_json_llm(analysis_prompt, ADMIN_MODEL)
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            parsed = json.loads(m.group())
+            parsed["confidence"] = _normalize_confidence(parsed.get("confidence", 35))
+            merged = {**fallback, **parsed}
+            _sanitize_ai_trade_fields(merged, fallback, price, pair, trend, tech)
+            
+            econ = {"has_danger": False, "events": []}
+            try:
+                econ = _check_econ_calendar()
+            except Exception:
+                pass
+            
+            score = _calc_score(tech, merged, econ, trend, vol)
+            return dict(
+                pair=pair,
+                price=price,
+                trend=trend,
+                vol=vol,
+                tech=tech,
+                ai=merged,
+                econ=econ,
+                score=score
+            )
+    except Exception as e:
+        log.warning("Hybrid admin analysis failed: %s", e)
+        
+    econ_fb = {"has_danger": False, "events": []}
+    try:
+        econ_fb = _check_econ_calendar()
+    except Exception:
+        pass
+    score_fb = _calc_score(tech, fallback, econ_fb, trend, vol)
+    
+    return dict(
+        pair=pair,
+        price=price,
+        trend=trend,
+        vol=vol,
+        tech=tech,
+        ai=fallback,
+        econ=econ_fb,
+        score=score_fb
     )
 
 
@@ -5575,6 +5723,13 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
             if p:
                 _prev_prices[pair] = _prices[pair]
                 _prices[pair]      = p
+                if pair not in _price_history:
+                    _price_history[pair] = []
+                _price_history[pair].append((time.time(), p))
+                _price_history[pair] = [
+                    (t, val) for t, val in _price_history[pair]
+                    if time.time() - t <= 1200
+                ]
 
         now_utc = datetime.now(UTC)
         h = now_utc.hour
@@ -5708,22 +5863,52 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                     check_interval = 5 * 60 if plan in ("diamond", "admin") else 15 * 60
 
                     if time.time() - ps.last_signal_time > cooldown:
-                        if time.time() - ps.last_check_time > check_interval:
-                            prev = _prev_prices.get(pair)
-                            if prev:
+                        if cid == ADMIN_ID and pair == "XAUUSD":
+                            change_5m = _get_price_change_pct("XAUUSD", 300)
+                            if abs(change_5m) >= XAU_VOLATILITY_THRESHOLD:
                                 ps.last_check_time = time.time()
-                                a = await asyncio.to_thread(
-                                    full_analysis, price, prev, pair,
+                                log.info(
+                                    "XAUUSD volatility spike detected: %+.2f%%. Running hybrid admin analysis...",
+                                    change_5m,
                                 )
-                                if a["score"] >= score_min and a["score"] > ps.last_signal_score:
-                                    priority_tag = " 💠 *Priority*" if plan == "diamond" else ""
-                                    text = (build_analysis_text(a)
-                                            + f"\n\n📡 *Auto-signal!*{priority_tag} Score: *{a['score']}/100*")
-                                    await safe_send(context.bot, cid, text,
-                                                    reply_markup=kb_main_for(cid, plan, pair))
-                                    ps.last_signal_time  = time.time()
-                                    ps.last_signal_score = a["score"]
-                                    ps.persist(cid, pair)
+                                try:
+                                    tech_snap = get_technicals(pair)
+                                    a = await asyncio.to_thread(
+                                        _run_hybrid_analysis,
+                                        pair,
+                                        price,
+                                        tech_snap,
+                                        "up" if change_5m > 0 else "down",
+                                        "high" if abs(change_5m) >= XAU_VOLATILITY_THRESHOLD * 2 else "normal",
+                                    )
+                                    if a["score"] >= score_min and a["score"] > ps.last_signal_score:
+                                        priority_tag = " ⚡ *Reactive Volatility*"
+                                        text = (build_analysis_text(a)
+                                                + f"\n\n📡 *Reactive Signal!*{priority_tag} 5m Move: *{change_5m:+.2f}%* | Score: *{a['score']}/100*")
+                                        await safe_send(context.bot, cid, text,
+                                                        reply_markup=kb_main_for(cid, plan, pair))
+                                        ps.last_signal_time  = time.time()
+                                        ps.last_signal_score = a["score"]
+                                        ps.persist(cid, pair)
+                                except Exception as ex:
+                                    log.error("Failed running hybrid admin analysis: %s", ex)
+                        else:
+                            if time.time() - ps.last_check_time > check_interval:
+                                prev = _prev_prices.get(pair)
+                                if prev:
+                                    ps.last_check_time = time.time()
+                                    a = await asyncio.to_thread(
+                                        full_analysis, price, prev, pair,
+                                    )
+                                    if a["score"] >= score_min and a["score"] > ps.last_signal_score:
+                                        priority_tag = " 💠 *Priority*" if plan == "diamond" else ""
+                                        text = (build_analysis_text(a)
+                                                + f"\n\n📡 *Auto-signal!*{priority_tag} Score: *{a['score']}/100*")
+                                        await safe_send(context.bot, cid, text,
+                                                        reply_markup=kb_main_for(cid, plan, pair))
+                                        ps.last_signal_time  = time.time()
+                                        ps.last_signal_score = a["score"]
+                                        ps.persist(cid, pair)
 
 
 # ═══════════════════════════════════════════════════════════════════
