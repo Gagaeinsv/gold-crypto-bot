@@ -4699,6 +4699,37 @@ def _gemini_deep_analysis(pair: str, price: float) -> str:
 
 
 def _deep_analysis_llm_call(pair: str, price: float) -> str:
+    if pair == "XAUUSD":
+        try:
+            log.info("Running premium Qwen 2.5 72B Deep Analysis for Gold (XAUUSD)")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                f_tf    = pool.submit(_get_multi_tf_data, pair)
+                f_macro = pool.submit(_get_macro_context, pair)
+                f_econ  = pool.submit(_check_econ_calendar)
+                try:
+                    tf_data = f_tf.result(timeout=25)
+                except Exception:
+                    tf_data = {}
+                try:
+                    macro = f_macro.result(timeout=10)
+                except Exception:
+                    macro = ""
+                try:
+                    econ = f_econ.result(timeout=6)
+                except Exception:
+                    econ = {"has_danger": False, "events": []}
+
+            prompt = _build_deep_prompt(pair, price, tf_data, macro, econ)
+            return _openrouter_chat(
+                [{"role": "user", "content": prompt}],
+                model="qwen/qwen-2.5-72b-instruct",
+                max_tokens=openrouter_deep_effective_output_cap(),
+                temperature=0.35,
+                key_scope="heavy",
+            )
+        except Exception as e:
+            log.warning("Premium XAUUSD Deep Analysis failed: %s. Falling back to default.", e)
+
     errs: list[str] = []
     route = _ai_route_deep()
     for step in route:
@@ -5568,15 +5599,28 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         try:
             loop = asyncio.get_event_loop()
-            a = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None,
-                    lambda pr=price_val, prev=_prev_prices.get(pair), pk=pair: full_analysis(
-                        pr, prev, pk, None, True
+            if cid == ADMIN_ID and pair == "XAUUSD":
+                def run_admin_hybrid():
+                    ref = _prev_prices.get(pair) or price_val
+                    diff = (price_val - ref) / ref * 100
+                    trend = "up" if price_val > ref else ("down" if price_val < ref else "flat")
+                    vol = "normal" if abs(diff) < 0.5 else ("high" if abs(diff) < 1.0 else "chaos")
+                    tech = get_technicals(pair)
+                    return _run_hybrid_analysis(pair, price_val, tech, trend, vol)
+                a = await asyncio.wait_for(
+                    loop.run_in_executor(None, run_admin_hybrid),
+                    timeout=60,
+                )
+            else:
+                a = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda pr=price_val, prev=_prev_prices.get(pair), pk=pair: full_analysis(
+                            pr, prev, pk, None, True
+                        ),
                     ),
-                ),
-                timeout=45,   # increased: parallel fetch ~15s + groq ~20s
-            )
+                    timeout=45,
+                )
         except asyncio.TimeoutError:
             await safe_edit(q,
                 "⏱ *Analysis timed out.*\n\n"
