@@ -1,0 +1,4 @@
+ccxt>=4.2.0
+fastapi>=0.100.0
+uvicorn>=0.20.0
+python-dotenv>=1.0.0
