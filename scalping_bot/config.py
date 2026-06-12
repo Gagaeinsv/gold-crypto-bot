@@ -6,9 +6,9 @@ load_dotenv()
 class Config:
     # --- Exchange Settings ---
     EXCHANGE_ID = os.getenv("EXCHANGE_ID", "bybit").lower()
-    API_KEY = os.getenv("EXCHANGE_API_KEY", "")
-    SECRET_KEY = os.getenv("EXCHANGE_SECRET_KEY", "")
-    IS_SANDBOX = os.getenv("EXCHANGE_IS_SANDBOX", "true").lower() == "true" # Defaults to testnet/sandbox
+    API_KEY = os.getenv("EXCHANGE_API_KEY") or os.getenv("BYBIT_API_KEY") or ""
+    SECRET_KEY = os.getenv("EXCHANGE_SECRET_KEY") or os.getenv("BYBIT_API_SECRET") or ""
+    IS_SANDBOX = (os.getenv("EXCHANGE_IS_SANDBOX") or os.getenv("BYBIT_IS_TESTNET") or "true").lower() == "true" # Defaults to testnet/sandbox
     
     # --- Risk Settings ---
     MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "10"))
