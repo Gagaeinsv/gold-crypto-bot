@@ -13,6 +13,7 @@ class Config:
     # --- Risk Settings ---
     MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "10"))
     MAX_CONCURRENT_TRADES = int(os.getenv("MAX_CONCURRENT_TRADES", "1"))
+    ALLOWED_TICKERS = [t.strip().upper() for t in os.getenv("ALLOWED_TICKERS", "XAUUSDT").split(",") if t.strip()]
     
     # Fixed SL/TP percentages (e.g. 1.0% Stop-Loss, 2.0% Take-Profit)
     DEFAULT_SL_PCT = float(os.getenv("DEFAULT_SL_PCT", "0.01"))

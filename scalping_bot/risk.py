@@ -19,6 +19,12 @@ class RiskGuard:
         # 1. Reset daily counter if a new calendar day in UTC has started
         await self._check_daily_reset()
 
+        # 1.5. Check Allowed Tickers
+        if self.config.ALLOWED_TICKERS and ticker.upper() not in self.config.ALLOWED_TICKERS:
+            reason = f"Blocked: Ticker {ticker} is not in ALLOWED_TICKERS list."
+            logger.warning(reason)
+            return False, reason
+
         # 2. Hard Rule A: Max Daily Trades
         current_daily_count = self.state.get_daily_trade_count()
         if current_daily_count >= self.config.MAX_DAILY_TRADES:

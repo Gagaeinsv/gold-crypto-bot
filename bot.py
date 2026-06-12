@@ -5972,6 +5972,58 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
 #  Signal tracking helpers
 # ═══════════════════════════════════════════════════════════════════
 
+def forward_signal_to_scalper(pair: str, direction: str, entry: float):
+    """Forward signal to scalping bot's FastAPI webhook asynchronously."""
+    import urllib.request
+    import json
+    import threading
+
+    # Map pair to Bybit Swap ticker
+    ticker = pair.upper()
+    if ticker == "XAUUSD":
+        ticker = "XAUUSDT"
+    elif ticker == "BTCUSD":
+        ticker = "BTCUSDT"
+    elif "/" not in ticker and not ticker.endswith("USDT"):
+        ticker = f"{ticker}USDT"
+
+    # Map direction to LONG/SHORT
+    dir_map = {
+        "BUY": "LONG",
+        "SELL": "SHORT",
+        "LONG": "LONG",
+        "SHORT": "SHORT"
+    }
+    mapped_dir = dir_map.get(direction.upper(), "LONG")
+
+    # Construct JSON payload
+    payload = {
+        "ticker": ticker,
+        "direction": mapped_dir,
+        "entry_price": float(entry)
+    }
+
+    # Scalper webhook URL
+    webhook_url = os.getenv("SCALPER_WEBHOOK_URL", "http://127.0.0.1:8000/webhook")
+
+    def send():
+        try:
+            req = urllib.request.Request(
+                webhook_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=5) as response:
+                res = response.read().decode("utf-8")
+                log.info("Forwarded signal to scalper: %s -> Response: %s", payload, res)
+        except Exception as e:
+            log.warning("Failed to forward signal to scalper: %s", e)
+
+    # Run in a background thread to prevent blocking the main Telegram bot event loop
+    threading.Thread(target=send, daemon=True).start()
+
+
 def db_save_signal(pair: str, direction: str, entry: float,
                    sl: float, tp: float, score: int,
                    sentiment: str, source: str = "ai",
@@ -5983,7 +6035,13 @@ def db_save_signal(pair: str, direction: str, entry: float,
             "score,sentiment,source,message_id) VALUES(?,?,?,?,?,?,?,?,?)",
             (pair, direction, entry, sl, tp, score, sentiment, source, message_id),
         )
-        return cur.lastrowid
+        sig_id = cur.lastrowid
+        # Forward the signal to the scalping bot
+        try:
+            forward_signal_to_scalper(pair, direction, entry)
+        except Exception as e:
+            log.error("Error launching forward_signal_to_scalper: %s", e)
+        return sig_id
 
 
 def db_get_open_signals(days: int = 30) -> list:
