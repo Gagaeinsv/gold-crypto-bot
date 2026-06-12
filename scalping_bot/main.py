@@ -28,7 +28,12 @@ async def orchestrate_trade(ticker: str, direction: str, size_usd: float | None,
     Runs pre-trade risk checks, executes the entry market order,
     calculates SL/TP levels, and submits protective orders to the exchange.
     """
-    trade_size = size_usd if size_usd is not None else Config.DEFAULT_SIZE_USD
+    # Calculate trade size: use dynamic percentage if configured, otherwise fallback to fixed size
+    if Config.POSITION_SIZE_PCT > 0.0:
+        logger.info(f"Calculating trade size dynamically as {Config.POSITION_SIZE_PCT}% of balance...")
+        trade_size = await exchange_manager.calculate_size_from_pct(Config.POSITION_SIZE_PCT)
+    else:
+        trade_size = size_usd if size_usd is not None else Config.DEFAULT_SIZE_USD
     
     # 1. Pre-trade Risk Check
     allowed, reason = await risk_guard.can_trade(ticker, direction)

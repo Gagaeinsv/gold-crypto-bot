@@ -21,6 +21,7 @@ class Config:
     
     # Position sizing
     DEFAULT_SIZE_USD = float(os.getenv("DEFAULT_SIZE_USD", "50.0")) # Size in USD per scalp trade
+    POSITION_SIZE_PCT = float(os.getenv("POSITION_SIZE_PCT", "0.0")) # If > 0, overrides DEFAULT_SIZE_USD with % of account balance
     
     # --- Server Settings ---
     HOST = os.getenv("HOST", "0.0.0.0")

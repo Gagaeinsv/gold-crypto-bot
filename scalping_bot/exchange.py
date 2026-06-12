@@ -43,6 +43,35 @@ class ExchangeManager:
         """Closes the exchange websocket connections."""
         await self.exchange.close()
 
+    async def calculate_size_from_pct(self, pct: float) -> float:
+        """
+        Fetches the total margin balance (equity) in USDT/USD and calculates position size.
+        """
+        await self.load_markets()
+        try:
+            balance = await self.exchange.fetch_balance()
+            total_balance = 0.0
+            
+            if balance.get("total"):
+                # Unified Trading Account (UTA) / Futures uses USDT or USD as base margin asset
+                total_balance = balance["total"].get("USDT") or balance["total"].get("USD") or 0.0
+                if total_balance == 0.0:
+                    for asset in ["USDC", "BUSD", "DAI"]:
+                        total_balance = balance["total"].get(asset) or 0.0
+                        if total_balance > 0.0:
+                            break
+                            
+            if total_balance <= 0.0:
+                logger.warning("Fetched balance is zero or could not be parsed. Using fallback default size.")
+                return self.config.DEFAULT_SIZE_USD
+                
+            size = total_balance * (pct / 100.0)
+            logger.info(f"Dynamic position size: {pct}% of account balance (${total_balance:.2f}) = ${size:.2f}")
+            return max(size, 1.0)
+        except Exception as e:
+            logger.error(f"Error fetching balance for dynamic sizing: {e}. Using fallback default size.")
+            return self.config.DEFAULT_SIZE_USD
+
     async def open_position(self, ticker: str, direction: str, size_usd: float) -> tuple[float, float]:
         """
         Opens a position by placing a MARKET order.
