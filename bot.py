@@ -831,6 +831,32 @@ def db_apply_payment(cid: int, stars: int, plan_key: str, months: int, charge_id
             "INSERT INTO payments(chat_id,stars,plan,months,telegram_charge_id) VALUES(?,?,?,?,?)",
             (cid, stars, plan_key, months, charge_id),
         )
+    
+    try:
+        with db_connect() as c:
+            ref_row = c.execute(
+                "SELECT referrer_id, bonus_given FROM referrals WHERE referred_id=?",
+                (cid,),
+            ).fetchone()
+        if ref_row and not ref_row["bonus_given"]:
+            referrer_id = ref_row["referrer_id"]
+            bonus = db_give_referral_bonus(referrer_id, cid)
+            if bonus > 0:
+                log.info("Referral bonus awarded: %d days given to %s for referring %s", bonus, referrer_id, cid)
+                app_ref = _get_app_ref()
+                if app_ref is not None:
+                    asyncio.create_task(
+                        safe_send(
+                            app_ref.bot,
+                            referrer_id,
+                            f"🎁 *+{bonus} days added to your plan!*\n\n"
+                            f"Your referred friend just activated a subscription package. 🚀\n\n"
+                            f"/refer — see your referral stats",
+                        )
+                    )
+    except Exception as e:
+        log.warning("Failed to process referral bonus on payment: %s", e)
+
     return new_exp
 
 
@@ -4041,26 +4067,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_new and source:
         db_save_utm(cid, source)
 
-    # ── Register referral and give bonus ────────────────────
+    # ── Register referral (pending package purchase) ────────
     if is_new and referrer_id and referrer_id != cid:
         registered = db_register_referral(referrer_id, cid, source or "ref")
         if registered:
-            # Give bonus days to referrer immediately on activation
-            bonus = db_give_referral_bonus(referrer_id, cid)
-            if bonus > 0:
-                try:
-                    ref_u = await context.bot.get_chat(referrer_id)
-                    await context.bot.send_message(
-                        referrer_id,
-                        f"🎁 *+{bonus} days added to your plan!*\n\n"
-                        f"Someone joined using your referral link.\n"
-                        f"Keep sharing to earn more free days! 🚀\n\n"
-                        f"/refer — see your referral stats",
-                        parse_mode="Markdown",
-                    )
-                except Exception:
-                    pass
-            log.info("Referral: %s → %s (source=%s)", referrer_id, cid, source)
+            log.info("Referral registered (pending purchase): %s → %s (source=%s)", referrer_id, cid, source)
 
     acc   = db_access(cid)
     plan  = acc["plan"]
@@ -4110,7 +4121,7 @@ async def cmd_refer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         f"🤝 *Refer a Friend*\n"
         f"{'─' * 28}\n\n"
-        f"For every friend who joins using your link:\n"
+        f"For every friend who joins using your link and purchases a subscription:\n"
         f"*+{REFERRAL_BONUS_DAYS} free days* added to your plan automatically!\n\n"
         f"*Your referral link:*\n"
         f"`{ref_link}`\n\n"
@@ -5927,7 +5938,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                                         "up" if change_5m > 0 else "down",
                                         "high" if abs(change_5m) >= XAU_VOLATILITY_THRESHOLD * 2 else "normal",
                                     )
-                                    if a["score"] >= score_min and a["score"] > ps.last_signal_score:
+                                    if a["score"] >= score_min:
                                         priority_tag = " ⚡ *Reactive Volatility*"
                                         text = (build_analysis_text(a)
                                                 + f"\n\n📡 *Reactive Signal!*{priority_tag} 5m Move: *{change_5m:+.2f}%* | Score: *{a['score']}/100*")
@@ -5946,7 +5957,7 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                                     a = await asyncio.to_thread(
                                         full_analysis, price, prev, pair,
                                     )
-                                    if a["score"] >= score_min and a["score"] > ps.last_signal_score:
+                                    if a["score"] >= score_min:
                                         priority_tag = " 💠 *Priority*" if plan == "diamond" else ""
                                         text = (build_analysis_text(a)
                                                 + f"\n\n📡 *Auto-signal!*{priority_tag} Score: *{a['score']}/100*")
