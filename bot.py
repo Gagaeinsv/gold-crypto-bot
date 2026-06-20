@@ -6508,6 +6508,7 @@ def _resolve_open_signals() -> list:
     except ImportError:
         return []
 
+    from datetime import timezone, timedelta
     open_sigs = db_get_open_signals(days=30)
     resolved  = []
 
@@ -6519,10 +6520,17 @@ def _resolve_open_signals() -> list:
         tp        = sig["tp_price"]
         posted_at = sig["posted_at"]
 
+        # Skip checking if the signal is very new (less than 5 minutes old)
+        posted_dt = datetime.strptime(posted_at[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        now_dt = datetime.now(timezone.utc)
+        if (now_dt - posted_dt).total_seconds() < 300:
+            continue
+
         try:
             # Download 1-minute bars from signal time to now
             ticker = PAIRS[pair]["yahoo"]
-            start  = datetime.strptime(posted_at[:19], "%Y-%m-%d %H:%M:%S")
+            # Subtract 1 minute to ensure start is strictly before end in case of slight clock drift
+            start  = posted_dt - timedelta(minutes=1)
             df     = yf.download(
                 ticker, start=start, interval="5m",
                 progress=False, auto_adjust=True,
