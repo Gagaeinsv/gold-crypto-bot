@@ -4909,8 +4909,8 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if plan not in ("trial", "diamond", "admin") and cid != ADMIN_ID:
         await update.message.reply_text(
-            "💠 *Deep Analysis* is available on Trial (1/day) and Diamond (3/day).\n\n"
-            "Tap /start → 💳 Subscription",
+            "💠 *Глибокий аналіз* доступний на тарифах Тріал (1/день) та Diamond (3/день).\n\n"
+            "Натисніть /start → 💳 Підписка",
             parse_mode="Markdown",
         )
         return
@@ -4927,16 +4927,16 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if used >= limit:
             if plan == "trial":
                 await update.message.reply_text(
-                    "⏳ *Trial limit reached* (1/day)\n\n"
-                    "Upgrade to 💠 Diamond to get *3 deep analyses per day* on any pair.\n\n"
-                    "Tap /start → 💳 Subscription",
+                    "⏳ *Досягнуто ліміту Тріалу* (1/день)\n\n"
+                    "Оновіть тариф до 💠 Diamond, щоб отримувати *3 глибокі аналізи на день* для будь-якої пари.\n\n"
+                    "Натисніть /start → 💳 Підписка",
                     parse_mode="Markdown",
                 )
             else:
                 await update.message.reply_text(
-                    f"⏳ *Daily limit reached* ({limit}/day)\n\n"
-                    f"You've used all {limit} deep analyses for today.\n"
-                    f"Resets at midnight UTC.",
+                    f"⏳ *Досягнуто денного ліміту* ({limit}/день)\n\n"
+                    f"Ви використали всі {limit} глибоких аналізів на сьогодні.\n"
+                    f"Ліміт скидається опівночі за UTC.",
                     parse_mode="Markdown",
                 )
             return
@@ -4963,17 +4963,17 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"{cfg['emoji']} {cfg['name']}",
                 callback_data=f"deepanalysis_{pid}",
             )])
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="deepanalysis_cancel")])
+    rows.append([InlineKeyboardButton("❌ Скасувати", callback_data="deepanalysis_cancel")])
 
     used = db_deepanalysis_count_today(cid) if cid != ADMIN_ID else 0
     limit = 1 if plan == "trial" else DEEP_ANALYSIS_DAILY_LIMIT
     if cid != ADMIN_ID:
-        remaining = f"  ({limit - used} left today)"
+        remaining = f"  (залишилось сьогодні: {limit - used})"
     else:
         remaining = ""
 
     await update.message.reply_text(
-        f"🧠 *Deep Analysis{remaining}*\n\nChoose a pair to analyse:",
+        f"🧠 *Глибокий аналіз{remaining}*\n\nОберіть пару для аналізу:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(rows),
     )
@@ -5154,12 +5154,12 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     acc = db_access(cid)
     if acc["plan"] not in ("diamond", "admin") and cid != ADMIN_ID:
         await update.message.reply_text(
-            "💠 *Chart AI Analysis* is a Diamond-exclusive feature.\n\n"
-            "Upgrade to Diamond to unlock:\n"
-            "• 📸 Screenshot chart analysis\n"
-            "• Priority auto-signals\n"
-            "• Lower alert threshold\n\n"
-            "Tap /start → 💳 Subscription",
+            "💠 *Аналіз графіка ШІ* доступний лише для користувачів тарифу Diamond.\n\n"
+            "Оновіть тариф до Diamond, щоб розблокувати:\n"
+            "• 📸 Аналіз графіків за скріншотом\n"
+            "• Пріоритетні автосигнали\n"
+            "• Знижений поріг сповіщень\n\n"
+            "Натисніть /start → 💳 Підписка",
             parse_mode="Markdown",
         )
         return
@@ -5181,17 +5181,17 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if not photo:
         await update.message.reply_text(
-            "📸 *How to use Chart Analysis:*\n\n"
-            "1. Open your broker/TradingView chart\n"
-            "2. Set your timeframe and indicators\n"
-            "3. Take a screenshot\n"
-            "4. Send the screenshot to this bot\n"
-            "   _(caption is optional)_\n\n"
-            "The AI will analyse the chart and give you:\n"
-            "• Trend direction and strength\n"
-            "• Key support & resistance levels\n"
-            "• Entry, SL and TP suggestion\n"
-            "• Overall trade recommendation",
+            "📸 *Як використовувати аналіз графіків:*\n\n"
+            "1. Відкрийте графік вашого брокера або TradingView\n"
+            "2. Налаштуйте таймфрейм та індикатори\n"
+            "3. Зробіть скріншот\n"
+            "4. Надішліть скріншот цьому боту\n"
+            "   _(опис фото додавати не обов'язково)_\n\n"
+            "ШІ проаналізує графік і надасть:\n"
+            "• Напрямок та силу тренду\n"
+            "• Ключові рівні підтримки та опору\n"
+            "• Рекомендації щодо входу, SL та TP\n"
+            "• Загальну рекомендацію щодо угоди",
             parse_mode="Markdown",
         )
         return
@@ -5202,8 +5202,8 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     await update.message.reply_text(
-        "🔍 *Analysing your chart…*\n"
-        f"_Model `{_chart_vision_label()}` — about 15–45 seconds_",
+        "🔍 *Аналізуємо ваш графік…*\n"
+        f"_Модель `{_chart_vision_label()}` — очікування близько 15–45 секунд_",
         parse_mode="Markdown",
     )
 
