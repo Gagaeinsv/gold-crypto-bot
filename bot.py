@@ -2334,15 +2334,9 @@ def _openrouter_chat(
             "OPENROUTER_KEYS_LIGHT / OPENROUTER_KEYS_HEAVY" % scope,
         )
 
-    use_model = (model or OPENROUTER_MODEL).strip()
-    payload: dict = {
-        "model": use_model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-    if response_format is not None:
-        payload["response_format"] = response_format
+    models_to_try = [m.strip() for m in (model or OPENROUTER_MODEL).split(",") if m.strip()]
+    if not models_to_try:
+        models_to_try = ["openai/gpt-4o-mini"]
 
     pool_rr_tag = "merged" if scope == "merged" else scope
     order = _openrouter_attempt_key_strings(pool, pool_rr_tag)
@@ -2350,77 +2344,101 @@ def _openrouter_chat(
     last_sc = 0
 
     for attempt, api_key in enumerate(order):
-        cap = max(
-            OPENROUTER_OUTPUT_FLOOR,
-            min(int(max_tokens), OPENROUTER_HARD_OUTPUT_CAP),
-        )
-        did_shrink = False
-        inner_last_err, inner_last_sc = "", 0
-        for _bump in range(12):
-            post_payload = dict(payload)
-            post_payload["max_tokens"] = cap
-            ok, text, sc, err = _openrouter_post_once(api_key, post_payload)
-            if ok:
-                if attempt > 0 or did_shrink:
-                    log.info(
-                        "OpenRouter: OK using key …%s (%s pool) after failover/reduced tokens",
-                        api_key[-4:] if len(api_key) >= 4 else "****",
-                        scope,
-                    )
-                return text
+        skip_key = False
+        for current_model in models_to_try:
+            if skip_key:
+                break
+            payload: dict = {
+                "model": current_model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+            if response_format is not None:
+                payload["response_format"] = response_format
 
-            inner_last_err, inner_last_sc = err, sc
+            cap = max(
+                OPENROUTER_OUTPUT_FLOOR,
+                min(int(max_tokens), OPENROUTER_HARD_OUTPUT_CAP),
+            )
+            did_shrink = False
+            inner_last_err, inner_last_sc = "", 0
+            for _bump in range(12):
+                post_payload = dict(payload)
+                post_payload["max_tokens"] = cap
+                ok, text, sc, err = _openrouter_post_once(api_key, post_payload)
+                if ok:
+                    if attempt > 0 or did_shrink or current_model != models_to_try[0]:
+                        log.info(
+                            "OpenRouter: OK using model %s and key …%s (%s pool) after failover",
+                            current_model,
+                            api_key[-4:] if len(api_key) >= 4 else "****",
+                            scope,
+                        )
+                    return text
 
-            afforded = _openrouter_parse_affordable_output_cap(err or "")
-            if afforded is not None:
-                nxt = max(OPENROUTER_OUTPUT_FLOOR, afforded - OPENROUTER_AFFORD_MARGIN)
-                if nxt < cap:
+                inner_last_err, inner_last_sc = err, sc
+
+                # Check if this is a credit hold error (402)
+                if sc == 402 and _openrouter_payment_starved_error(sc, err or ""):
+                    _openrouter_hold_key_credit_low(api_key)
+                    skip_key = True
+                    break
+
+                # If rate limit or transient error, try next model in fallback list
+                if sc in (429, 408, 500, 502, 503, 504):
                     log.warning(
-                        "OpenRouter: lowering max_tokens %s→%s (affordable=%s) key …%s",
-                        cap,
-                        nxt,
-                        afforded,
-                        api_key[-4:] if len(api_key) >= 4 else "****",
-                    )
-                    cap = nxt
-                    did_shrink = True
-                    continue
-
-            # If API wording changes and we couldn't parse afford, bisect downwards on credit errors.
-            if _openrouter_suggests_fewer_max_tokens(sc, err or "") and cap > OPENROUTER_OUTPUT_FLOOR + 48:
-                nxt = max(OPENROUTER_OUTPUT_FLOOR, cap // 2)
-                if nxt < cap:
-                    log.warning(
-                        "OpenRouter: bisect max_tokens %s→%s (HTTP %s) key …%s",
-                        cap,
-                        nxt,
+                        "OpenRouter: model %s failed with HTTP %s; trying next model in pool",
+                        current_model,
                         sc,
-                        api_key[-4:] if len(api_key) >= 4 else "****",
                     )
-                    cap = nxt
-                    did_shrink = True
-                    continue
+                    break
 
-            break
+                afforded = _openrouter_parse_affordable_output_cap(err or "")
+                if afforded is not None:
+                    nxt = max(OPENROUTER_OUTPUT_FLOOR, afforded - OPENROUTER_AFFORD_MARGIN)
+                    if nxt < cap:
+                        log.warning(
+                            "OpenRouter: lowering max_tokens %s→%s (affordable=%s) key …%s",
+                            cap,
+                            nxt,
+                            afforded,
+                            api_key[-4:] if len(api_key) >= 4 else "****",
+                        )
+                        cap = nxt
+                        did_shrink = True
+                        continue
 
-        last_err, last_sc = inner_last_err, inner_last_sc
-        if (
-            inner_last_sc == 402
-            and _openrouter_payment_starved_error(inner_last_sc, inner_last_err)
-        ):
-            _openrouter_hold_key_credit_low(api_key)
-        if not _openrouter_failover_eligible(inner_last_sc, inner_last_err):
-            raise RuntimeError(inner_last_err or f"OpenRouter HTTP {inner_last_sc}")
+                # If API wording changes and we couldn't parse afford, bisect downwards on credit errors.
+                if _openrouter_suggests_fewer_max_tokens(sc, err or "") and cap > OPENROUTER_OUTPUT_FLOOR + 48:
+                    nxt = max(OPENROUTER_OUTPUT_FLOOR, cap // 2)
+                    if nxt < cap:
+                        log.warning(
+                            "OpenRouter: bisect max_tokens %s→%s (HTTP %s) key …%s",
+                            cap,
+                            nxt,
+                            sc,
+                            api_key[-4:] if len(api_key) >= 4 else "****",
+                        )
+                        cap = nxt
+                        did_shrink = True
+                        continue
+
+                break
+
+            last_err, last_sc = inner_last_err, inner_last_sc
+
+        # After trying all models for this key, if it wasn't successful:
+        if not _openrouter_failover_eligible(last_sc, last_err):
+            raise RuntimeError(last_err or f"OpenRouter HTTP {last_sc}")
         if attempt < len(order) - 1:
             log.warning(
-                "OpenRouter key …%s HTTP %s — %s; trying next key (%s pool)",
+                "OpenRouter key …%s failed; trying next key (%s pool)",
                 api_key[-4:] if len(api_key) >= 4 else "****",
-                inner_last_sc,
-                (inner_last_err or "")[:160],
                 scope,
             )
 
-    raise RuntimeError(last_err or f"OpenRouter HTTP {last_sc} (all keys exhausted)")
+    raise RuntimeError(last_err or f"OpenRouter HTTP {last_sc} (all keys/models exhausted)")
 
 
 def _openrouter_text(prompt: str, max_tokens: int = 500) -> str:
