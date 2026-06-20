@@ -600,13 +600,17 @@ def db_connect() -> sqlite3.Connection:
 
 
 def _migrate_users_analytics_columns(c: sqlite3.Connection) -> None:
-    """Add language_code / is_premium for existing SQLite DBs (CREATE only covers fresh installs)."""
+    """Add language_code / is_premium / ref_rewards_received for existing SQLite DBs (CREATE only covers fresh installs)."""
     cols = {row[1] for row in c.execute("PRAGMA table_info(users)").fetchall()}
     if "language_code" not in cols:
         c.execute("ALTER TABLE users ADD COLUMN language_code TEXT")
     if "is_premium" not in cols:
         c.execute(
             "ALTER TABLE users ADD COLUMN is_premium INTEGER NOT NULL DEFAULT 0"
+        )
+    if "ref_rewards_received" not in cols:
+        c.execute(
+            "ALTER TABLE users ADD COLUMN ref_rewards_received INTEGER DEFAULT 0"
         )
 
 
@@ -624,7 +628,8 @@ def db_init() -> None:
                 joined_at        TEXT    DEFAULT (datetime('now')),
                 last_active      TEXT,
                 language_code    TEXT,
-                is_premium       INTEGER NOT NULL DEFAULT 0
+                is_premium       INTEGER NOT NULL DEFAULT 0,
+                ref_rewards_received INTEGER DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS payments (
                 id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1591,6 +1596,108 @@ def db_referral_stats(cid: int) -> dict:
             "days_earned": bonused * REFERRAL_BONUS_DAYS}
 
 
+async def check_channel_subscription(bot, user_id: int) -> bool:
+    """Check if user is subscribed to the official Telegram channel."""
+    if user_id == ADMIN_ID:
+        return True
+    if not CHANNEL_ID or CHANNEL_ID == "@your_channel":
+        return True
+    try:
+        chat_target = CHANNEL_ID
+        if isinstance(CHANNEL_ID, str) and (CHANNEL_ID.startswith("-") or CHANNEL_ID.isdigit()):
+            chat_target = int(CHANNEL_ID)
+        member = await bot.get_chat_member(chat_id=chat_target, user_id=user_id)
+        if member.status in ("creator", "administrator", "member"):
+            return True
+        return False
+    except Exception as e:
+        log.warning("Subscription check failed for user %s: %s", user_id, e)
+        return True
+
+
+async def check_subscription_and_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Send blocker message if user is not subscribed. Returns False."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if user is None or chat is None or chat.type != "private":
+        return True
+    cid = chat.id
+    if cid == ADMIN_ID:
+        return True
+    is_subbed = await check_channel_subscription(context.bot, cid)
+    if is_subbed:
+        return True
+
+    channel_url = f"https://t.me/{CHANNEL_ID.lstrip('@')}" if isinstance(CHANNEL_ID, str) and CHANNEL_ID.startswith("@") else "https://t.me/your_channel"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👉 Підписатися на канал", url=channel_url)],
+        [InlineKeyboardButton("Перевірити підписку 🔄", callback_data="check_subscription_refresh")]
+    ])
+    text = (
+        "❌ *Доступ обмежено!*\n\n"
+        "Щоб використовувати цього бота, отримувати сигнали та використовувати ШІ, "
+        "ви повинні бути підписані на наш офіційний Telegram-канал.\n\n"
+        "Будь ласка, підпишіться за посиланням нижче та натисніть кнопку перевірки."
+    )
+    if update.callback_query:
+        try:
+            await safe_edit(update.callback_query, text, markup=keyboard)
+        except Exception:
+            try:
+                await update.callback_query.message.reply_text(text, reply_markup=keyboard, parse_mode="Markdown")
+            except Exception:
+                pass
+    else:
+        try:
+            await safe_send(context.bot, cid, text, reply_markup=keyboard)
+        except Exception:
+            pass
+    return False
+
+
+async def try_award_referral_bonus(bot, referred_id: int) -> None:
+    """Award referral bonus to referrer if referred user is subscribed and has a username."""
+    is_subbed = await check_channel_subscription(bot, referred_id)
+    if not is_subbed:
+        return
+    with db_connect() as c:
+        row = c.execute(
+            "SELECT id, referrer_id, bonus_given FROM referrals WHERE referred_id=?",
+            (referred_id,)
+        ).fetchone()
+    if row and not row["bonus_given"]:
+        referrer_id = row["referrer_id"]
+        with db_connect() as c:
+            referee_row = c.execute("SELECT username FROM users WHERE chat_id=?", (referred_id,)).fetchone()
+            referee_username = referee_row["username"] if referee_row else ""
+        if not referee_username:
+            log.warning("Referral bonus delayed: referee %s has no username", referred_id)
+            return
+        with db_connect() as c:
+            ref_user = c.execute("SELECT ref_rewards_received FROM users WHERE chat_id=?", (referrer_id,)).fetchone()
+            rewards_received = ref_user["ref_rewards_received"] if ref_user else 0
+        if rewards_received >= 10:
+            log.info("Referrer %s reached maximum referral reward limit (10).", referrer_id)
+            with db_connect() as c:
+                c.execute("UPDATE referrals SET bonus_given=1 WHERE referred_id=?", (referred_id,))
+            return
+        bonus = db_give_referral_bonus(referrer_id, referred_id)
+        if bonus:
+            with db_connect() as c:
+                c.execute("UPDATE users SET ref_rewards_received = ref_rewards_received + 1 WHERE chat_id=?", (referrer_id,))
+            log.info("Referral bonus awarded: %d days to %s for referring %s", bonus, referrer_id, referred_id)
+            try:
+                await bot.send_message(
+                    chat_id=referrer_id,
+                    text=f"🎉 *Ваш друг підписався на канал та активував бота!*\n\n"
+                         f"Вам нараховано *+{REFERRAL_BONUS_DAYS} безкоштовних днів* Premium-підписки!\n\n"
+                         f"/refer — переглянути вашу статистику запрошень.",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                log.warning("Could not notify referrer %s: %s", referrer_id, e)
+
+
 def db_utm_stats() -> dict:
     """Admin: traffic source breakdown."""
     with db_connect() as c:
@@ -1675,6 +1782,7 @@ _price_history: dict[str, list[tuple[float, float]]] = {p: [] for p in PAIRS}
 _last_channel_analysis_slot: tuple[date, int] | None = None
 _last_article_hour:          int = -1
 _article_index:          int = 0
+_last_resolution_check_time: float = 0.0
 
 
 def get_user(cid: int) -> UserState:
@@ -4067,11 +4175,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_new and source:
         db_save_utm(cid, source)
 
-    # ── Register referral (pending package purchase) ────────
+    # ── Register referral (pending channel sub & active check) ────────
     if is_new and referrer_id and referrer_id != cid:
         registered = db_register_referral(referrer_id, cid, source or "ref")
         if registered:
-            log.info("Referral registered (pending purchase): %s → %s (source=%s)", referrer_id, cid, source)
+            log.info("Referral registered (pending channel sub): %s → %s (source=%s)", referrer_id, cid, source)
+
+    # ── Enforce channel subscription check ──────────────────
+    is_subbed = await check_channel_subscription(context.bot, cid)
+    if not is_subbed:
+        await check_subscription_and_block(update, context)
+        return
+
+    # If subbed, try to award referral bonus immediately (if they joined via ref)
+    await try_award_referral_bonus(context.bot, cid)
 
     acc   = db_access(cid)
     plan  = acc["plan"]
@@ -4114,6 +4231,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_refer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show referral link and stats."""
     cid = update.effective_chat.id
+    if not await check_channel_subscription(context.bot, cid):
+        await check_subscription_and_block(update, context)
+        return
+
     stats = db_referral_stats(cid)
     ref_link = f"https://t.me/{BOT_USERNAME.lstrip('@')}?start=ref_{cid}"
 
@@ -4121,7 +4242,7 @@ async def cmd_refer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         f"🤝 *Refer a Friend*\n"
         f"{'─' * 28}\n\n"
-        f"For every friend who joins using your link and purchases a subscription:\n"
+        f"For every friend who joins using your link and subscribes to our channel:\n"
         f"*+{REFERRAL_BONUS_DAYS} free days* added to your plan automatically!\n\n"
         f"*Your referral link:*\n"
         f"`{ref_link}`\n\n"
@@ -4780,6 +4901,10 @@ async def cmd_deepanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     Trial: 1/day (XAU only). Diamond: 3/day (all pairs). Admin: unlimited.
     """
     cid = update.effective_chat.id
+    if not await check_channel_subscription(context.bot, cid):
+        await check_subscription_and_block(update, context)
+        return
+
     acc = db_access(cid)
     plan = acc["plan"]
 
@@ -5023,6 +5148,10 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     Available to Diamond plan users only.
     """
     cid = update.effective_chat.id
+    if not await check_channel_subscription(context.bot, cid):
+        await check_subscription_and_block(update, context)
+        return
+
     acc = db_access(cid)
     if acc["plan"] not in ("diamond", "admin") and cid != ADMIN_ID:
         await update.message.reply_text(
@@ -5162,6 +5291,10 @@ async def cmd_chartanalysis(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def handle_photo(update, context):
     cid = update.effective_chat.id
+    if not await check_channel_subscription(context.bot, cid):
+        await check_subscription_and_block(update, context)
+        return
+
     acc = db_access(cid)
     if acc["plan"] not in ("diamond", "admin") and cid != ADMIN_ID:
         return
@@ -5249,6 +5382,31 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     u    = get_user(cid)
     acc  = db_access(cid)
     plan = acc["plan"]
+
+    if q.data == "check_subscription_refresh":
+        is_subbed = await check_channel_subscription(context.bot, cid)
+        if is_subbed:
+            try:
+                await q.answer("✅ Дякуємо за підписку! Доступ активовано.", show_alert=True)
+            except Exception:
+                pass
+            await try_award_referral_bonus(context.bot, cid)
+            try:
+                await q.message.delete()
+            except Exception:
+                pass
+            await cmd_start(update, context)
+        else:
+            try:
+                await q.answer("❌ Ви все ще не підписалися на канал! Будь ласка, підпишіться.", show_alert=True)
+            except Exception:
+                pass
+        return
+
+    # Check channel subscription for all other buttons
+    if not await check_channel_subscription(context.bot, cid):
+        await check_subscription_and_block(update, context)
+        return
 
     # Deep analysis pair selection
     if q.data == "deepanalysis_cancel":
@@ -5357,7 +5515,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text = (
             f"🤝 *Refer a Friend — Earn Free Days*\n"
             f"{'─' * 28}\n\n"
-            f"Share your link → friend joins → you get *+{REFERRAL_BONUS_DAYS} free days!*\n\n"
+            f"Share your link → friend joins and subscribes → you get *+{REFERRAL_BONUS_DAYS} free days!*\n\n"
             f"*Your link:*\n`{ref_link}`\n\n"
             f"{'─' * 28}\n"
             f"👥 Invited: *{stats['total']}*\n"
@@ -5767,7 +5925,7 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ═══════════════════════════════════════════════════════════════════
 
 async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
-    global _last_channel_analysis_slot, _last_article_hour, _article_index
+    global _last_channel_analysis_slot, _last_article_hour, _article_index, _last_resolution_check_time
 
     if _monitor_lock.locked():
         log.warning("monitor: already running, skipping tick")
@@ -5967,6 +6125,19 @@ async def monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
                                         ps.last_signal_score = a["score"]
                                         ps.persist(cid, pair)
 
+        # 5) Auto-resolve signals and broadcast resolutions (every 5 minutes)
+        now_time = time.time()
+        if now_time - _last_resolution_check_time >= 300:
+            _last_resolution_check_time = now_time
+            try:
+                loop = asyncio.get_running_loop()
+                resolved_sigs = await loop.run_in_executor(None, _resolve_open_signals)
+                if resolved_sigs:
+                    log.info("Monitor resolved %d signal(s). Broadcasting...", len(resolved_sigs))
+                    await broadcast_signal_resolution(context.bot, resolved_sigs)
+            except Exception as e:
+                log.error("Monitor signal resolution failed: %s", e)
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Signal tracking helpers
@@ -6089,18 +6260,18 @@ def db_backtest_stats(pair: str | None = None, days: int = 30) -> dict:
 #  Backtesting engine  (runs in executor — never on event loop)
 # ═══════════════════════════════════════════════════════════════════
 
-def _resolve_open_signals() -> int:
+def _resolve_open_signals() -> list:
     """
     For every unresolved signal check historical data to see if
-    TP or SL was hit. Returns count of newly resolved signals.
+    TP or SL was hit. Returns list of newly resolved signals details.
     """
     try:
         import yfinance as yf
     except ImportError:
-        return 0
+        return []
 
     open_sigs = db_get_open_signals(days=30)
-    resolved  = 0
+    resolved  = []
 
     for sig in open_sigs:
         pair      = sig["pair"]
@@ -6165,12 +6336,109 @@ def _resolve_open_signals() -> int:
 
             if outcome:
                 db_resolve_signal(sig["id"], outcome, pnl_pct)
-                resolved += 1
+                resolved.append({
+                    "id": sig["id"],
+                    "pair": pair,
+                    "direction": direction,
+                    "entry_price": entry,
+                    "sl_price": sl,
+                    "tp_price": tp,
+                    "outcome": outcome,
+                    "pnl_pct": pnl_pct,
+                    "message_id": sig.get("message_id", 0)
+                })
 
         except Exception as e:
             log.debug("Backtest resolve error (signal %s): %s", sig["id"], e)
 
     return resolved
+
+
+async def broadcast_signal_resolution(bot, resolved_sigs: list) -> None:
+    """Broadcast resolved signals to the channel and active users with referral profit cards."""
+    for sig in resolved_sigs:
+        pair      = sig["pair"]
+        direction = sig["direction"]
+        entry     = sig["entry_price"]
+        sl        = sig["sl_price"]
+        tp        = sig["tp_price"]
+        outcome   = sig["outcome"]
+        pnl       = sig["pnl_pct"]
+        
+        if outcome not in ("TP", "SL"):
+            continue
+
+        cfg = PAIRS.get(pair)
+        if not cfg:
+            continue
+
+        emoji = cfg.get("emoji", "📈")
+        name = cfg.get("name", pair)
+
+        status_emoji = "🎯" if outcome == "TP" else "❌"
+        outcome_label = "Take-Profit" if outcome == "TP" else "Stop-Loss"
+        exit_price = tp if outcome == "TP" else sl
+        pnl_sign = "+" if pnl > 0 else ""
+        pnl_str = f"{pnl_sign}{pnl}%"
+
+        # 1. Post to Channel
+        channel_text = (
+            f"{status_emoji} *{outcome_label} виконано по {name} ({pair})!*\n\n"
+            f"💰 Результат: *{pnl_str}* прибутку\n"
+            f"📈 Вхід: *{fmt_price(entry, pair)}* | Вихід: *{fmt_price(exit_price, pair)}*\n"
+            f"🤖 Сигнал розрахований нашою моделлю ШІ.\n\n"
+            f"🔗 Приєднуйтесь та отримуйте сигнали: @{BOT_USERNAME.lstrip('@')}"
+        )
+        try:
+            await safe_send(bot, CHANNEL_ID, channel_text, parse_mode="Markdown")
+        except Exception as e:
+            log.error("Failed to post resolution to channel: %s", e)
+
+        # 2. DM to allowed/active users
+        try:
+            with db_connect() as c:
+                users = c.execute("SELECT chat_id FROM users").fetchall()
+        except Exception as e:
+            log.error("Failed to fetch users from DB: %s", e)
+            users = []
+
+        for u_row in users:
+            user_id = u_row["chat_id"]
+            if str(user_id) == str(CHANNEL_ID):
+                continue
+
+            try:
+                acc = db_access(user_id)
+                if not acc["allowed"]:
+                    continue
+            except Exception:
+                continue
+
+            ref_link = f"https://t.me/{BOT_USERNAME.lstrip('@')}?start=ref_{user_id}"
+            user_text = (
+                f"{status_emoji} *{outcome_label} виконано по {name} ({pair})!*\n\n"
+                f"💰 Результат: *{pnl_str}* прибутку\n"
+                f"📈 Вхід: *{fmt_price(entry, pair)}* | Вихід: *{fmt_price(exit_price, pair)}*\n"
+                f"🤖 Сигнал розрахований нашою моделлю ШІ.\n\n"
+                f"🔗 Отримати ці сигнали безкоштовно на 3 дні:\n"
+                f"`{ref_link}`"
+            )
+
+            share_text = (
+                f"🎯 {outcome_label} виконано по {name}!\n\n"
+                f"Результат: {pnl_str} прибутку\n"
+                f"Вхід: {fmt_price(entry, pair)} | Вихід: {fmt_price(exit_price, pair)}\n\n"
+                f"Отримати ці сигнали безкоштовно на 3 дні:\n"
+                f"{ref_link}"
+            )
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Поділитися прибутком 🚀", switch_inline_query=share_text)]
+            ])
+
+            try:
+                await safe_send(bot, user_id, user_text, parse_mode="Markdown", reply_markup=kb)
+            except Exception as e:
+                log.debug("Failed to send resolution card to user %s: %s", user_id, e)
 
 
 def _backtest_stats_text(pair: str | None = None, days: int = 30) -> str:
@@ -6215,6 +6483,10 @@ def _backtest_stats_text(pair: str | None = None, days: int = 30) -> str:
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show signal accuracy stats. Available to all users."""
     cid = update.effective_chat.id
+    if not await check_channel_subscription(context.bot, cid):
+        await check_subscription_and_block(update, context)
+        return
+
     acc = db_access(cid)
     if not acc["allowed"] and cid != ADMIN_ID:
         await update.message.reply_text(
@@ -6229,7 +6501,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Resolve any open signals first (in executor to avoid blocking)
     loop = asyncio.get_event_loop()
-    resolved_count = await loop.run_in_executor(None, _resolve_open_signals)
+    resolved_sigs = await loop.run_in_executor(None, _resolve_open_signals)
+    resolved_count = len(resolved_sigs)
 
     text = _backtest_stats_text(pair, days)
     if resolved_count:
@@ -6535,7 +6808,8 @@ async def _handle_stats_callback(q, cid: int, data: str) -> None:
     pair_filter = pair if pair != "ALL" else None
 
     loop = asyncio.get_event_loop()
-    resolved_count = await loop.run_in_executor(None, _resolve_open_signals)
+    resolved_sigs = await loop.run_in_executor(None, _resolve_open_signals)
+    resolved_count = len(resolved_sigs)
 
     text = _backtest_stats_text(pair_filter, days)
     if resolved_count:
