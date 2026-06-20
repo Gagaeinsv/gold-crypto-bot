@@ -3974,41 +3974,41 @@ PLAN_EMOJI = {"trial": "🔬", "basic": "⭐", "pro": "💎", "diamond": "💠",
 
 
 def plan_label(p: str) -> str:
-    return {"trial": "Trial", "basic": "Basic", "pro": "Pro", "diamond": "Diamond",
-            "admin": "Admin", "expired": "Expired"}.get(p, p)
+    return {"trial": "Тріал", "basic": "Базовий", "pro": "Pro", "diamond": "Diamond",
+            "admin": "Адмін", "expired": "Закінчився"}.get(p, p)
 
 
 def kb_main(plan: str = "trial", pair: str = DEFAULT_PAIR, deep_left: int | None = None) -> InlineKeyboardMarkup:
     cfg = PAIRS[pair]
     rows = [
-        [InlineKeyboardButton(f"🔀 Pair: {cfg['emoji']} {cfg['name']}", callback_data="choose_pair")],
-        [InlineKeyboardButton("▶️ Analyse & Enter", callback_data="start")],
+        [InlineKeyboardButton(f"🔀 Пара: {cfg['emoji']} {cfg['name']}", callback_data="choose_pair")],
+        [InlineKeyboardButton("▶️ Аналіз та вхід", callback_data="start")],
     ]
     if plan in ("basic", "pro", "diamond", "admin", "trial"):
         rows.append([
-            InlineKeyboardButton("⏹ Stop",  callback_data="stop"),
-            InlineKeyboardButton("🔄 Reset", callback_data="reset"),
+            InlineKeyboardButton("⏹ Стоп",  callback_data="stop"),
+            InlineKeyboardButton("🔄 Скинути", callback_data="reset"),
         ])
-        rows.append([InlineKeyboardButton("📊 Trade Status", callback_data="status")])
+        rows.append([InlineKeyboardButton("📊 Статус угоди", callback_data="status")])
     if plan in ("trial", "diamond", "admin"):
         if plan == "admin":
-            deep_label = "🧠 Deep Analysis"
+            deep_label = "🧠 Глибокий аналіз"
         elif plan == "trial":
             left = deep_left if deep_left is not None else 1
-            deep_label = f"🧠 Deep Analysis ({left}/1)"
+            deep_label = f"🧠 Глибокий аналіз ({left}/1)"
         else:
             left = deep_left if deep_left is not None else DEEP_ANALYSIS_DAILY_LIMIT
-            deep_label = f"🧠 Deep Analysis ({left}/{DEEP_ANALYSIS_DAILY_LIMIT})"
+            deep_label = f"🧠 Глибокий аналіз ({left}/{DEEP_ANALYSIS_DAILY_LIMIT})"
         if plan in ("diamond", "admin"):
             rows.append([
                 InlineKeyboardButton(deep_label, callback_data="deepanalysis_menu"),
-                InlineKeyboardButton("📸 Chart AI", callback_data="chart_ai"),
+                InlineKeyboardButton("📸 Графік AI", callback_data="chart_ai"),
             ])
         else:
             rows.append([InlineKeyboardButton(deep_label, callback_data="deepanalysis_menu")])
     rows.append([
-        InlineKeyboardButton("💳 Subscription", callback_data="sub_menu"),
-        InlineKeyboardButton("🤝 Refer & Earn",  callback_data="refer"),
+        InlineKeyboardButton("💳 Підписка", callback_data="sub_menu"),
+        InlineKeyboardButton("🤝 Реферали",  callback_data="refer"),
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -4031,88 +4031,88 @@ def kb_pairs(current_pair: str, plan: str) -> InlineKeyboardMarkup:
         mark  = "✅" if pid == current_pair else ("🔒" if not accessible else "")
         label = f"{mark} {cfg['emoji']} {cfg['name']}" + (" (Pro)" if not accessible else "")
         rows.append([InlineKeyboardButton(label, callback_data=f"pair_{pid}")])
-    rows.append([InlineKeyboardButton("↩️ Back", callback_data="back_main")])
+    rows.append([InlineKeyboardButton("↩️ Назад", callback_data="back_main")])
     return InlineKeyboardMarkup(rows)
 
 
 def kb_sub() -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(f"⭐ Basic — {PRICE_BASIC}⭐/mo (~$5)",            callback_data="buy_basic_1")],
-        [InlineKeyboardButton(f"⭐ Basic — {PRICE_BASIC_3}⭐/3mo (~$12.5) 🔥",   callback_data="buy_basic_3")],
-        [InlineKeyboardButton(f"💎 Pro   — {PRICE_PRO}⭐/mo (~$9.99)",          callback_data="buy_pro_1")],
-        [InlineKeyboardButton(f"💎 Pro   — {PRICE_PRO_3}⭐/3mo (~$25) 🔥",      callback_data="buy_pro_3")],
-        [InlineKeyboardButton(f"💠 Diamond — {PRICE_DIAMOND}⭐/mo (~$19.99)",   callback_data="buy_diamond_1")],
-        [InlineKeyboardButton(f"💠 Diamond — {PRICE_DIAMOND_3}⭐/3mo (~$49.99) 🔥", callback_data="buy_diamond_3")],
+        [InlineKeyboardButton(f"⭐ Базовий — {PRICE_BASIC}⭐/міс (~$5)",            callback_data="buy_basic_1")],
+        [InlineKeyboardButton(f"⭐ Базовий — {PRICE_BASIC_3}⭐/3міс (~$12.5) 🔥",   callback_data="buy_basic_3")],
+        [InlineKeyboardButton(f"💎 Pro   — {PRICE_PRO}⭐/міс (~$9.99)",          callback_data="buy_pro_1")],
+        [InlineKeyboardButton(f"💎 Pro   — {PRICE_PRO_3}⭐/3міс (~$25) 🔥",      callback_data="buy_pro_3")],
+        [InlineKeyboardButton(f"💠 Diamond — {PRICE_DIAMOND}⭐/міс (~$19.99)",   callback_data="buy_diamond_1")],
+        [InlineKeyboardButton(f"💠 Diamond — {PRICE_DIAMOND_3}⭐/3міс (~$49.99) 🔥", callback_data="buy_diamond_3")],
     ]
     # Optional crypto payments (NOWPayments)
     if NOWPAYMENTS_API_KEY and PUBLIC_BASE_URL and NOWPAYMENTS_IPN_SECRET:
         rows += [
-            [InlineKeyboardButton("₮ Pay with Crypto (USDT TRC20)", callback_data="crypto_menu")],
+            [InlineKeyboardButton("₮ Оплата криптою (USDT TRC20)", callback_data="crypto_menu")],
         ]
-    rows.append([InlineKeyboardButton("↩️ Back", callback_data="back_main")])
+    rows.append([InlineKeyboardButton("↩️ Назад", callback_data="back_main")])
     return InlineKeyboardMarkup(rows)
 
 
 def kb_confirm(opt: float, pair: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Enter now",                        callback_data="confirm_now")],
-        [InlineKeyboardButton(f"⏳ Wait for {fmt_price(opt, pair)}", callback_data=f"wait_{opt}")],
-        [InlineKeyboardButton("❌ Cancel",                           callback_data="cancel")],
-        [InlineKeyboardButton("🔄 Refresh analysis",                 callback_data="refresh_analysis")],
+        [InlineKeyboardButton("✅ Увійти зараз",                        callback_data="confirm_now")],
+        [InlineKeyboardButton(f"⏳ Чекати ціни {fmt_price(opt, pair)}", callback_data=f"wait_{opt}")],
+        [InlineKeyboardButton("❌ Скасувати",                           callback_data="cancel")],
+        [InlineKeyboardButton("🔄 Оновити аналіз",                 callback_data="refresh_analysis")],
     ])
 
 
 def sub_info_text(acc: dict) -> str:
     plan = acc["plan"];  dl = acc["days_left"]
-    lines = [f"💳 *Plan: {PLAN_EMOJI.get(plan, '?')} {plan_label(plan)}*", ""]
+    lines = [f"💳 *Тариф: {PLAN_EMOJI.get(plan, '?')} {plan_label(plan)}*", ""]
     if plan == "trial":
-        lines += [f"🔬 Trial: *{dl} days* left", "",
+        lines += [f"🔬 Тріал: залишилось *{dl} дн.*", "",
                   "🥇 XAU/USD — ✅", "₿ BTC — 🔒", "Ξ ETH — 🔒", "",
-                  "🧠 Deep Analysis — ✅ _(1/day)_", ""]
+                  "🧠 Глибокий аналіз — ✅ _(1/день)_", ""]
     elif plan == "basic":
-        lines += [f"⭐ Basic: *{dl} days* left", "",
+        lines += [f"⭐ Базовий: залишилось *{dl} дн.*", "",
                   "🥇 XAU/USD — ✅", "🥈 XAG/USD — ✅",
                   "₿ BTC — 🔒", "Ξ ETH — 🔒", "◎ SOL — 🔒",
                   "✕ XRP — 🔒", "🔶 BNB — 🔒", "🔹 TON — 🔒", "🔵 ADA — 🔒", ""]
     elif plan == "pro":
-        lines += [f"💎 Pro: *{dl} days* left", "",
+        lines += [f"💎 Pro: залишилось *{dl} дн.*", "",
                   "🥇 XAU — ✅", "🥈 XAG — ✅",
                   "₿ BTC — ✅", "Ξ ETH — ✅", "◎ SOL — ✅",
                   "✕ XRP — ✅", "🔶 BNB — ✅", "🔹 TON — ✅", "🔵 ADA — ✅",
-                  "✅ Auto-signals", ""]
+                  "✅ Автосигнали", ""]
     elif plan == "diamond":
-        lines += [f"💠 Diamond: *{dl} days* left", "",
+        lines += [f"💠 Diamond: залишилось *{dl} дн.*", "",
                   "🥇 XAU — ✅", "🥈 XAG — ✅",
                   "₿ BTC — ✅", "Ξ ETH — ✅", "◎ SOL — ✅",
                   "✕ XRP — ✅", "🔶 BNB — ✅", "🔹 TON — ✅", "🔵 ADA — ✅",
-                  "✅ Auto-signals (priority)", "✅ Chart AI screenshot analysis",
-                  "✅ Priority alerts (lower threshold)", ""]
+                  "✅ Автосигнали (пріоритетні)", "✅ Аналіз скріншотів Chart AI",
+                  "✅ Пріоритетні сповіщення (нижчий поріг)", ""]
     elif plan in ("expired", "none"):
-        lines += ["❌ *Subscription expired*", ""]
+        lines += ["❌ *Термін підписки закінчився*", ""]
     lines += [
         "─" * 30,
-        "*⭐ Basic — $5/mo*",
-        "  • XAU/USD signals",
-        "  • AI pre-trade analysis",
-        "  • SL / TP monitoring",
-        f"  1 mo — *{PRICE_BASIC}⭐* (~$5)",
-        f"  3 mo — *{PRICE_BASIC_3}⭐* (~$12.5) 🔥 _save ~17%_",
+        "*⭐ Базовий — $5/міс*",
+        "  • Сигнали по золоту XAU/USD",
+        "  • ШІ аналіз перед угодою",
+        "  • Моніторинг SL / TP",
+        f"  1 міс — *{PRICE_BASIC}⭐* (~$5)",
+        f"  3 міс — *{PRICE_BASIC_3}⭐* (~$12.5) 🔥 _економія ~17%_",
         "",
-        "*💎 Pro — $9.99/mo*",
-        "  • Everything in Basic +",
-        "  • BTC/USD and ETH/USD",
-        "  • 24/7 auto-signals",
-        "  • Priority alerts",
-        f"  1 mo — *{PRICE_PRO}⭐* (~$9.99)",
-        f"  3 mo — *{PRICE_PRO_3}⭐* (~$25) 🔥 _save ~17%_",
+        "*💎 Pro — $9.99/міс*",
+        "  • Усе з Базового +",
+        "  • Валютні пари BTC/USD та ETH/USD",
+        "  • Цілодобові автосигнали",
+        "  • Пріоритетні сповіщення",
+        f"  1 міс — *{PRICE_PRO}⭐* (~$9.99)",
+        f"  3 міс — *{PRICE_PRO_3}⭐* (~$25) 🔥 _економія ~17%_",
         "",
-        "*💠 Diamond — $19.99/mo*",
-        "  • Everything in Pro +",
-        "  • 📸 Chart AI screenshot analysis",
-        "  • Priority signals (lower threshold)",
-        "  • Faster auto-signal cooldown",
-        f"  1 mo — *{PRICE_DIAMOND}⭐* (~$19.99)",
-        f"  3 mo — *{PRICE_DIAMOND_3}⭐* (~$49.99) 🔥 _save ~17%_",
+        "*💠 Diamond — $19.99/міс*",
+        "  • Усе з Pro +",
+        "  • 📸 Аналіз графіків за скріншотом (Chart AI)",
+        "  • Пріоритетні сигнали (знижений поріг)",
+        "  • Скорочений кулдаун автосигналів",
+        f"  1 міс — *{PRICE_DIAMOND}⭐* (~$19.99)",
+        f"  3 міс — *{PRICE_DIAMOND_3}⭐* (~$49.99) 🔥 _економія ~17%_",
         "",
         f"💡 _Безкоштовний trial для нових — {_trial_duration_ua()}_",
     ]
@@ -4208,17 +4208,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Welcome message differs for referred users
     if is_new and referrer_id:
         welcome = (
-            f"👋 *Welcome! You were invited by a friend.*\n\n"
+            f"👋 *Вітаємо! Вас запросив друг.*\n\n"
             f"{prices_text}\n\n"
-            f"Plan: {PLAN_EMOJI.get(plan, '?')} *{plan_label(plan)}*  ({acc['days_left']} days)\n\n"
-            f"Choose a pair and tap ▶️ Analyse & Enter"
+            f"Тариф: {PLAN_EMOJI.get(plan, '?')} *{plan_label(plan)}*  ({acc['days_left']} дн.)\n\n"
+            f"Оберіть пару та натисніть кнопку нижче для аналізу 👇"
         )
     else:
         welcome = (
-            f"🤖 *Gold & Crypto AI Signals*\n\n"
+            f"🤖 *ШІ Сигнали: Золото та Крипта*\n\n"
             f"{prices_text}\n\n"
-            f"Plan: {PLAN_EMOJI.get(plan, '?')} *{plan_label(plan)}*  ({acc['days_left']} days)\n\n"
-            f"Choose a pair and tap ▶️ Analyse & Enter"
+            f"Тариф: {PLAN_EMOJI.get(plan, '?')} *{plan_label(plan)}*  ({acc['days_left']} дн.)\n\n"
+            f"Оберіть пару та натисніть кнопку нижче для аналізу 👇"
         )
 
     await update.message.reply_text(
@@ -4240,23 +4240,22 @@ async def cmd_refer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     bars = "🟢" * min(stats["bonused"], 10)
     text = (
-        f"🤝 *Refer a Friend*\n"
+        f"🤝 *Запроси друга — отримай Premium!*\n"
         f"{'─' * 28}\n\n"
-        f"For every friend who joins using your link and subscribes to our channel:\n"
-        f"*+{REFERRAL_BONUS_DAYS} free days* added to your plan automatically!\n\n"
-        f"*Your referral link:*\n"
+        f"За кожного друга, який приєднається за вашим посиланням та підпишеться на наш канал:\n"
+        f"Ви автоматично отримаєте *+{REFERRAL_BONUS_DAYS} безкоштовних днів* Premium-підписки!\n\n"
+        f"*Ваше реферальне посилання:*\n"
         f"`{ref_link}`\n\n"
         f"{'─' * 28}\n"
-        f"📊 *Your stats:*\n"
-        f"👥 Friends invited: *{stats['total']}*\n"
-        f"✅ Bonuses earned: *{stats['bonused']}* {bars}\n"
-        f"⏳ Pending: *{stats['pending']}*\n"
-        f"🎁 Total days earned: *{stats['days_earned']}*\n\n"
-        f"💡 _Share on social media, send to trading groups,\n"
-        f"or ask your friend to forward it!_"
+        f"📊 *Ваша статистика:*\n"
+        f"👥 Запрошено друзів: *{stats['total']}*\n"
+        f"✅ Отримано бонусів: *{stats['bonused']}* {bars}\n"
+        f"⏳ В очікуванні підписки: *{stats['pending']}*\n"
+        f"🎁 Усього отримано днів: *{stats['days_earned']}*\n\n"
+        f"💡 _Поділіться цим посиланням у соцмережах, надішліть у торгові чати або попросіть друзів скористатися ним!_"
     )
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("📤 Share link", switch_inline_query=ref_link),
+        InlineKeyboardButton("📤 Поділитися посиланням", switch_inline_query=ref_link),
     ]])
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
@@ -5505,7 +5504,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if q.data == "back_main":
-        await safe_edit(q, "🤖 *AI Trading Bot*", markup=kb_main_for(cid, plan, u.selected_pair))
+        await safe_edit(q, "🤖 *ШІ Сигнали: Золото та Крипта*", markup=kb_main_for(cid, plan, u.selected_pair))
         return
 
     if q.data == "refer":
@@ -5513,17 +5512,17 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ref_link = f"https://t.me/{BOT_USERNAME.lstrip('@')}?start=ref_{cid}"
         bars     = "🟢" * min(stats["bonused"], 10)
         text = (
-            f"🤝 *Refer a Friend — Earn Free Days*\n"
+            f"🤝 *Запроси друга — отримай Premium!*\n"
             f"{'─' * 28}\n\n"
-            f"Share your link → friend joins and subscribes → you get *+{REFERRAL_BONUS_DAYS} free days!*\n\n"
-            f"*Your link:*\n`{ref_link}`\n\n"
+            f"Поділіться посиланням → друг приєднується та підписується → ви отримуєте *+{REFERRAL_BONUS_DAYS} безкоштовних днів*!\n\n"
+            f"*Ваше посилання:*\n`{ref_link}`\n\n"
             f"{'─' * 28}\n"
-            f"👥 Invited: *{stats['total']}*\n"
-            f"✅ Bonuses: *{stats['bonused']}* {bars}\n"
-            f"🎁 Days earned: *{stats['days_earned']}*"
+            f"👥 Запрошено: *{stats['total']}*\n"
+            f"✅ Бонуси: *{stats['bonused']}* {bars}\n"
+            f"🎁 Отримано днів: *{stats['days_earned']}*"
         )
         await safe_edit(q, text, markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("↩️ Back", callback_data="back_main")],
+            [InlineKeyboardButton("↩️ Назад", callback_data="back_main")],
         ]))
         return
 
