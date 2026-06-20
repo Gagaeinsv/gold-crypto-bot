@@ -727,8 +727,10 @@ def db_upsert_user(
     """
 
     def _lang_norm(raw: str | None) -> str:
-        z = (raw or "").strip()
-        return z if z else "en"
+        z = (raw or "").strip().lower()
+        if z.startswith("uk") or z.startswith("ua"):
+            return "uk"
+        return "en"
 
     with db_connect() as c:
         row = c.execute("SELECT * FROM users WHERE chat_id=?", (cid,)).fetchone()
@@ -762,6 +764,28 @@ def db_upsert_user(
             (nu, nf, nlang, npm, cid),
         )
         return False
+
+
+def db_get_user_lang(cid: int) -> str:
+    """Fetch user's normalized language ('uk' or 'en')."""
+    try:
+        with db_connect() as c:
+            row = c.execute("SELECT language_code FROM users WHERE chat_id=?", (cid,)).fetchone()
+        if row and row["language_code"] in ("uk", "en"):
+            return row["language_code"]
+    except Exception:
+        pass
+    return "en"
+
+
+def db_set_user_lang(cid: int, lang: str) -> None:
+    """Set user's language ('uk' or 'en')."""
+    clean_lang = "uk" if lang == "uk" else "en"
+    try:
+        with db_connect() as c:
+            c.execute("UPDATE users SET language_code=? WHERE chat_id=?", (clean_lang, cid))
+    except Exception as e:
+        log.error("Failed to set user lang: %s", e)
 
 
 def db_access(cid: int) -> dict:
@@ -3973,149 +3997,333 @@ async def safe_callback_answer(q, **kwargs) -> None:
 PLAN_EMOJI = {"trial": "🔬", "basic": "⭐", "pro": "💎", "diamond": "💠", "admin": "👑", "expired": "❌"}
 
 
-def plan_label(p: str) -> str:
-    return {"trial": "Тріал", "basic": "Базовий", "pro": "Pro", "diamond": "Diamond",
-            "admin": "Адмін", "expired": "Закінчився"}.get(p, p)
+TRANSLATIONS = {
+    "uk": {
+        "welcome_ref": "👋 *Вітаємо! Вас запросив друг.*\n\n{prices}\n\nТариф: {emoji} *{plan_label}*  ({days} дн.)\n\nОберіть пару та натисніть кнопку нижче для аналізу 👇",
+        "welcome_normal": "🤖 *ШІ Сигнали: Золото та Крипта*\n\n{prices}\n\nТариф: {emoji} *{plan_label}*  ({days} дн.)\n\nОберіть пару та натисніть кнопку нижче для аналізу 👇",
+        "btn_pair": "🔀 Пара: {emoji} {name}",
+        "btn_analyse": "▶️ Аналіз та вхід",
+        "btn_stop": "⏹ Стоп",
+        "btn_reset": "🔄 Скинути",
+        "btn_status": "📊 Статус угоди",
+        "btn_deep": "🧠 Глибокий аналіз",
+        "btn_chart": "📸 Графік AI",
+        "btn_sub": "💳 Підписка",
+        "btn_refer": "🤝 Реферали",
+        "btn_lang": "🌐 Мова / Language",
+        "btn_back": "↩️ Назад",
+        "sub_menu_title": "💳 *Тариф: {emoji} {plan_label}*",
+        "sub_trial_left": "🔬 Тріал: залишилось *{days} дн.*",
+        "sub_basic_left": "⭐ Базовий: залишилось *{days} дн.*",
+        "sub_pro_left": "💎 Pro: залишилось *{days} дн.*",
+        "sub_diamond_left": "💠 Diamond: залишилось *{days} дн.*",
+        "sub_expired": "❌ *Термін підписки закінчився*",
+        "refer_title": "🤝 *Запроси друга — отримай Premium!*\n{line}\n\nЗа кожного друга, який приєднається за вашим посиланням та підпишеться на наш канал:\nВи автоматично отримаєте *+{bonus} безкоштовних днів* Premium-підписки!\n\n*Ваше реферальне посилання:*\n`{link}`\n\n{line}\n📊 *Ваша статистика:*\n👥 Запрошено друзів: *{total}*\n✅ Отримано бонусів: *{bonused}* {bars}\n⏳ В очікуванні підписки: *{pending}*\n🎁 Усього отримано днів: *{earned}*\n\n💡 _Поділіться цим посиланням у соцмережах, надішліть у торгові чати або попросіть друзів скористатися ним!_",
+        "refer_callback": "🤝 *Запроси друга — отримай Premium!*\n{line}\n\nПоділіться посиланням → друг приєднується та підписується → ви отримуєте *+{bonus} безкоштовних днів*!\n\n*Ваше посилання:*\n`{link}`\n\n{line}\n👥 Запрошено: *{total}*\n✅ Бонуси: *{bonused}* {bars}\n🎁 Отримано днів: *{earned}*",
+        "deep_no_access": "💠 *Глибокий аналіз* доступний на тарифах Тріал (1/день) та Diamond (3/день).\n\nНатисніть /start → 💳 Підписка",
+        "deep_trial_limit": "⏳ *Досягнуто ліміту Тріалу* (1/день)\n\nОновіть тариф до 💠 Diamond, щоб отримувати *3 глибокі аналізи на день* для будь-якої пари.\n\nНатисніть /start → 💳 Підписка",
+        "deep_daily_limit": "⏳ *Досягнуто денного ліміту* ({limit}/день)\n\nВи використали всі {limit} глибоких аналізів на сьогодні.\nЛіміт скидається опівночі за UTC.",
+        "deep_title": "🧠 *Глибокий аналіз {remaining}*\n\nОберіть пару для аналізу:",
+        "chart_no_access": "💠 *Аналіз графіка ШІ* доступний лише для користувачів тарифу Diamond.\n\nОновіть тариф до Diamond, щоб розблокувати:\n• 📸 Аналіз графіків за скріншотом\n• Пріоритетні автосигнали\n• Знижений поріг сповіщень\n\nНатисніть /start → 💳 Підписка",
+        "chart_usage": "📸 *Як використовувати аналіз графіків:*\n\n1. Відкрийте графік вашого брокера або TradingView\n2. Налаштуйте таймфрейм та індикатори\n3. Зробіть скріншот\n4. Надішліть скріншот цьому боту\n   _(опис фото додавати не обов'язково)_\n\nШІ проаналізує графік і надасть:\n• Напрямок та силу тренду\n• Ключові рівні підтримки та опору\n• Рекомендації щодо входу, SL та TP\n• Загальну рекомендацію щодо угоди",
+        "chart_analysing": "🔍 *Аналізуємо ваш графік…*\n_Модель `{model}` — очікування близько 15–45 секунд_",
+        "btn_cancel": "❌ Скасувати",
+        "btn_enter_now": "✅ Увійти зараз",
+        "btn_wait_price": "⏳ Чекати ціни {price}",
+        "btn_refresh_analysis": "🔄 Оновити аналіз",
+        "main_title": "🤖 *ШІ Сигнали: Золото та Крипта*",
+        "choose_pair_hint": "🔀 *Оберіть пару*\n\n🔒 XAG (Срібло) — від тарифу Базовий\n🔒 Крипта _(BTC, ETH, SOL, XRP, BNB, TON, ADA)_ — від тарифу Pro",
+        "err_unknown_pair": "❌ Невідома пара.",
+        "err_requires_plan": "🔒 *{name}* потребує тарифу Pro або Diamond.",
+        "pair_selected": "✅ *{emoji} {name}*\n\nЦіна: *{price}*",
+        "lang_menu_title": "🌐 *Оберіть мову інтерфейсу:*",
+        "lang_changed": "✅ Мову змінено на Українську!",
+        "sub_success_alert": "✅ Дякуємо за підписку! Доступ активовано.",
+        "sub_fail_alert": "❌ Ви все ще не підписалися на канал! Будь ласка, підпишіться.",
+        "fetching_price": "⏳ *Отримуємо ціну {emoji} {name}…*",
+        "err_no_price": "❌ Не вдалося отримати ціну.",
+        "analysing": "🔄 *Аналізуємо {emoji} {name}…*\n\n💰 Ціна: *{price}*\n_Отримуємо технічні дані, новини та інсайти ШІ…_",
+        "timeout": "⏱ *Перевищено час очікування аналізу.*\n\n_Сервер відповідав занадто довго. Зазвичай це трапляється один раз — спробуйте ще раз._",
+        "price_error": "❌ Помилка ціни.",
+        "trade_opened": "✅ *{emoji} Угоду відкрито!*\n\n{emoji_dir} Напрямок: *{direction}* {description}\nВхід: *{entry}*\nSL: *{sl}* | TP: *{tp}*",
+        "trade_error": "❌ Помилка.",
+        "waiting_price": "⏳ Очікування ціни *{price}*",
+        "cancelled": "↩️ Скасовано",
+        "stopped": "⏹ Зупинено",
+        "reset_done": "🔄 *Скинуто*",
+        "status_title": "📊 *Статус*",
+        "what_to_do": "\n\n*Що ви хочете зробити?*",
+    },
+    "en": {
+        "welcome_ref": "👋 *Welcome! You were invited by a friend.*\n\n{prices}\n\nPlan: {emoji} *{plan_label}*  ({days} days)\n\nChoose a pair and tap ▶️ Analyse & Enter",
+        "welcome_normal": "🤖 *Gold & Crypto AI Signals*\n\n{prices}\n\nPlan: {emoji} *{plan_label}*  ({days} days)\n\nChoose a pair and tap ▶️ Analyse & Enter",
+        "btn_pair": "🔀 Pair: {emoji} {name}",
+        "btn_analyse": "▶️ Analyse & Enter",
+        "btn_stop": "⏹ Stop",
+        "btn_reset": "🔄 Reset",
+        "btn_status": "📊 Trade Status",
+        "btn_deep": "🧠 Deep Analysis",
+        "btn_chart": "📸 Chart AI",
+        "btn_sub": "💳 Subscription",
+        "btn_refer": "🤝 Refer & Earn",
+        "btn_lang": "🌐 Language / Мова",
+        "btn_back": "↩️ Back",
+        "sub_menu_title": "💳 *Plan: {emoji} {plan_label}*",
+        "sub_trial_left": "🔬 Trial: *{days} days* left",
+        "sub_basic_left": "⭐ Basic: *{days} days* left",
+        "sub_pro_left": "💎 Pro: *{days} days* left",
+        "sub_diamond_left": "💠 Diamond: *{days} days* left",
+        "sub_expired": "❌ *Subscription expired*",
+        "refer_title": "🤝 *Refer a Friend*\n{line}\n\nFor every friend who joins using your link and subscribes to our channel:\n*+{bonus} free days* added to your plan automatically!\n\n*Your referral link:*\n`{link}`\n\n{line}\n📊 *Your stats:*\n👥 Friends invited: *{total}*\n✅ Bonuses earned: *{bonused}* {bars}\n⏳ Pending: *{pending}*\n🎁 Total days earned: *{earned}*\n\n💡 _Share on social media, send to trading groups,\nor ask your friend to forward it!_",
+        "refer_callback": "🤝 *Refer a Friend — Earn Free Days*\n{line}\n\nShare your link → friend joins and subscribes → you get *+{bonus} free days!*\n\n*Your link:*\n`{link}`\n\n{line}\n👥 Invited: *{total}*\n✅ Bonuses: *{bonused}* {bars}\n🎁 Days earned: *{earned}*",
+        "deep_no_access": "💠 *Deep Analysis* is available on Trial (1/day) and Diamond (3/day).\n\nTap /start → 💳 Subscription",
+        "deep_trial_limit": "⏳ *Trial limit reached* (1/day)\n\nUpgrade to 💠 Diamond to get *3 deep analyses per day* on any pair.\n\nTap /start → 💳 Subscription",
+        "deep_daily_limit": "⏳ *Daily limit reached* ({limit}/day)\n\nYou've used all {limit} deep analyses for today.\nResets at midnight UTC.",
+        "deep_title": "🧠 *Deep Analysis {remaining}*\n\nChoose a pair to analyse:",
+        "chart_no_access": "💠 *Chart AI Analysis* is a Diamond-exclusive feature.\n\nUpgrade to Diamond to unlock:\n• 📸 Screenshot chart analysis\n• Priority auto-signals\n• Lower alert threshold\n\nTap /start → 💳 Subscription",
+        "chart_usage": "📸 *How to use Chart Analysis:*\n\n1. Open your broker/TradingView chart\n2. Set your timeframe and indicators\n3. Take a screenshot\n4. Send the screenshot to this bot\n   _(caption is optional)_\n\nThe AI will analyse the chart and give you:\n• Trend direction and strength\n• Key support & resistance levels\n• Entry, SL and TP suggestion\n• Overall trade recommendation",
+        "chart_analysing": "🔍 *Analysing your chart…*\n_Model `{model}` — about 15–45 seconds_",
+        "btn_cancel": "❌ Cancel",
+        "btn_enter_now": "✅ Enter now",
+        "btn_wait_price": "⏳ Wait for {price}",
+        "btn_refresh_analysis": "🔄 Refresh analysis",
+        "main_title": "🤖 *Gold & Crypto AI Signals*",
+        "choose_pair_hint": "🔀 *Select pair*\n\n🔒 XAG (Silver) — Basic+\n🔒 Crypto _(BTC, ETH, SOL, XRP, BNB, TON, ADA)_ — Pro+",
+        "err_unknown_pair": "❌ Unknown pair.",
+        "err_requires_plan": "🔒 *{name}* requires Pro or Diamond plan.",
+        "pair_selected": "✅ *{emoji} {name}*\n\nPrice: *{price}*",
+        "lang_menu_title": "🌐 *Select your interface language:*",
+        "lang_changed": "✅ Language changed to English!",
+        "sub_success_alert": "✅ Thank you for subscribing! Access activated.",
+        "sub_fail_alert": "❌ You still haven't subscribed to the channel! Please subscribe.",
+        "fetching_price": "⏳ *Fetching price {emoji} {name}…*",
+        "err_no_price": "❌ Could not get price.",
+        "analysing": "🔄 *Analysing {emoji} {name}…*\n\n💰 Price: *{price}*\n_Fetching technicals, news and AI insight…_",
+        "timeout": "⏱ *Analysis timed out.*\n\n_The server took too long. This usually happens once — please try again._",
+        "price_error": "❌ Price error.",
+        "trade_opened": "✅ *{emoji} Trade opened!*\n\n{emoji_dir} Direction: *{direction}* {description}\nEntry: *{entry}*\nSL: *{sl}* | TP: *{tp}*",
+        "trade_error": "❌ Error.",
+        "waiting_price": "⏳ Waiting for *{price}*",
+        "cancelled": "↩️ Cancelled",
+        "stopped": "⏹ Stopped",
+        "reset_done": "🔄 *Reset*",
+        "status_title": "📊 *Status*",
+        "what_to_do": "\n\n*What would you like to do?*",
+    }
+}
 
 
-def kb_main(plan: str = "trial", pair: str = DEFAULT_PAIR, deep_left: int | None = None) -> InlineKeyboardMarkup:
+def plan_label(p: str, lang: str = "en") -> str:
+    if lang == "uk":
+        return {"trial": "Тріал", "basic": "Базовий", "pro": "Pro", "diamond": "Diamond",
+                "admin": "Адмін", "expired": "Закінчився"}.get(p, p)
+    else:
+        return {"trial": "Trial", "basic": "Basic", "pro": "Pro", "diamond": "Diamond",
+                "admin": "Admin", "expired": "Expired"}.get(p, p)
+
+
+def _t(key: str, lang: str, **kwargs) -> str:
+    """Get translated text for key in the given language."""
+    trans = TRANSLATIONS.get(lang, TRANSLATIONS["en"])
+    text = trans.get(key, TRANSLATIONS["en"].get(key, key))
+    if kwargs:
+        return text.format(**kwargs)
+    return text
+
+
+def kb_main(plan: str = "trial", pair: str = DEFAULT_PAIR, deep_left: int | None = None, lang: str = "en") -> InlineKeyboardMarkup:
     cfg = PAIRS[pair]
     rows = [
-        [InlineKeyboardButton(f"🔀 Пара: {cfg['emoji']} {cfg['name']}", callback_data="choose_pair")],
-        [InlineKeyboardButton("▶️ Аналіз та вхід", callback_data="start")],
+        [InlineKeyboardButton(_t("btn_pair", lang, emoji=cfg['emoji'], name=cfg['name']), callback_data="choose_pair")],
+        [InlineKeyboardButton(_t("btn_analyse", lang), callback_data="start")],
     ]
     if plan in ("basic", "pro", "diamond", "admin", "trial"):
         rows.append([
-            InlineKeyboardButton("⏹ Стоп",  callback_data="stop"),
-            InlineKeyboardButton("🔄 Скинути", callback_data="reset"),
+            InlineKeyboardButton(_t("btn_stop", lang),  callback_data="stop"),
+            InlineKeyboardButton(_t("btn_reset", lang), callback_data="reset"),
         ])
-        rows.append([InlineKeyboardButton("📊 Статус угоди", callback_data="status")])
+        rows.append([InlineKeyboardButton(_t("btn_status", lang), callback_data="status")])
     if plan in ("trial", "diamond", "admin"):
         if plan == "admin":
-            deep_label = "🧠 Глибокий аналіз"
+            deep_label = _t("btn_deep", lang)
         elif plan == "trial":
             left = deep_left if deep_left is not None else 1
-            deep_label = f"🧠 Глибокий аналіз ({left}/1)"
+            deep_label = f"{_t('btn_deep', lang)} ({left}/1)"
         else:
             left = deep_left if deep_left is not None else DEEP_ANALYSIS_DAILY_LIMIT
-            deep_label = f"🧠 Глибокий аналіз ({left}/{DEEP_ANALYSIS_DAILY_LIMIT})"
+            deep_label = f"{_t('btn_deep', lang)} ({left}/{DEEP_ANALYSIS_DAILY_LIMIT})"
         if plan in ("diamond", "admin"):
             rows.append([
                 InlineKeyboardButton(deep_label, callback_data="deepanalysis_menu"),
-                InlineKeyboardButton("📸 Графік AI", callback_data="chart_ai"),
+                InlineKeyboardButton(_t("btn_chart", lang), callback_data="chart_ai"),
             ])
         else:
             rows.append([InlineKeyboardButton(deep_label, callback_data="deepanalysis_menu")])
     rows.append([
-        InlineKeyboardButton("💳 Підписка", callback_data="sub_menu"),
-        InlineKeyboardButton("🤝 Реферали",  callback_data="refer"),
+        InlineKeyboardButton(_t("btn_sub", lang), callback_data="sub_menu"),
+        InlineKeyboardButton(_t("btn_refer", lang),  callback_data="refer"),
+    ])
+    rows.append([
+        InlineKeyboardButton(_t("btn_lang", lang), callback_data="lang_menu")
     ])
     return InlineKeyboardMarkup(rows)
 
 
 def kb_main_for(cid: int, plan: str, pair: str = DEFAULT_PAIR) -> InlineKeyboardMarkup:
-    """Build kb_main with correct deep_left counter for the given user."""
+    """Build kb_main with correct deep_left counter and language for the given user."""
+    lang = db_get_user_lang(cid)
     if plan in ("trial", "diamond"):
         used = db_deepanalysis_count_today(cid)
         limit = 1 if plan == "trial" else DEEP_ANALYSIS_DAILY_LIMIT
         deep_left = max(0, limit - used)
     else:
         deep_left = None
-    return kb_main(plan, pair, deep_left=deep_left)
+    return kb_main(plan, pair, deep_left=deep_left, lang=lang)
 
 
-def kb_pairs(current_pair: str, plan: str) -> InlineKeyboardMarkup:
+def kb_pairs(current_pair: str, plan: str, lang: str = "en") -> InlineKeyboardMarkup:
     rows = []
     for pid, cfg in PAIRS.items():
         accessible = plan in cfg["plans"]
         mark  = "✅" if pid == current_pair else ("🔒" if not accessible else "")
         label = f"{mark} {cfg['emoji']} {cfg['name']}" + (" (Pro)" if not accessible else "")
         rows.append([InlineKeyboardButton(label, callback_data=f"pair_{pid}")])
-    rows.append([InlineKeyboardButton("↩️ Назад", callback_data="back_main")])
+    rows.append([InlineKeyboardButton(_t("btn_back", lang), callback_data="back_main")])
     return InlineKeyboardMarkup(rows)
 
 
-def kb_sub() -> InlineKeyboardMarkup:
+def kb_sub(lang: str = "en") -> InlineKeyboardMarkup:
+    basic_label = f"⭐ Basic — {PRICE_BASIC}⭐/mo (~$5)" if lang == "en" else f"⭐ Базовий — {PRICE_BASIC}⭐/міс (~$5)"
+    basic_3_label = f"⭐ Basic — {PRICE_BASIC_3}⭐/3mo (~$12.5) 🔥" if lang == "en" else f"⭐ Базовий — {PRICE_BASIC_3}⭐/3міс (~$12.5) 🔥"
+    pro_label = f"💎 Pro   — {PRICE_PRO}⭐/mo (~$9.99)" if lang == "en" else f"💎 Pro   — {PRICE_PRO}⭐/міс (~$9.99)"
+    pro_3_label = f"💎 Pro   — {PRICE_PRO_3}⭐/3mo (~$25) 🔥" if lang == "en" else f"💎 Pro   — {PRICE_PRO_3}⭐/3міс (~$25) 🔥"
+    diamond_label = f"💠 Diamond — {PRICE_DIAMOND}⭐/mo (~$19.99)" if lang == "en" else f"💠 Diamond — {PRICE_DIAMOND}⭐/міс (~$19.99)"
+    diamond_3_label = f"💠 Diamond — {PRICE_DIAMOND_3}⭐/3mo (~$49.99) 🔥" if lang == "en" else f"💠 Diamond — {PRICE_DIAMOND_3}⭐/3міс (~$49.99) 🔥"
+
     rows = [
-        [InlineKeyboardButton(f"⭐ Базовий — {PRICE_BASIC}⭐/міс (~$5)",            callback_data="buy_basic_1")],
-        [InlineKeyboardButton(f"⭐ Базовий — {PRICE_BASIC_3}⭐/3міс (~$12.5) 🔥",   callback_data="buy_basic_3")],
-        [InlineKeyboardButton(f"💎 Pro   — {PRICE_PRO}⭐/міс (~$9.99)",          callback_data="buy_pro_1")],
-        [InlineKeyboardButton(f"💎 Pro   — {PRICE_PRO_3}⭐/3міс (~$25) 🔥",      callback_data="buy_pro_3")],
-        [InlineKeyboardButton(f"💠 Diamond — {PRICE_DIAMOND}⭐/міс (~$19.99)",   callback_data="buy_diamond_1")],
-        [InlineKeyboardButton(f"💠 Diamond — {PRICE_DIAMOND_3}⭐/3міс (~$49.99) 🔥", callback_data="buy_diamond_3")],
+        [InlineKeyboardButton(basic_label,            callback_data="buy_basic_1")],
+        [InlineKeyboardButton(basic_3_label,   callback_data="buy_basic_3")],
+        [InlineKeyboardButton(pro_label,          callback_data="buy_pro_1")],
+        [InlineKeyboardButton(pro_3_label,      callback_data="buy_pro_3")],
+        [InlineKeyboardButton(diamond_label,   callback_data="buy_diamond_1")],
+        [InlineKeyboardButton(diamond_3_label, callback_data="buy_diamond_3")],
     ]
     # Optional crypto payments (NOWPayments)
     if NOWPAYMENTS_API_KEY and PUBLIC_BASE_URL and NOWPAYMENTS_IPN_SECRET:
+        pay_label = "₮ Pay with Crypto (USDT TRC20)" if lang == "en" else "₮ Оплата криптою (USDT TRC20)"
         rows += [
-            [InlineKeyboardButton("₮ Оплата криптою (USDT TRC20)", callback_data="crypto_menu")],
+            [InlineKeyboardButton(pay_label, callback_data="crypto_menu")],
         ]
-    rows.append([InlineKeyboardButton("↩️ Назад", callback_data="back_main")])
+    rows.append([InlineKeyboardButton(_t("btn_back", lang), callback_data="back_main")])
     return InlineKeyboardMarkup(rows)
 
 
-def kb_confirm(opt: float, pair: str) -> InlineKeyboardMarkup:
+def kb_confirm(opt: float, pair: str, lang: str = "en") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Увійти зараз",                        callback_data="confirm_now")],
-        [InlineKeyboardButton(f"⏳ Чекати ціни {fmt_price(opt, pair)}", callback_data=f"wait_{opt}")],
-        [InlineKeyboardButton("❌ Скасувати",                           callback_data="cancel")],
-        [InlineKeyboardButton("🔄 Оновити аналіз",                 callback_data="refresh_analysis")],
+        [InlineKeyboardButton(_t("btn_enter_now", lang),                        callback_data="confirm_now")],
+        [InlineKeyboardButton(_t("btn_wait_price", lang, price=fmt_price(opt, pair)), callback_data=f"wait_{opt}")],
+        [InlineKeyboardButton(_t("btn_cancel", lang),                           callback_data="cancel")],
+        [InlineKeyboardButton(_t("btn_refresh_analysis", lang),                 callback_data="refresh_analysis")],
     ])
 
 
-def sub_info_text(acc: dict) -> str:
+def kb_lang(lang: str = "en") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🇺🇦 Українська", callback_data="set_lang_uk"),
+            InlineKeyboardButton("🇬🇧 English", callback_data="set_lang_en"),
+        ],
+        [
+            InlineKeyboardButton(_t("btn_back", lang), callback_data="back_main"),
+        ]
+    ])
+
+
+def sub_info_text(acc: dict, lang: str = "en") -> str:
     plan = acc["plan"];  dl = acc["days_left"]
-    lines = [f"💳 *Тариф: {PLAN_EMOJI.get(plan, '?')} {plan_label(plan)}*", ""]
+    lines = [_t("sub_menu_title", lang, emoji=PLAN_EMOJI.get(plan, '?'), plan_label=plan_label(plan, lang)), ""]
     if plan == "trial":
-        lines += [f"🔬 Тріал: залишилось *{dl} дн.*", "",
+        lines += [_t("sub_trial_left", lang, days=dl), "",
                   "🥇 XAU/USD — ✅", "₿ BTC — 🔒", "Ξ ETH — 🔒", "",
-                  "🧠 Глибокий аналіз — ✅ _(1/день)_", ""]
+                  f"{_t('btn_deep', lang)} — ✅ _(1/day)_" if lang == "en" else f"{_t('btn_deep', lang)} — ✅ _(1/день)_", ""]
     elif plan == "basic":
-        lines += [f"⭐ Базовий: залишилось *{dl} дн.*", "",
+        lines += [_t("sub_basic_left", lang, days=dl), "",
                   "🥇 XAU/USD — ✅", "🥈 XAG/USD — ✅",
                   "₿ BTC — 🔒", "Ξ ETH — 🔒", "◎ SOL — 🔒",
                   "✕ XRP — 🔒", "🔶 BNB — 🔒", "🔹 TON — 🔒", "🔵 ADA — 🔒", ""]
     elif plan == "pro":
-        lines += [f"💎 Pro: залишилось *{dl} дн.*", "",
+        lines += [_t("sub_pro_left", lang, days=dl), "",
                   "🥇 XAU — ✅", "🥈 XAG — ✅",
                   "₿ BTC — ✅", "Ξ ETH — ✅", "◎ SOL — ✅",
                   "✕ XRP — ✅", "🔶 BNB — ✅", "🔹 TON — ✅", "🔵 ADA — ✅",
-                  "✅ Автосигнали", ""]
+                  "✅ Auto-signals" if lang == "en" else "✅ Автосигнали", ""]
     elif plan == "diamond":
-        lines += [f"💠 Diamond: залишилось *{dl} дн.*", "",
+        lines += [_t("sub_diamond_left", lang, days=dl), "",
                   "🥇 XAU — ✅", "🥈 XAG — ✅",
                   "₿ BTC — ✅", "Ξ ETH — ✅", "◎ SOL — ✅",
                   "✕ XRP — ✅", "🔶 BNB — ✅", "🔹 TON — ✅", "🔵 ADA — ✅",
-                  "✅ Автосигнали (пріоритетні)", "✅ Аналіз скріншотів Chart AI",
-                  "✅ Пріоритетні сповіщення (нижчий поріг)", ""]
+                  "✅ Auto-signals (priority)" if lang == "en" else "✅ Автосигнали (пріоритетні)",
+                  "✅ Chart AI screenshot analysis" if lang == "en" else "✅ - Аналіз скріншотів Chart AI",
+                  "✅ Priority alerts (lower threshold)" if lang == "en" else "✅ Пріоритетні сповіщення (нижчий поріг)", ""]
     elif plan in ("expired", "none"):
-        lines += ["❌ *Термін підписки закінчився*", ""]
-    lines += [
-        "─" * 30,
-        "*⭐ Базовий — $5/міс*",
-        "  • Сигнали по золоту XAU/USD",
-        "  • ШІ аналіз перед угодою",
-        "  • Моніторинг SL / TP",
-        f"  1 міс — *{PRICE_BASIC}⭐* (~$5)",
-        f"  3 міс — *{PRICE_BASIC_3}⭐* (~$12.5) 🔥 _економія ~17%_",
-        "",
-        "*💎 Pro — $9.99/міс*",
-        "  • Усе з Базового +",
-        "  • Валютні пари BTC/USD та ETH/USD",
-        "  • Цілодобові автосигнали",
-        "  • Пріоритетні сповіщення",
-        f"  1 міс — *{PRICE_PRO}⭐* (~$9.99)",
-        f"  3 міс — *{PRICE_PRO_3}⭐* (~$25) 🔥 _економія ~17%_",
-        "",
-        "*💠 Diamond — $19.99/міс*",
-        "  • Усе з Pro +",
-        "  • 📸 Аналіз графіків за скріншотом (Chart AI)",
-        "  • Пріоритетні сигнали (знижений поріг)",
-        "  • Скорочений кулдаун автосигналів",
-        f"  1 міс — *{PRICE_DIAMOND}⭐* (~$19.99)",
-        f"  3 міс — *{PRICE_DIAMOND_3}⭐* (~$49.99) 🔥 _економія ~17%_",
-        "",
-        f"💡 _Безкоштовний trial для нових — {_trial_duration_ua()}_",
-    ]
+        lines += [_t("sub_expired", lang), ""]
+
+    if lang == "en":
+        lines += [
+            "─" * 30,
+            "*⭐ Basic — $5/mo*",
+            "  • XAU/USD signals",
+            "  • AI pre-trade analysis",
+            "  • SL / TP monitoring",
+            f"  1 mo — *{PRICE_BASIC}⭐* (~$5)",
+            f"  3 mo — *{PRICE_BASIC_3}⭐* (~$12.5) 🔥 _save ~17%_",
+            "",
+            "*💎 Pro — $9.99/mo*",
+            "  • Everything in Basic +",
+            "  • BTC/USD and ETH/USD",
+            "  • 24/7 auto-signals",
+            "  • Priority alerts",
+            f"  1 mo — *{PRICE_PRO}⭐* (~$9.99)",
+            f"  3 mo — *{PRICE_PRO_3}⭐* (~$25) 🔥 _save ~17%_",
+            "",
+            "*💠 Diamond — $19.99/mo*",
+            "  • Everything in Pro +",
+            "  • 📸 Chart AI screenshot analysis",
+            "  • Priority signals (lower threshold)",
+            "  • Faster auto-signal cooldown",
+            f"  1 mo — *{PRICE_DIAMOND}⭐* (~$19.99)",
+            f"  3 mo — *{PRICE_DIAMOND_3}⭐* (~$49.99) 🔥 _save ~17%_",
+            "",
+            f"💡 _Free trial for new users — 3 days_",
+        ]
+    else:
+        lines += [
+            "─" * 30,
+            "*⭐ Базовий — $5/міс*",
+            "  • Сигнали по золоту XAU/USD",
+            "  • ШІ аналіз перед угодою",
+            "  • Моніторинг SL / TP",
+            f"  1 міс — *{PRICE_BASIC}⭐* (~$5)",
+            f"  3 міс — *{PRICE_BASIC_3}⭐* (~$12.5) 🔥 _економія ~17%_",
+            "",
+            "*💎 Pro — $9.99/міс*",
+            "  • Усе з Базового +",
+            "  • Валютні пари BTC/USD та ETH/USD",
+            "  • Цілодобові автосигнали",
+            "  • Пріоритетні сповіщення",
+            f"  1 міс — *{PRICE_PRO}⭐* (~$9.99)",
+            f"  3 міс — *{PRICE_PRO_3}⭐* (~$25) 🔥 _економія ~17%_",
+            "",
+            "*💠 Diamond — $19.99/міс*",
+            "  • Усе з Pro +",
+            "  • 📸 Аналіз графіків за скріншотом (Chart AI)",
+            "  • Пріоритетні сигнали (знижений поріг)",
+            "  • Скорочений кулдаун автосигналів",
+            f"  1 міс — *{PRICE_DIAMOND}⭐* (~$19.99)",
+            f"  3 міс — *{PRICE_DIAMOND_3}⭐* (~$49.99) 🔥 _економія ~17%_",
+            "",
+            f"💡 _Безкоштовний trial для нових — {_trial_duration_ua()}_",
+        ]
     return "\n".join(lines)
 
 
@@ -4206,19 +4414,24 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     prices_text = "\n".join(price_lines) if price_lines else ""
 
     # Welcome message differs for referred users
+    lang = db_get_user_lang(cid)
     if is_new and referrer_id:
-        welcome = (
-            f"👋 *Вітаємо! Вас запросив друг.*\n\n"
-            f"{prices_text}\n\n"
-            f"Тариф: {PLAN_EMOJI.get(plan, '?')} *{plan_label(plan)}*  ({acc['days_left']} дн.)\n\n"
-            f"Оберіть пару та натисніть кнопку нижче для аналізу 👇"
+        welcome = _t(
+            "welcome_ref",
+            lang,
+            prices=prices_text,
+            emoji=PLAN_EMOJI.get(plan, "?"),
+            plan_label=plan_label(plan, lang),
+            days=acc["days_left"],
         )
     else:
-        welcome = (
-            f"🤖 *ШІ Сигнали: Золото та Крипта*\n\n"
-            f"{prices_text}\n\n"
-            f"Тариф: {PLAN_EMOJI.get(plan, '?')} *{plan_label(plan)}*  ({acc['days_left']} дн.)\n\n"
-            f"Оберіть пару та натисніть кнопку нижче для аналізу 👇"
+        welcome = _t(
+            "welcome_normal",
+            lang,
+            prices=prices_text,
+            emoji=PLAN_EMOJI.get(plan, "?"),
+            plan_label=plan_label(plan, lang),
+            days=acc["days_left"],
         )
 
     await update.message.reply_text(
@@ -4235,27 +4448,26 @@ async def cmd_refer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await check_subscription_and_block(update, context)
         return
 
+    lang = db_get_user_lang(cid)
     stats = db_referral_stats(cid)
     ref_link = f"https://t.me/{BOT_USERNAME.lstrip('@')}?start=ref_{cid}"
 
     bars = "🟢" * min(stats["bonused"], 10)
-    text = (
-        f"🤝 *Запроси друга — отримай Premium!*\n"
-        f"{'─' * 28}\n\n"
-        f"За кожного друга, який приєднається за вашим посиланням та підпишеться на наш канал:\n"
-        f"Ви автоматично отримаєте *+{REFERRAL_BONUS_DAYS} безкоштовних днів* Premium-підписки!\n\n"
-        f"*Ваше реферальне посилання:*\n"
-        f"`{ref_link}`\n\n"
-        f"{'─' * 28}\n"
-        f"📊 *Ваша статистика:*\n"
-        f"👥 Запрошено друзів: *{stats['total']}*\n"
-        f"✅ Отримано бонусів: *{stats['bonused']}* {bars}\n"
-        f"⏳ В очікуванні підписки: *{stats['pending']}*\n"
-        f"🎁 Усього отримано днів: *{stats['days_earned']}*\n\n"
-        f"💡 _Поділіться цим посиланням у соцмережах, надішліть у торгові чати або попросіть друзів скористатися ним!_"
+    text = _t(
+        "refer_title",
+        lang,
+        line="─" * 28,
+        bonus=REFERRAL_BONUS_DAYS,
+        link=ref_link,
+        total=stats["total"],
+        bonused=stats["bonused"],
+        bars=bars,
+        pending=stats["pending"],
+        earned=stats["days_earned"],
     )
+    share_label = "📤 Поділитися посиланням" if lang == "uk" else "📤 Share link"
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("📤 Поділитися посиланням", switch_inline_query=ref_link),
+        InlineKeyboardButton(share_label, switch_inline_query=ref_link),
     ]])
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
@@ -5381,12 +5593,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     u    = get_user(cid)
     acc  = db_access(cid)
     plan = acc["plan"]
+    lang = db_get_user_lang(cid)
 
     if q.data == "check_subscription_refresh":
         is_subbed = await check_channel_subscription(context.bot, cid)
         if is_subbed:
             try:
-                await q.answer("✅ Дякуємо за підписку! Доступ активовано.", show_alert=True)
+                await q.answer(_t("sub_success_alert", lang), show_alert=True)
             except Exception:
                 pass
             await try_award_referral_bonus(context.bot, cid)
@@ -5397,7 +5610,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await cmd_start(update, context)
         else:
             try:
-                await q.answer("❌ Ви все ще не підписалися на канал! Будь ласка, підпишіться.", show_alert=True)
+                await q.answer(_t("sub_fail_alert", lang), show_alert=True)
             except Exception:
                 pass
         return
@@ -5405,6 +5618,31 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Check channel subscription for all other buttons
     if not await check_channel_subscription(context.bot, cid):
         await check_subscription_and_block(update, context)
+        return
+
+    # Language Menu Callback
+    if q.data == "lang_menu":
+        await safe_edit(
+            q,
+            _t("lang_menu_title", lang),
+            markup=kb_lang(lang)
+        )
+        return
+
+    if q.data.startswith("set_lang_"):
+        new_lang = q.data[len("set_lang_"):]
+        if new_lang in ("uk", "en"):
+            db_set_user_lang(cid, new_lang)
+            lang = db_get_user_lang(cid)
+            try:
+                await q.answer(_t("lang_changed", lang), show_alert=True)
+            except Exception:
+                pass
+            await safe_edit(
+                q,
+                _t("main_title", lang),
+                markup=kb_main_for(cid, plan, u.selected_pair)
+            )
         return
 
     # Deep analysis pair selection
@@ -5416,18 +5654,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if acc["plan"] not in ("diamond", "admin") and cid != ADMIN_ID:
             await safe_edit(
                 q,
-                "💠 *Chart AI* is available on the *Diamond* plan only.\n\n"
-                "Upgrade in *Subscription* to unlock chart screenshot analysis.",
-                markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="back_main")]]),
+                _t("chart_no_access", lang),
+                markup=InlineKeyboardMarkup([[InlineKeyboardButton(_t("btn_back", lang), callback_data="back_main")]]),
             )
             return
         await safe_edit(q,
-            "📸 *Chart AI Analysis*\n\n"
-            "Send me a screenshot of your chart and I'll analyse it.\n\n"
-            "1. Take a screenshot of your TradingView/broker chart\n"
-            "2. Send the photo to this chat\n"
-            "   _(caption is optional)_",
-            markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="back_main")]]),
+            _t("chart_usage", lang),
+            markup=InlineKeyboardMarkup([[InlineKeyboardButton(_t("btn_back", lang), callback_data="back_main")]]),
         )
         return
 
@@ -5436,24 +5669,26 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if cur_plan not in ("trial", "diamond", "admin") and cid != ADMIN_ID:
             await safe_edit(
                 q,
-                "🔒 *Deep Analysis* is not available on your current plan.",
-                markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="back_main")]]),
+                _t("deep_no_access", lang),
+                markup=InlineKeyboardMarkup([[InlineKeyboardButton(_t("btn_back", lang), callback_data="back_main")]]),
             )
             return
         if cid != ADMIN_ID:
             used = db_deepanalysis_count_today(cid)
             limit = 1 if cur_plan == "trial" else DEEP_ANALYSIS_DAILY_LIMIT
             if used >= limit:
-                msg = (f"⏳ *Trial limit reached* (1/day).\nUpgrade to Diamond for 3/day."
-                       if cur_plan == "trial"
-                       else f"⏳ *Daily limit reached* ({limit}/day). Resets at midnight UTC.")
+                if cur_plan == "trial":
+                    msg = _t("deep_trial_limit", lang)
+                else:
+                    msg = _t("deep_daily_limit", lang, limit=limit)
                 await safe_edit(
                     q,
                     msg,
-                    markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Back", callback_data="back_main")]]),
+                    markup=InlineKeyboardMarkup([[InlineKeyboardButton(_t("btn_back", lang), callback_data="back_main")]]),
                 )
                 return
-            remaining = f"  ({limit - used} left today)"
+            rem_val = limit - used
+            remaining = f"  ({rem_val} left today)" if lang == "en" else f"  ({rem_val} залишилось сьогодні)"
         else:
             remaining = ""
         rows = []
@@ -5463,8 +5698,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     f"{cfg['emoji']} {cfg['name']}",
                     callback_data=f"deepanalysis_{pid}",
                 )])
-        rows.append([InlineKeyboardButton("❌ Cancel", callback_data="deepanalysis_cancel")])
-        await safe_edit(q, f"🧠 *Deep Analysis{remaining}*\n\nChoose a pair to analyse:", markup=InlineKeyboardMarkup(rows))
+        rows.append([InlineKeyboardButton(_t("btn_cancel", lang), callback_data="deepanalysis_cancel")])
+        await safe_edit(q, _t("deep_title", lang, remaining=remaining), markup=InlineKeyboardMarkup(rows))
         return
 
     if q.data.startswith("deepanalysis_"):
@@ -5476,58 +5711,54 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if q.data == "choose_pair":
-        hint = (
-            "🔀 *Select pair*\n\n"
-            "🔒 XAG — Basic+\n"
-            "🔒 Crypto _(BTC ETH SOL XRP BNB TON ADA)_ — Pro+"
-        )
-        await safe_edit(q, hint, markup=kb_pairs(u.selected_pair, plan))
+        await safe_edit(q, _t("choose_pair_hint", lang), markup=kb_pairs(u.selected_pair, plan, lang))
         return
 
     if q.data.startswith("pair_"):
         new_pair = q.data[5:]
         cfg = PAIRS.get(new_pair)
         if not cfg:
-            await safe_edit(q, "❌ Unknown pair.", markup=kb_main_for(cid, plan, u.selected_pair))
+            await safe_edit(q, _t("err_unknown_pair", lang), markup=kb_main_for(cid, plan, u.selected_pair))
             return
         if plan not in cfg["plans"]:
-            await safe_edit(q, f"🔒 *{cfg['name']}* requires Pro or Diamond plan.", markup=kb_sub())
+            await safe_edit(q, _t("err_requires_plan", lang, name=cfg['name']), markup=kb_sub(lang))
             return
         u.selected_pair = new_pair
         price = get_price(new_pair)
+        price_str = fmt_price(price, new_pair) if price else 'N/A'
         await safe_edit(
             q,
-            f"✅ *{cfg['emoji']} {cfg['name']}*\n\n"
-            f"Price: *{fmt_price(price, new_pair) if price else 'N/A'}*",
+            _t("pair_selected", lang, emoji=cfg['emoji'], name=cfg['name'], price=price_str),
             markup=kb_main_for(cid, plan, new_pair),
         )
         return
 
     if q.data == "back_main":
-        await safe_edit(q, "🤖 *ШІ Сигнали: Золото та Крипта*", markup=kb_main_for(cid, plan, u.selected_pair))
+        await safe_edit(q, _t("main_title", lang), markup=kb_main_for(cid, plan, u.selected_pair))
         return
 
     if q.data == "refer":
         stats    = db_referral_stats(cid)
         ref_link = f"https://t.me/{BOT_USERNAME.lstrip('@')}?start=ref_{cid}"
         bars     = "🟢" * min(stats["bonused"], 10)
-        text = (
-            f"🤝 *Запроси друга — отримай Premium!*\n"
-            f"{'─' * 28}\n\n"
-            f"Поділіться посиланням → друг приєднується та підписується → ви отримуєте *+{REFERRAL_BONUS_DAYS} безкоштовних днів*!\n\n"
-            f"*Ваше посилання:*\n`{ref_link}`\n\n"
-            f"{'─' * 28}\n"
-            f"👥 Запрошено: *{stats['total']}*\n"
-            f"✅ Бонуси: *{stats['bonused']}* {bars}\n"
-            f"🎁 Отримано днів: *{stats['days_earned']}*"
+        text = _t(
+            "refer_callback",
+            lang,
+            line="─" * 28,
+            bonus=REFERRAL_BONUS_DAYS,
+            link=ref_link,
+            total=stats["total"],
+            bonused=stats["bonused"],
+            bars=bars,
+            earned=stats["days_earned"],
         )
         await safe_edit(q, text, markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("↩️ Назад", callback_data="back_main")],
+            [InlineKeyboardButton(_t("btn_back", lang), callback_data="back_main")],
         ]))
         return
 
     if q.data == "sub_menu":
-        await safe_edit(q, sub_info_text(acc), markup=kb_sub())
+        await safe_edit(q, sub_info_text(acc, lang), markup=kb_sub(lang))
         return
 
     # ── Crypto payments (NOWPayments) ────────────────────────────
@@ -5757,15 +5988,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg  = PAIRS[pair]
 
     if q.data in ("start", "refresh_analysis"):
-        await safe_edit(q, f"⏳ *Fetching price {cfg['emoji']} {cfg['name']}…*")
+        await safe_edit(q, _t("fetching_price", lang, emoji=cfg['emoji'], name=cfg['name']))
         price_val = get_price(pair)
         if not price_val:
-            await safe_edit(q, "❌ Could not get price.", markup=kb_main(plan, pair))
+            await safe_edit(q, _t("err_no_price", lang), markup=kb_main(plan, pair, lang=lang))
             return
         await safe_edit(q,
-            f"🔄 *Analysing {cfg['emoji']} {cfg['name']}…*\n\n"
-            f"💰 Price: *{fmt_price(price_val, pair)}*\n"
-            f"_Fetching technicals, news and AI insight…_"
+            _t("analysing", lang, emoji=cfg['emoji'], name=cfg['name'], price=fmt_price(price_val, pair))
         )
         try:
             loop = asyncio.get_event_loop()
@@ -5793,8 +6022,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
         except asyncio.TimeoutError:
             await safe_edit(q,
-                "⏱ *Analysis timed out.*\n\n"
-                "_The server took too long. This usually happens once — please try again._",
+                _t("timeout", lang),
                 markup=kb_main_for(cid, plan, pair),
             )
             return
@@ -5802,15 +6030,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         opt = float(a["ai"].get("optimal_entry") or price_val)
         await safe_edit(
             q,
-            build_analysis_text(a) + "\n\n*What would you like to do?*",
-            markup=kb_confirm(opt, pair),
+            build_analysis_text(a) + _t("what_to_do", lang),
+            markup=kb_confirm(opt, pair, lang),
         )
         return
 
     if q.data == "confirm_now":
         price_val = get_price(pair)
         if not price_val:
-            await safe_edit(q, "❌ Price error.", markup=kb_main_for(cid, plan, pair))
+            await safe_edit(q, _t("price_error", lang), markup=kb_main_for(cid, plan, pair))
             return
         a  = u.pending_analysis or {}
         ai = a.get("ai", {})
@@ -5829,10 +6057,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         await safe_edit(
             q,
-            f"✅ *{cfg['emoji']} Trade opened!*\n\n"
-            f"{'🟢' if dr == 'BUY' else '🔴'} Direction: *{dr}* {de}\n"
-            f"Entry: *{fmt_price(price_val, pair)}*\n"
-            f"🛑 SL: *{sl}*  🎯 TP: *{tp}*",
+            _t("trade_opened", lang, emoji=cfg['emoji'], emoji_dir=('🟢' if dr == 'BUY' else '🔴'), direction=dr, description=de, entry=fmt_price(price_val, pair), sl=sl, tp=tp),
         )
         return
 
@@ -5840,29 +6065,29 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             opt = float(q.data[5:])
         except ValueError:
-            await safe_edit(q, "❌ Error.", markup=kb_main_for(cid, plan, pair))
+            await safe_edit(q, _t("trade_error", lang), markup=kb_main_for(cid, plan, pair))
             return
         ps.waiting_entry_price = opt
         ps.persist(cid, pair)
-        await safe_edit(q, f"⏳ Waiting for *{fmt_price(opt, pair)}*",
+        await safe_edit(q, _t("waiting_price", lang, price=fmt_price(opt, pair)),
                         markup=kb_main_for(cid, plan, pair))
         return
 
     if q.data == "cancel":
         u.pending_analysis = None
-        await safe_edit(q, "↩️ Cancelled", markup=kb_main_for(cid, plan, pair))
+        await safe_edit(q, _t("cancelled", lang), markup=kb_main_for(cid, plan, pair))
         return
 
     if q.data == "stop":
         ps.running = False
         ps.persist(cid, pair)
-        await safe_edit(q, "⏹ Stopped", markup=kb_main_for(cid, plan, pair))
+        await safe_edit(q, _t("stopped", lang), markup=kb_main_for(cid, plan, pair))
         return
 
     if q.data == "reset":
         ps.reset(cid, pair)
         u.pending_analysis = None
-        await safe_edit(q, "🔄 *Reset*", markup=kb_main_for(cid, plan, pair))
+        await safe_edit(q, _t("reset_done", lang), markup=kb_main_for(cid, plan, pair))
         return
 
     if q.data == "status":
@@ -5875,8 +6100,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     f"{PAIRS[pid]['emoji']} *{PAIRS[pid]['name']}* "
                     f"{'🟢' if ch >= 0 else '🔴'} *{ch:+.2f}%*"
                 )
-        msg = "\n\n".join(lines) if lines else "ℹ️ No active trades"
-        await safe_edit(q, f"📊 *Status*\n\n{msg}", markup=kb_main_for(cid, plan, u.selected_pair))
+        msg = "\n\n".join(lines) if lines else ("ℹ️ Немає активних угод" if lang == "uk" else "ℹ️ No active trades")
+        await safe_edit(q, f"{_t('status_title', lang)}\n\n{msg}", markup=kb_main_for(cid, plan, u.selected_pair))
         return
 
     # ── Signal accuracy stats ────────────────────────────────────
@@ -5899,19 +6124,33 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     months  = int(parts[1]) if len(parts) > 1 else 1
     new_exp = db_apply_payment(cid, stars, pk, months, charge)
     uname   = update.effective_user.username or str(cid)
+    lang    = db_get_user_lang(cid)
     log.info("💰 PAYMENT: @%s | %s x%d mo | %d⭐ | until %s",
-             uname, plan_label(pk), months, stars, new_exp.strftime("%d.%m.%Y"))
+             uname, plan_label(pk, lang), months, stars, new_exp.strftime("%d.%m.%Y"))
+
+    if lang == "uk":
+        msg = (
+            f"✅ *Оплату отримано!*\n\n"
+            f"{PLAN_EMOJI.get(pk, '⭐')} *{plan_label(pk, lang)}*\n"
+            f"Активний до: *{new_exp.strftime('%d.%m.%Y')}*\n"
+            f"⭐ {stars} Зірок\n\nНатисніть /start"
+        )
+    else:
+        msg = (
+            f"✅ *Payment received!*\n\n"
+            f"{PLAN_EMOJI.get(pk, '⭐')} *{plan_label(pk, lang)}*\n"
+            f"Active until: *{new_exp.strftime('%d.%m.%Y')}*\n"
+            f"⭐ {stars} Stars\n\nTap /start"
+        )
+
     await update.message.reply_text(
-        f"✅ *Payment received!*\n\n"
-        f"{PLAN_EMOJI.get(pk, '⭐')} *{plan_label(pk)}*\n"
-        f"Active until: *{new_exp.strftime('%d.%m.%Y')}*\n"
-        f"⭐ {stars} Stars\n\nTap /start",
+        msg,
         parse_mode="Markdown",
     )
     try:
         await context.bot.send_message(
             ADMIN_ID,
-            f"💰 *New payment!*\n@{uname} | {plan_label(pk)} x{months} mo | {stars}⭐\n"
+            f"💰 *New payment!*\n@{uname} | {plan_label(pk, 'en')} x{months} mo | {stars}⭐\n"
             f"Until: {new_exp.strftime('%d.%m.%Y')}",
             parse_mode="Markdown",
         )
