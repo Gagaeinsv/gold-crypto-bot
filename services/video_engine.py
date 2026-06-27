@@ -205,12 +205,13 @@ class VideoEngine:
             video_clip = VideoFileClip(bg_path).resize(newsize=(1080, 1920))
             audio_clip = AudioFileClip(audio_path)
             
-            # Set duration based on audio + a small tail, up to 15 seconds
-            duration = min(audio_clip.duration + 0.5, 15.0)
+            # Set duration based on audio + a small tail (max 59s for YouTube Shorts)
+            duration = min(audio_clip.duration + 0.5, 59.0)
             
             if video_clip.duration < duration:
-                logger.warning(f"Background video ({video_clip.duration}s) is shorter than required audio ({duration}s). Result will be truncated.")
-                duration = video_clip.duration
+                logger.warning(f"Background video ({video_clip.duration}s) is shorter than required audio ({duration}s). Looping video.")
+                import moviepy.video.fx.all as vfx
+                video_clip = video_clip.fx(vfx.loop, duration=duration)
                 
             video_clip = video_clip.subclip(0, duration)
             overlay_clip = overlay_clip.set_duration(duration)
