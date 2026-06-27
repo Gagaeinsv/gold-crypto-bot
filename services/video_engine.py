@@ -169,11 +169,11 @@ class VideoEngine:
             loop.close()
             
             # Create Text Overlay Clip
-            overlay_array = VideoEngine._create_text_overlay(text1, text2, text3)
+            overlay_array = VideoEngine._create_text_overlay(text1, text2, text3, width=1080, height=1920)
             overlay_clip = ImageClip(overlay_array).set_position('center')
             
-            # Process Video
-            video_clip = VideoFileClip(bg_path)
+            # Process Video (Ensure 1080x1920 for Shorts format)
+            video_clip = VideoFileClip(bg_path).resize(newsize=(1080, 1920))
             audio_clip = AudioFileClip(audio_path)
             
             # Set duration based on audio + a small tail, up to 15 seconds
