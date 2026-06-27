@@ -290,7 +290,7 @@ class VideoEngine:
                 
                 yt_title = f"Trading Bot Closed a ${asset} {direction} Position with +{pnl:.1f}% Profit! 🚀 #shorts"
                 yt_desc = (
-                    f"Our fully automated AI trading bot just secured another profit on {asset}!\n\n"
+                    f"Our AI trading algorithm just secured another massive profit on {asset}!\n\n"
                     f"✅ Direction: {direction}\n"
                     f"💰 Profit: +{pnl:.2f}%\n"
                     f"📈 VIP Win Rate: {vip_win_rate:.1f}%\n\n"
