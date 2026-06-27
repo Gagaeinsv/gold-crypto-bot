@@ -21,3 +21,6 @@ __pycache__/
 # Misc
 .bash_history
 .cache/
+
+client_secrets.json
+token.pickle

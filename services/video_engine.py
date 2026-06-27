@@ -158,6 +158,38 @@ class VideoEngine:
                 os.remove(audio_path)
                 
             logger.info(f"Video successfully generated: {output_path}")
+            
+            # --- YOUTUBE UPLOAD INTEGRATION ---
+            try:
+                from services.youtube_uploader import YouTubeUploader
+                
+                yt_title = f"Trading Bot Closed a ${asset} {direction} Position with +{pnl:.1f}% Profit! 🚀 #shorts"
+                yt_desc = (
+                    f"Our fully automated AI trading bot just secured another profit on {asset}!\n\n"
+                    f"✅ Direction: {direction}\n"
+                    f"💰 Profit: +{pnl:.2f}%\n"
+                    f"📈 Current Win Rate: {win_rate:.1f}%\n\n"
+                    "Don't miss the next signal! Join our Telegram Bot for FREE real-time trading signals.\n\n"
+                    "#crypto #trading #bitcoin #ethereum #investing #tradingbot #signals"
+                )
+                yt_tags = ["crypto", "trading", "bot", "signals", "bitcoin", "ethereum", "xauusd", "tradingbot"]
+                
+                logger.info("Initiating automatic YouTube upload...")
+                success = YouTubeUploader.upload_video(
+                    video_path=output_path,
+                    title=yt_title,
+                    description=yt_desc,
+                    tags=yt_tags,
+                    privacy_status="public" # Immediately public
+                )
+                
+                if success:
+                    # Optionally remove the local mp4 file after upload to save space
+                    # os.remove(output_path)
+                    pass
+            except Exception as upload_err:
+                logger.error(f"YouTube upload step failed: {upload_err}")
+            
             return output_path
             
         except Exception as e:

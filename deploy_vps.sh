@@ -24,7 +24,7 @@ fi
 echo "Installing dependencies inside venv..."
 "$VENV_DIR/bin/pip" install --upgrade pip
 "$VENV_DIR/bin/pip" install -r "$PROJECT_DIR/scalping_bot/requirements.txt" || true
-"$VENV_DIR/bin/pip" install telethon streamlit yfinance pandas python-dotenv moviepy Pillow edge-tts
+"$VENV_DIR/bin/pip" install telethon streamlit yfinance pandas python-dotenv moviepy Pillow edge-tts google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
 # Create temporary services
 TEMP_TRACKER="/tmp/analytics_tracker.service"
