@@ -134,17 +134,21 @@ class StorageEngine:
                 })
             return res
 
-    def get_metrics(self) -> dict:
+    def get_metrics(self, source: str = None) -> dict:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             
+            # Helper to append source filter
+            source_cond = " AND source = ?" if source else ""
+            params = (source,) if source else ()
+            
             # 1. Overall Win Rate
-            cursor.execute("SELECT COUNT(*) FROM signals WHERE outcome IS NOT NULL")
+            cursor.execute(f"SELECT COUNT(*) FROM signals WHERE outcome IS NOT NULL{source_cond}", params)
             total_closed = cursor.fetchone()[0]
             
             if total_closed > 0:
                 # Wins are resolutions with positive PnL
-                cursor.execute("SELECT COUNT(*) FROM signals WHERE outcome IS NOT NULL AND pnl_pct > 0")
+                cursor.execute(f"SELECT COUNT(*) FROM signals WHERE outcome IS NOT NULL AND pnl_pct > 0{source_cond}", params)
                 wins = cursor.fetchone()[0]
                 win_rate = (wins / total_closed) * 100.0
             else:
@@ -152,19 +156,20 @@ class StorageEngine:
 
             # 2. 7-Day Cumulative PnL
             seven_days_ago = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
-            cursor.execute("""
+            query_params = (seven_days_ago,) + params
+            cursor.execute(f"""
                 SELECT SUM(pnl_pct) FROM signals 
-                WHERE outcome IS NOT NULL AND resolved_at >= ?
-            """, (seven_days_ago,))
+                WHERE outcome IS NOT NULL AND resolved_at >= ?{source_cond}
+            """, query_params)
             res_pnl = cursor.fetchone()[0]
             cumulative_weekly_pnl = float(res_pnl) if res_pnl is not None else 0.0
 
             # 3. Active Winning Streak
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT pnl_pct FROM signals 
-                WHERE outcome IS NOT NULL 
+                WHERE outcome IS NOT NULL{source_cond}
                 ORDER BY resolved_at DESC, id DESC
-            """)
+            """, params)
             closed_pnl_list = [row['pnl_pct'] for row in cursor.fetchall()]
             
             win_streak = 0

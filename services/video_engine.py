@@ -14,7 +14,7 @@ logger = logging.getLogger("video_engine")
 
 class VideoEngine:
     @staticmethod
-    def _create_text_overlay(trade_data: dict, metrics: dict, width: int = 1080, height: int = 1920):
+    def _create_text_overlay(trade_data: dict, free_metrics: dict, vip_metrics: dict, width: int = 1080, height: int = 1920):
         img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
         
@@ -36,11 +36,12 @@ class VideoEngine:
                 f_asset = ImageFont.truetype(font_path, 90)
                 f_prices = ImageFont.truetype(font_path, 55)
                 f_pnl = ImageFont.truetype(font_path, 180)
-                f_stats = ImageFont.truetype(font_path, 50)
+                f_stats = ImageFont.truetype(font_path, 45)  # slightly smaller for 2 lines
+                f_stats_vip = ImageFont.truetype(font_path, 50)
             else:
-                f_title = f_asset = f_prices = f_pnl = f_stats = ImageFont.load_default()
+                f_title = f_asset = f_prices = f_pnl = f_stats = f_stats_vip = ImageFont.load_default()
         except Exception:
-            f_title = f_asset = f_prices = f_pnl = f_stats = ImageFont.load_default()
+            f_title = f_asset = f_prices = f_pnl = f_stats = f_stats_vip = ImageFont.load_default()
 
         # Helper
         def draw_centered_text(y, text, font, fill):
@@ -90,19 +91,28 @@ class VideoEngine:
         
         draw_centered_text(card_y1 + 550, "NET PROFIT", f_title, (200, 200, 200, 255))
         
-        # 5. Stats line (Marketing Safeguard)
-        win_rate = metrics.get("win_rate", 0.0)
-        weekly = metrics.get("cumulative_weekly_pnl", 0.0)
+        # 5. Stats line (FOMO Marketing logic)
+        free_weekly = free_metrics.get("cumulative_weekly_pnl", 0.0)
+        vip_weekly = vip_metrics.get("cumulative_weekly_pnl", 0.0)
+        vip_win_rate = vip_metrics.get("win_rate", 0.0)
         
-        stats_parts = []
-        if win_rate >= 50:
-            stats_parts.append(f"Win Rate: {win_rate:.1f}%")
-        if weekly > 0:
-            stats_parts.append(f"Weekly PnL: +{weekly:.1f}%")
-            
-        if stats_parts:
-            stats_text = "   |   ".join(stats_parts)
-            draw_centered_text(card_y1 + 680, stats_text, f_stats, (150, 200, 255, 255))
+        stats_y = card_y1 + 650
+        
+        if vip_weekly > free_weekly and vip_weekly > 0 and free_weekly > 0:
+            # Draw Two lines
+            draw_centered_text(stats_y, f"📢 Free Channel PnL: +{free_weekly:.1f}%", f_stats, (180, 180, 180, 255))
+            draw_centered_text(stats_y + 60, f"💎 VIP Premium PnL: +{vip_weekly:.1f}%", f_stats_vip, (255, 215, 0, 255)) # Gold color
+        else:
+            # Draw standard single line VIP stats
+            stats_parts = []
+            if vip_win_rate >= 50:
+                stats_parts.append(f"VIP Win Rate: {vip_win_rate:.1f}%")
+            if vip_weekly > 0:
+                stats_parts.append(f"VIP Weekly PnL: +{vip_weekly:.1f}%")
+                
+            if stats_parts:
+                stats_text = "   |   ".join(stats_parts)
+                draw_centered_text(stats_y + 30, stats_text, f_stats_vip, (255, 215, 0, 255))
 
         return np.array(img)
 
@@ -166,7 +176,7 @@ class VideoEngine:
         await communicate.save(output_path)
 
     @staticmethod
-    def generate_shorts(trade_data: dict, metrics: dict) -> str | None:
+    def generate_shorts(trade_data: dict, free_metrics: dict, vip_metrics: dict) -> str | None:
         """
         Generates a premium vertical video (YouTube Shorts format) from a trade result.
         """
@@ -178,24 +188,30 @@ class VideoEngine:
             entry = trade_data.get("entry_price")
             exit_p = trade_data.get("exit_price")
             
-            win_rate = metrics.get("win_rate", 0.0)
-            weekly = metrics.get("cumulative_weekly_pnl", 0.0)
+            # Extract both stats
+            free_weekly = free_metrics.get("cumulative_weekly_pnl", 0.0)
+            vip_weekly = vip_metrics.get("cumulative_weekly_pnl", 0.0)
+            vip_win_rate = vip_metrics.get("win_rate", 0.0)
             
-            # 1. Dynamic TTS Script (with Marketing Safeguard)
-            if weekly > 0:
-                weekly_text = f"Our weekly profit is soaring at {weekly:.1f} percent, and the "
+            # 1. Dynamic TTS Script (FOMO Marketing logic)
+            if vip_weekly > free_weekly and vip_weekly > 0 and free_weekly > 0:
+                # Full FOMO Contrast
+                fomo_text = f"Our free signals secured {free_weekly:.1f} percent, but our VIP premium algorithm soared to {vip_weekly:.1f} percent this week! "
+            elif vip_weekly > 0:
+                # Just VIP Marketing
+                fomo_text = f"Our VIP premium algorithm is soaring with {vip_weekly:.1f} percent profit this week! "
             else:
-                weekly_text = "The "
+                fomo_text = "The premium algorithm is dominating the market right now. "
                 
-            if win_rate >= 50:
-                win_text = f"win rate is holding strong at {win_rate:.1f} percent. "
+            if vip_win_rate >= 50:
+                win_text = f"Win rate is holding strong at {vip_win_rate:.1f} percent. "
             else:
-                win_text = "algorithm is finding the best entries in the market. "
+                win_text = "We are finding the absolute best entries. "
                 
             tts_text = (f"Boom! Another successful trade! Our AI bot just nailed a {direction} position "
                         f"on {asset}, securing a massive {pnl:.1f} percent profit! "
-                        f"{weekly_text}{win_text}"
-                        f"Stop guessing and let the AI trade for you. Link in bio for live signals!")
+                        f"{fomo_text}{win_text}"
+                        f"Stop guessing and let the AI trade for you. Link in bio to upgrade to VIP!")
             
             # File paths
             audio_path = f"storage/renders/temp_audio_{trade_id}.mp3"
@@ -215,7 +231,7 @@ class VideoEngine:
             loop.close()
             
             # Create Text Overlay Clip
-            overlay_array = VideoEngine._create_text_overlay(trade_data, metrics, width=1080, height=1920)
+            overlay_array = VideoEngine._create_text_overlay(trade_data, free_metrics, vip_metrics, width=1080, height=1920)
             overlay_clip = ImageClip(overlay_array).set_position('center')
             
             # Process Video (Ensure 1080x1920 for Shorts format)
