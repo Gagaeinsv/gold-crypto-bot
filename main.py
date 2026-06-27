@@ -87,6 +87,24 @@ async def price_tracker_loop(db_engine: StorageEngine):
                             trigger_type = "Take Profit" if tp_triggered else "Stop Loss"
                             logger.info(f"Trade #{trade_id} hit {trigger_type} target at price {current_price}. Closing. PnL: {pnl_pct:.2f}%")
                             db_engine.close_trade(trade_id, current_price, pnl_pct)
+                            
+                            if pnl_pct > 0:
+                                logger.info(f"Trade #{trade_id} closed with profit. Triggering VideoEngine...")
+                                try:
+                                    from services.video_engine import VideoEngine
+                                    # Fetch overall win rate
+                                    metrics = db_engine.get_metrics()
+                                    trade_data = {
+                                        "id": trade_id,
+                                        "asset": asset,
+                                        "direction": direction,
+                                        "pnl_percentage": pnl_pct
+                                    }
+                                    # Run synchronous video generation in a separate thread to avoid blocking event loop
+                                    asyncio.create_task(asyncio.to_thread(VideoEngine.generate_shorts, trade_data, metrics))
+                                except Exception as video_ex:
+                                    logger.error(f"Failed to start VideoEngine task for trade #{trade_id}: {video_ex}")
+                                    
                     except Exception as ex:
                         logger.error(f"Error checking trade #{trade_id} ({asset}): {ex}")
             else:

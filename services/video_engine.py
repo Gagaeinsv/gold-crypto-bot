@@ -1,0 +1,165 @@
+import os
+import asyncio
+import logging
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import edge_tts
+from moviepy.editor import VideoFileClip, AudioFileClip, CompositeVideoClip, ImageClip
+
+logger = logging.getLogger("video_engine")
+
+class VideoEngine:
+    @staticmethod
+    def _create_text_overlay(text1: str, text2: str, text3: str, width: int = 1080, height: int = 1920) -> np.ndarray:
+        # Create transparent background
+        img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        
+        # Try to load a good font, fallback to default
+        try:
+            # Common paths for Windows and Ubuntu
+            font_paths = [
+                "C:/Windows/Fonts/arialbd.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+            ]
+            font_path = None
+            for p in font_paths:
+                if os.path.exists(p):
+                    font_path = p
+                    break
+            
+            if font_path:
+                font1 = ImageFont.truetype(font_path, 80)
+                font2 = ImageFont.truetype(font_path, 130)
+                font3 = ImageFont.truetype(font_path, 60)
+            else:
+                font1 = font2 = font3 = ImageFont.load_default()
+        except Exception:
+            font1 = font2 = font3 = ImageFont.load_default()
+
+        # Add a subtle dark background rectangle for text readability
+        rect_height = 450
+        rect_y = (height - rect_height) // 2
+        draw.rectangle([0, rect_y, width, rect_y + rect_height], fill=(0, 0, 0, 180))
+        
+        # Helper to get text width
+        def get_text_width(text, font):
+            if hasattr(draw, 'textbbox'):
+                bbox = draw.textbbox((0, 0), text, font=font)
+                return bbox[2] - bbox[0]
+            else:
+                return font.getlength(text) if hasattr(font, 'getlength') else len(text)*20
+
+        # Draw texts
+        # Text 1: Asset and Profit
+        color1 = (100, 255, 100, 255) # Light Green
+        w1 = get_text_width(text1, font1)
+        draw.text(((width - w1) / 2, rect_y + 50), text1, font=font1, fill=color1)
+        
+        # Text 2: PnL %
+        w2 = get_text_width(text2, font2)
+        draw.text(((width - w2) / 2, rect_y + 150), text2, font=font2, fill=(255, 255, 255, 255))
+        
+        # Text 3: Win rate
+        w3 = get_text_width(text3, font3)
+        draw.text(((width - w3) / 2, rect_y + 320), text3, font=font3, fill=(200, 200, 200, 255))
+        
+        return np.array(img)
+
+    @staticmethod
+    async def _generate_tts(text: str, output_path: str):
+        # en-US-ChristopherNeural is a great male voice
+        communicate = edge_tts.Communicate(text, "en-US-ChristopherNeural")
+        await communicate.save(output_path)
+
+    @staticmethod
+    def generate_shorts(trade_data: dict, metrics: dict) -> str | None:
+        """
+        Generates a 15-second vertical video for YouTube Shorts.
+        This is a synchronous method (runs in its own thread in main.py)
+        """
+        try:
+            trade_id = trade_data.get('id', 'unknown')
+            logger.info(f"Starting video generation for trade #{trade_id}...")
+            
+            asset = trade_data.get('asset', 'UNKNOWN')
+            direction = trade_data.get('direction', 'BUY')
+            pnl = float(trade_data.get('pnl_percentage', 0.0))
+            win_rate = float(metrics.get('win_rate', 0.0))
+            
+            # Prepare Texts
+            text1 = f"${asset} PROFIT"
+            text2 = f"+{pnl:.2f}% 🚀"
+            text3 = f"Win Rate: {win_rate:.1f}%"
+            
+            tts_text = (f"Trade update. Our bot just closed a {direction} position on "
+                        f"{asset} with a profit of {pnl:.2f} percent. "
+                        f"Current algorithm win rate is {win_rate:.1f} percent. "
+                        f"Join our Telegram for free signals.")
+            
+            # File paths
+            bg_path = "templates/bg.mp4"
+            audio_path = f"storage/renders/temp_audio_{trade_id}.mp3"
+            output_path = f"storage/renders/trade_{trade_id}.mp4"
+            
+            if not os.path.exists(bg_path):
+                logger.error(f"Background template {bg_path} not found! Cannot render video.")
+                return None
+                
+            # Generate Audio (need to run asyncio loop because we are in a sync thread)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(VideoEngine._generate_tts(tts_text, audio_path))
+            loop.close()
+            
+            # Create Text Overlay Clip
+            overlay_array = VideoEngine._create_text_overlay(text1, text2, text3)
+            overlay_clip = ImageClip(overlay_array).set_position('center')
+            
+            # Process Video
+            video_clip = VideoFileClip(bg_path)
+            audio_clip = AudioFileClip(audio_path)
+            
+            # Set duration based on audio + a small tail, up to 15 seconds
+            duration = min(audio_clip.duration + 0.5, 15.0)
+            
+            if video_clip.duration < duration:
+                logger.warning(f"Background video ({video_clip.duration}s) is shorter than required audio ({duration}s). Result will be truncated.")
+                duration = video_clip.duration
+                
+            video_clip = video_clip.subclip(0, duration)
+            overlay_clip = overlay_clip.set_duration(duration)
+            
+            # Combine video and text
+            final_video = CompositeVideoClip([video_clip, overlay_clip])
+            
+            # Set audio
+            final_audio = audio_clip.subclip(0, duration)
+            final_video = final_video.set_audio(final_audio)
+            
+            # Render
+            logger.info(f"Rendering video {output_path} (Duration: {duration:.1f}s)...")
+            final_video.write_videofile(
+                output_path,
+                fps=30,
+                codec="libx264",
+                audio_codec="aac",
+                threads=4,
+                logger=None  # Disable terminal bar
+            )
+            
+            # Cleanup temp audio, close clips to free memory
+            video_clip.close()
+            audio_clip.close()
+            final_video.close()
+            
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
+                
+            logger.info(f"Video successfully generated: {output_path}")
+            return output_path
+            
+        except Exception as e:
+            logger.error(f"Error generating video: {e}")
+            return None
