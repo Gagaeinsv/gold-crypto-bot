@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from services.storage_engine import StorageEngine
 
 st.set_page_config(
@@ -32,33 +32,6 @@ if st.sidebar.button("Inject Test Trade"):
     else:
         st.sidebar.error("Asset name cannot be empty.")
 
-# Fetch computed analytics metrics
-metrics = db.get_metrics()
-
-# Render Metric Cards
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric(
-        label="Overall Win Rate", 
-        value=f"{metrics['win_rate']}%",
-        help="Percentage of closed trades with positive PnL"
-    )
-with col2:
-    st.metric(
-        label="7-Day Cumulative PnL", 
-        value=f"{metrics['cumulative_weekly_pnl']}%",
-        delta=f"{metrics['cumulative_weekly_pnl']}%" if metrics['cumulative_weekly_pnl'] != 0 else None,
-        help="Sum of PnL percentages for trades closed in the last 7 days"
-    )
-with col3:
-    st.metric(
-        label="Active Win Streak", 
-        value=metrics['win_streak'],
-        help="Consecutive winning closed trades counting backwards from the latest closed trade"
-    )
-
-st.write("---")
-
 # Fetch all historical trades
 trades = db.get_all_trades()
 df = pd.DataFrame(trades)
@@ -71,11 +44,96 @@ else:
     df['created_at'] = pd.to_datetime(df['created_at'])
     df['closed_at'] = pd.to_datetime(df['closed_at'])
     
+    # ─── Category Selector at the Top ───
+    st.subheader("🎯 Категорія сигналів")
+    
+    source_options = {
+        "🟢 Всі сигнали": "All",
+        "📢 Безкоштовні (Канал)": "ai",
+        "💎 Преміум (Бот)": "user",
+        "🛠️ Ручні / Тестові": "manual"
+    }
+    
+    selected_label = st.radio(
+        "Оберіть категорію для перегляду аналітики:",
+        options=list(source_options.keys()),
+        index=0,
+        horizontal=True
+    )
+    selected_source = source_options[selected_label]
+    
+    # Filter main dataframe based on category choice
+    if selected_source != "All":
+        filtered_source_df = df[df['source'] == selected_source].copy()
+    else:
+        filtered_source_df = df.copy()
+
+    # Dynamic metrics calculation based on selection
+    def calculate_live_metrics(m_df):
+        if m_df.empty:
+            return {"win_rate": 0.0, "cumulative_weekly_pnl": 0.0, "win_streak": 0}
+            
+        closed_m_df = m_df[m_df['status'] == 'CLOSED'].copy()
+        total_closed = len(closed_m_df)
+        
+        # 1. Win Rate
+        if total_closed > 0:
+            wins = len(closed_m_df[closed_m_df['pnl_percentage'] > 0])
+            win_rate = (wins / total_closed) * 100.0
+        else:
+            win_rate = 0.0
+            
+        # 2. 7-Day Cumulative PnL
+        seven_days_ago = datetime.utcnow() - timedelta(days=7)
+        recent_closed = closed_m_df[closed_m_df['closed_at'] >= seven_days_ago]
+        cumulative_weekly_pnl = recent_closed['pnl_percentage'].sum()
+        
+        # 3. Active Win Streak
+        streak_df = closed_m_df.sort_values(by=['closed_at', 'id'], ascending=[False, False])
+        win_streak = 0
+        for pnl in streak_df['pnl_percentage']:
+            if pnl is not None and pnl > 0:
+                win_streak += 1
+            else:
+                break
+                
+        return {
+            "win_rate": round(win_rate, 2),
+            "cumulative_weekly_pnl": round(cumulative_weekly_pnl, 2),
+            "win_streak": win_streak
+        }
+
+    metrics = calculate_live_metrics(filtered_source_df)
+
+    # Render Metric Cards
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric(
+            label="Overall Win Rate", 
+            value=f"{metrics['win_rate']}%",
+            help="Percentage of closed trades with positive PnL in this category"
+        )
+    with col2:
+        st.metric(
+            label="7-Day Cumulative PnL", 
+            value=f"{metrics['cumulative_weekly_pnl']}%",
+            delta=f"{metrics['cumulative_weekly_pnl']}%" if metrics['cumulative_weekly_pnl'] != 0 else None,
+            help="Sum of PnL percentages for trades closed in the last 7 days in this category"
+        )
+    with col3:
+        st.metric(
+            label="Active Win Streak", 
+            value=metrics['win_streak'],
+            help="Consecutive winning closed trades counting backwards from the latest closed trade in this category"
+        )
+
+    st.write("---")
+
     # Cumulative PnL Line Chart
     st.subheader("📈 Cumulative PnL Growth Over Time")
-    closed_df = df[df['status'] == 'CLOSED'].copy()
+    closed_df = filtered_source_df[filtered_source_df['status'] == 'CLOSED'].copy()
     if closed_df.empty:
-        st.info("No closed trades to compute cumulative PnL chart.")
+        st.info("No closed trades to compute cumulative PnL chart in this category.")
     else:
         # Sort chronologically to calculate cumulative PnL sum
         closed_df = closed_df.sort_values('closed_at')
@@ -97,7 +155,7 @@ else:
         direction_filter = st.selectbox("Direction", options=["All", "BUY", "SELL"])
 
     # Apply filters
-    filtered_df = df.copy()
+    filtered_df = filtered_source_df.copy()
     if search_query:
         filtered_df = filtered_df[filtered_df['asset'].str.contains(search_query, na=False)]
     if status_filter != "All":
@@ -115,6 +173,13 @@ else:
         display_df['pnl_percentage'] = display_df['pnl_percentage'].apply(lambda x: f"{x:+.2f}%" if pd.notnull(x) else "—")
         display_df['created_at'] = display_df['created_at'].dt.strftime('%Y-%m-%d %H:%M:%S')
         display_df['closed_at'] = display_df['closed_at'].apply(lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notnull(x) else "—")
+
+        # Map source to a human-readable name
+        display_df['source'] = display_df['source'].map({
+            'ai': '📢 Free (Channel)',
+            'user': '💎 Premium (Bot)',
+            'manual': '🛠️ Manual (Test)'
+        })
 
         # Cell styling helper for highlighting rows/cells
         def style_rows(row):
@@ -148,6 +213,7 @@ else:
                 "pnl_percentage": "PnL %",
                 "status": "Status",
                 "created_at": "Opened At",
-                "closed_at": "Closed At"
+                "closed_at": "Closed At",
+                "source": "Category"
             }
         )

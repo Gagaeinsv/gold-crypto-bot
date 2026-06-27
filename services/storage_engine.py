@@ -129,7 +129,8 @@ class StorageEngine:
                     "pnl_percentage": pnl,
                     "status": "OPEN" if outcome is None else "CLOSED",
                     "created_at": row["posted_at"],
-                    "closed_at": row["resolved_at"]
+                    "closed_at": row["resolved_at"],
+                    "source": row["source"]
                 })
             return res
 
