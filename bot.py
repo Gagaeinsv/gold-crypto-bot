@@ -749,10 +749,8 @@ def db_upsert_user(
 
         nu = username if username else (row["username"] or "")
         nf = fname if fname else (row["first_name"] or "")
-        if language_code is not None:
-            nlang = _lang_norm(language_code)
-        else:
-            nlang = _lang_norm(row["language_code"])
+        # Keep user's custom language preference if it exists in the database
+        nlang = row["language_code"] if row["language_code"] else _lang_norm(language_code)
         if is_premium is not None:
             npm = 1 if is_premium else 0
         else:
@@ -1653,16 +1651,29 @@ async def check_subscription_and_block(update: Update, context: ContextTypes.DEF
         return True
 
     channel_url = f"https://t.me/{CHANNEL_ID.lstrip('@')}" if isinstance(CHANNEL_ID, str) and CHANNEL_ID.startswith("@") else "https://t.me/your_channel"
+    lang = db_get_user_lang(cid)
+    if lang == "en":
+        btn_join = "👉 Subscribe to Channel"
+        btn_check = "Check subscription 🔄"
+        text = (
+            "❌ *Access Restricted!*\n\n"
+            "To use this bot, receive signals, and use AI, "
+            "you must be subscribed to our official Telegram channel.\n\n"
+            "Please subscribe using the link below and click the verification button."
+        )
+    else:
+        btn_join = "👉 Підписатися на канал"
+        btn_check = "Перевірити підписку 🔄"
+        text = (
+            "❌ *Доступ обмежено!*\n\n"
+            "Щоб використовувати цього бота, отримувати сигнали та використовувати ШІ, "
+            "ви повинні бути підписані на наш офіційний Telegram-канал.\n\n"
+            "Будь ласка, підпишіться за посиланням нижче та натисніть кнопку перевірки."
+        )
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("👉 Підписатися на канал", url=channel_url)],
-        [InlineKeyboardButton("Перевірити підписку 🔄", callback_data="check_subscription_refresh")]
+        [InlineKeyboardButton(btn_join, url=channel_url)],
+        [InlineKeyboardButton(btn_check, callback_data="check_subscription_refresh")]
     ])
-    text = (
-        "❌ *Доступ обмежено!*\n\n"
-        "Щоб використовувати цього бота, отримувати сигнали та використовувати ШІ, "
-        "ви повинні бути підписані на наш офіційний Telegram-канал.\n\n"
-        "Будь ласка, підпишіться за посиланням нижче та натисніть кнопку перевірки."
-    )
     if update.callback_query:
         try:
             await safe_edit(update.callback_query, text, markup=keyboard)
@@ -1710,12 +1721,23 @@ async def try_award_referral_bonus(bot, referred_id: int) -> None:
             with db_connect() as c:
                 c.execute("UPDATE users SET ref_rewards_received = ref_rewards_received + 1 WHERE chat_id=?", (referrer_id,))
             log.info("Referral bonus awarded: %d days to %s for referring %s", bonus, referrer_id, referred_id)
+            ref_lang = db_get_user_lang(referrer_id)
+            if ref_lang == "en":
+                ref_text = (
+                    f"🎉 *Your friend subscribed to the channel and activated the bot!*\n\n"
+                    f"You have been awarded *+{REFERRAL_BONUS_DAYS} free days* of Premium subscription!\n\n"
+                    f"/refer — view your invitation stats."
+                )
+            else:
+                ref_text = (
+                    f"🎉 *Ваш друг підписався на канал та активував бота!*\n\n"
+                    f"Вам нараховано *+{REFERRAL_BONUS_DAYS} безкоштовних днів* Premium-підписки!\n\n"
+                    f"/refer — переглянути вашу статистику запрошень."
+                )
             try:
                 await bot.send_message(
                     chat_id=referrer_id,
-                    text=f"🎉 *Ваш друг підписався на канал та активував бота!*\n\n"
-                         f"Вам нараховано *+{REFERRAL_BONUS_DAYS} безкоштовних днів* Premium-підписки!\n\n"
-                         f"/refer — переглянути вашу статистику запрошень.",
+                    text=ref_text,
                     parse_mode="Markdown"
                 )
             except Exception as e:
