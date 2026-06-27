@@ -726,17 +726,11 @@ def db_upsert_user(
     Passing language_code/is_premium as None skips overwriting those columns on UPDATE.
     """
 
-    def _lang_norm(raw: str | None) -> str:
-        z = (raw or "").strip().lower()
-        if z.startswith("uk") or z.startswith("ua"):
-            return "uk"
-        return "en"
-
     with db_connect() as c:
         row = c.execute("SELECT * FROM users WHERE chat_id=?", (cid,)).fetchone()
         if row is None:
             trial_ends = (datetime.now(UTC) + timedelta(days=TRIAL_DAYS)).strftime("%Y-%m-%d")
-            lang_ins = _lang_norm(language_code)
+            lang_ins = "en"  # Always default to English for new users
             prem_ins = 1 if bool(is_premium if is_premium is not None else False) else 0
 
             c.execute(
@@ -749,8 +743,8 @@ def db_upsert_user(
 
         nu = username if username else (row["username"] or "")
         nf = fname if fname else (row["first_name"] or "")
-        # Keep user's custom language preference if it exists in the database
-        nlang = row["language_code"] if row["language_code"] else _lang_norm(language_code)
+        # Keep user's custom language preference if it exists in the database, else default to English
+        nlang = row["language_code"] if row["language_code"] else "en"
         if is_premium is not None:
             npm = 1 if is_premium else 0
         else:
