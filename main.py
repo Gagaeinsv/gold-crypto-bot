@@ -88,7 +88,7 @@ async def price_tracker_loop(db_engine: StorageEngine):
                             logger.info(f"Trade #{trade_id} hit {trigger_type} target at price {current_price}. Closing. PnL: {pnl_pct:.2f}%")
                             db_engine.close_trade(trade_id, current_price, pnl_pct)
                             
-                            if pnl_pct > 0:
+                            if pnl_pct >= 1.0:
                                 logger.info(f"Trade #{trade_id} closed with profit. Triggering VideoEngine...")
                                 try:
                                     from services.video_engine import VideoEngine
