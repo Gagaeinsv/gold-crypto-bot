@@ -90,11 +90,19 @@ class VideoEngine:
         
         draw_centered_text(card_y1 + 550, "NET PROFIT", f_title, (200, 200, 200, 255))
         
-        # 5. Stats line
+        # 5. Stats line (Marketing Safeguard)
         win_rate = metrics.get("win_rate", 0.0)
         weekly = metrics.get("cumulative_weekly_pnl", 0.0)
-        stats_text = f"Win Rate: {win_rate:.1f}%   |   Weekly PnL: +{weekly:.1f}%"
-        draw_centered_text(card_y1 + 680, stats_text, f_stats, (150, 200, 255, 255))
+        
+        stats_parts = []
+        if win_rate >= 50:
+            stats_parts.append(f"Win Rate: {win_rate:.1f}%")
+        if weekly > 0:
+            stats_parts.append(f"Weekly PnL: +{weekly:.1f}%")
+            
+        if stats_parts:
+            stats_text = "   |   ".join(stats_parts)
+            draw_centered_text(card_y1 + 680, stats_text, f_stats, (150, 200, 255, 255))
 
         return np.array(img)
 
@@ -173,11 +181,20 @@ class VideoEngine:
             win_rate = metrics.get("win_rate", 0.0)
             weekly = metrics.get("cumulative_weekly_pnl", 0.0)
             
-            # 1. Dynamic TTS Script
-            # We use a highly engaging, influencer-style voiceover
+            # 1. Dynamic TTS Script (with Marketing Safeguard)
+            if weekly > 0:
+                weekly_text = f"Our weekly profit is soaring at {weekly:.1f} percent, and the "
+            else:
+                weekly_text = "The "
+                
+            if win_rate >= 50:
+                win_text = f"win rate is holding strong at {win_rate:.1f} percent. "
+            else:
+                win_text = "algorithm is finding the best entries in the market. "
+                
             tts_text = (f"Boom! Another successful trade! Our AI bot just nailed a {direction} position "
                         f"on {asset}, securing a massive {pnl:.1f} percent profit! "
-                        f"Our weekly profit is soaring at {weekly:.1f} percent, and the win rate is holding strong at {win_rate:.1f} percent. "
+                        f"{weekly_text}{win_text}"
                         f"Stop guessing and let the AI trade for you. Link in bio for live signals!")
             
             # File paths
