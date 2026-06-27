@@ -98,6 +98,8 @@ async def price_tracker_loop(db_engine: StorageEngine):
                                         "id": trade_id,
                                         "asset": asset,
                                         "direction": direction,
+                                        "entry_price": entry_price,
+                                        "exit_price": current_price,
                                         "pnl_percentage": pnl_pct
                                     }
                                     # Run synchronous video generation in a separate thread to avoid blocking event loop

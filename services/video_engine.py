@@ -14,61 +14,88 @@ logger = logging.getLogger("video_engine")
 
 class VideoEngine:
     @staticmethod
-    def _create_text_overlay(text1: str, text2: str, text3: str, width: int = 1080, height: int = 1920) -> np.ndarray:
-        # Create transparent background
+    def _create_text_overlay(trade_data: dict, metrics: dict, width: int = 1080, height: int = 1920):
         img = Image.new('RGBA', (width, height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
         
-        # Try to load a good font, fallback to default
+        # Fonts
+        font_paths = [
+            "C:/Windows/Fonts/arialbd.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+        ]
+        font_path = None
+        for p in font_paths:
+            if os.path.exists(p):
+                font_path = p
+                break
+                
         try:
-            # Common paths for Windows and Ubuntu
-            font_paths = [
-                "C:/Windows/Fonts/arialbd.ttf",
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
-            ]
-            font_path = None
-            for p in font_paths:
-                if os.path.exists(p):
-                    font_path = p
-                    break
-            
             if font_path:
-                font1 = ImageFont.truetype(font_path, 80)
-                font2 = ImageFont.truetype(font_path, 130)
-                font3 = ImageFont.truetype(font_path, 60)
+                f_title = ImageFont.truetype(font_path, 60)
+                f_asset = ImageFont.truetype(font_path, 90)
+                f_prices = ImageFont.truetype(font_path, 55)
+                f_pnl = ImageFont.truetype(font_path, 180)
+                f_stats = ImageFont.truetype(font_path, 50)
             else:
-                font1 = font2 = font3 = ImageFont.load_default()
+                f_title = f_asset = f_prices = f_pnl = f_stats = ImageFont.load_default()
         except Exception:
-            font1 = font2 = font3 = ImageFont.load_default()
+            f_title = f_asset = f_prices = f_pnl = f_stats = ImageFont.load_default()
 
-        # Add a subtle dark background rectangle for text readability
-        rect_height = 450
-        rect_y = (height - rect_height) // 2
-        draw.rectangle([0, rect_y, width, rect_y + rect_height], fill=(0, 0, 0, 180))
-        
-        # Helper to get text width
-        def get_text_width(text, font):
-            if hasattr(draw, 'textbbox'):
-                bbox = draw.textbbox((0, 0), text, font=font)
-                return bbox[2] - bbox[0]
-            else:
-                return font.getlength(text) if hasattr(font, 'getlength') else len(text)*20
+        # Helper
+        def draw_centered_text(y, text, font, fill):
+            bbox = draw.textbbox((0, 0), text, font=font)
+            w = bbox[2] - bbox[0]
+            draw.text(((width - w) / 2, y), text, font=font, fill=fill)
+            return bbox[3] - bbox[1] # return height
 
-        # Draw texts
-        # Text 1: Asset and Profit
-        color1 = (100, 255, 100, 255) # Light Green
-        w1 = get_text_width(text1, font1)
-        draw.text(((width - w1) / 2, rect_y + 50), text1, font=font1, fill=color1)
+        # Draw a sleek semi-transparent card background
+        card_y1 = height // 2 - 400
+        card_y2 = height // 2 + 400
+        margin = 80
+        # Main card
+        draw.rounded_rectangle([margin, card_y1, width - margin, card_y2], radius=40, fill=(15, 15, 20, 220), outline=(50, 50, 70, 255), width=4)
         
-        # Text 2: PnL %
-        w2 = get_text_width(text2, font2)
-        draw.text(((width - w2) / 2, rect_y + 150), text2, font=font2, fill=(255, 255, 255, 255))
+        # 1. Header
+        draw_centered_text(card_y1 + 40, "🚀 AI SIGNAL CLOSED", f_title, (200, 200, 200, 255))
         
-        # Text 3: Win rate
-        w3 = get_text_width(text3, font3)
-        draw.text(((width - w3) / 2, rect_y + 320), text3, font=font3, fill=(200, 200, 200, 255))
+        # 2. Asset & Direction
+        asset = trade_data.get("asset", "UNKNOWN")
+        direction = trade_data.get("direction", "BUY")
+        dir_color = (80, 255, 100, 255) if direction == "BUY" else (255, 80, 80, 255)
+        dir_icon = "🟢" if direction == "BUY" else "🔴"
+        draw_centered_text(card_y1 + 130, f"{dir_icon} {asset} {direction}", f_asset, dir_color)
         
+        # 3. Prices
+        entry = trade_data.get("entry_price", 0)
+        exit_p = trade_data.get("exit_price", 0)
+        
+        def format_price(p):
+            if p is None: return "N/A"
+            return f"${p:.5f}" if p < 1 else f"${p:.2f}"
+            
+        prices_text = f"Entry: {format_price(entry)}  ➡️  Exit: {format_price(exit_p)}"
+        draw_centered_text(card_y1 + 250, prices_text, f_prices, (255, 255, 255, 255))
+        
+        # 4. Giant PnL
+        pnl = trade_data.get("pnl_percentage", 0.0)
+        pnl_text = f"+{pnl:.2f}%"
+        # Drop shadow for PnL
+        bbox = draw.textbbox((0, 0), pnl_text, font=f_pnl)
+        w = bbox[2] - bbox[0]
+        x_pnl = (width - w) / 2
+        y_pnl = card_y1 + 350
+        draw.text((x_pnl + 8, y_pnl + 8), pnl_text, font=f_pnl, fill=(0, 0, 0, 255)) # Shadow
+        draw.text((x_pnl, y_pnl), pnl_text, font=f_pnl, fill=(50, 255, 50, 255)) # Glowing green
+        
+        draw_centered_text(card_y1 + 550, "NET PROFIT", f_title, (200, 200, 200, 255))
+        
+        # 5. Stats line
+        win_rate = metrics.get("win_rate", 0.0)
+        weekly = metrics.get("cumulative_weekly_pnl", 0.0)
+        stats_text = f"Win Rate: {win_rate:.1f}%   |   Weekly PnL: +{weekly:.1f}%"
+        draw_centered_text(card_y1 + 680, stats_text, f_stats, (150, 200, 255, 255))
+
         return np.array(img)
 
     @staticmethod
@@ -133,27 +160,25 @@ class VideoEngine:
     @staticmethod
     def generate_shorts(trade_data: dict, metrics: dict) -> str | None:
         """
-        Generates a 15-second vertical video for YouTube Shorts.
-        This is a synchronous method (runs in its own thread in main.py)
+        Generates a premium vertical video (YouTube Shorts format) from a trade result.
         """
         try:
-            trade_id = trade_data.get('id', 'unknown')
-            logger.info(f"Starting video generation for trade #{trade_id}...")
+            trade_id = trade_data.get("id")
+            asset = trade_data.get("asset")
+            direction = trade_data.get("direction")
+            pnl = trade_data.get("pnl_percentage", 0.0)
+            entry = trade_data.get("entry_price")
+            exit_p = trade_data.get("exit_price")
             
-            asset = trade_data.get('asset', 'UNKNOWN')
-            direction = trade_data.get('direction', 'BUY')
-            pnl = float(trade_data.get('pnl_percentage', 0.0))
-            win_rate = float(metrics.get('win_rate', 0.0))
+            win_rate = metrics.get("win_rate", 0.0)
+            weekly = metrics.get("cumulative_weekly_pnl", 0.0)
             
-            # Prepare Texts
-            text1 = f"${asset} PROFIT"
-            text2 = f"+{pnl:.2f}% 🚀"
-            text3 = f"Win Rate: {win_rate:.1f}%"
-            
-            tts_text = (f"Trade update. Our bot just closed a {direction} position on "
-                        f"{asset} with a profit of {pnl:.2f} percent. "
-                        f"Current algorithm win rate is {win_rate:.1f} percent. "
-                        f"Join our Telegram for free signals.")
+            # 1. Dynamic TTS Script
+            # We use a highly engaging, influencer-style voiceover
+            tts_text = (f"Boom! Another successful trade! Our AI bot just nailed a {direction} position "
+                        f"on {asset}, securing a massive {pnl:.1f} percent profit! "
+                        f"Our weekly profit is soaring at {weekly:.1f} percent, and the win rate is holding strong at {win_rate:.1f} percent. "
+                        f"Stop guessing and let the AI trade for you. Link in bio for live signals!")
             
             # File paths
             audio_path = f"storage/renders/temp_audio_{trade_id}.mp3"
@@ -173,7 +198,7 @@ class VideoEngine:
             loop.close()
             
             # Create Text Overlay Clip
-            overlay_array = VideoEngine._create_text_overlay(text1, text2, text3, width=1080, height=1920)
+            overlay_array = VideoEngine._create_text_overlay(trade_data, metrics, width=1080, height=1920)
             overlay_clip = ImageClip(overlay_array).set_position('center')
             
             # Process Video (Ensure 1080x1920 for Shorts format)
