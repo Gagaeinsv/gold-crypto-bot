@@ -124,7 +124,7 @@ class TelegramParserService:
 
         self.client = TelegramClient(Config.TELEGRAM_SESSION_NAME, int(Config.TELEGRAM_API_ID), Config.TELEGRAM_API_HASH)
         
-        @self.client.on(events.NewMessage(chats=Config.TELEGRAM_CHANNEL))
+        @self.client.on(events.NewMessage(chats=Config.TELEGRAM_CHANNELS))
         async def handler(event):
             logger.info(f"New message received from channel: {event.message.text}")
             signal = self.parse_message_text(event.message.text)
@@ -139,7 +139,7 @@ class TelegramParserService:
             else:
                 logger.info("Message could not be parsed into a valid trading signal.")
 
-        logger.info(f"Starting Telethon client. Listening to channel: {Config.TELEGRAM_CHANNEL}")
+        logger.info(f"Starting Telethon client. Listening to channels: {Config.TELEGRAM_CHANNELS}")
         await self.client.start()
         logger.info("Telethon client connected successfully. Waiting for signals...")
         await self.client.run_until_disconnected()
