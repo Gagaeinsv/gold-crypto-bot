@@ -293,7 +293,7 @@ class VideoEngine:
                     f"Our fully automated AI trading bot just secured another profit on {asset}!\n\n"
                     f"✅ Direction: {direction}\n"
                     f"💰 Profit: +{pnl:.2f}%\n"
-                    f"📈 Current Win Rate: {win_rate:.1f}%\n\n"
+                    f"📈 VIP Win Rate: {vip_win_rate:.1f}%\n\n"
                     "Don't miss the next signal! Join our Telegram Bot for FREE real-time trading signals.\n\n"
                     "#crypto #trading #bitcoin #ethereum #investing #tradingbot #signals"
                 )
