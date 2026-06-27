@@ -4,10 +4,10 @@ from services.video_engine import VideoEngine
 logging.basicConfig(level=logging.INFO)
 
 trade_data = {
-    "id": 999,
-    "asset": "BTCUSDT",
-    "direction": "BUY",
-    "pnl_percentage": 15.42
+    "id": 888,
+    "asset": "XAUUSD",
+    "direction": "SELL",
+    "pnl_percentage": 25.10
 }
 
 metrics = {

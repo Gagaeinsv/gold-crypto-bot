@@ -68,6 +68,59 @@ class VideoEngine:
         return np.array(img)
 
     @staticmethod
+    def _download_dynamic_background(asset: str, trade_id: str) -> str:
+        import requests
+        from config import Config
+        
+        pexels_key = getattr(Config, 'PEXELS_API_KEY', None)
+        if not pexels_key:
+            logger.warning("PEXELS_API_KEY is not set. Using fallback background.")
+            return "templates/bg.mp4"
+            
+        asset_upper = asset.upper()
+        if "XAU" in asset_upper or "GOLD" in asset_upper:
+            query = "gold bars, gold bullion, gold trading"
+        elif "BTC" in asset_upper or "BITCOIN" in asset_upper:
+            query = "bitcoin, cryptocurrency"
+        elif "ETH" in asset_upper or "ETHEREUM" in asset_upper:
+            query = "ethereum crypto"
+        else:
+            query = "trading chart, finance, stock market"
+            
+        url = f"https://api.pexels.com/videos/search?query={query}&orientation=portrait&size=medium&per_page=15"
+        headers = {"Authorization": pexels_key}
+        
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                videos = data.get("videos", [])
+                if videos:
+                    import random
+                    video = random.choice(videos)
+                    video_files = video.get("video_files", [])
+                    # Find a decent quality vertical video
+                    hd_file = next((f for f in video_files if f.get("quality") == "hd" and f.get("height", 0) > f.get("width", 0)), None)
+                    if not hd_file and video_files:
+                        hd_file = video_files[0]
+                        
+                    if hd_file:
+                        link = hd_file.get("link")
+                        output_path = f"storage/renders/temp_bg_{trade_id}.mp4"
+                        logger.info(f"Downloading dynamic Pexels video for {asset}...")
+                        vid_resp = requests.get(link, stream=True, timeout=30)
+                        with open(output_path, 'wb') as f:
+                            for chunk in vid_resp.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                        return output_path
+                        
+            logger.warning(f"No Pexels video found for query '{query}'. Using fallback background.")
+        except Exception as e:
+            logger.error(f"Failed to fetch Pexels video: {e}")
+            
+        return "templates/bg.mp4"
+
+    @staticmethod
     async def _generate_tts(text: str, output_path: str):
         # en-US-ChristopherNeural is a great male voice
         communicate = edge_tts.Communicate(text, "en-US-ChristopherNeural")
@@ -99,9 +152,11 @@ class VideoEngine:
                         f"Join our Telegram for free signals.")
             
             # File paths
-            bg_path = "templates/bg.mp4"
             audio_path = f"storage/renders/temp_audio_{trade_id}.mp3"
             output_path = f"storage/renders/trade_{trade_id}.mp4"
+            
+            # Fetch Dynamic Background from Pexels based on asset
+            bg_path = VideoEngine._download_dynamic_background(asset, str(trade_id))
             
             if not os.path.exists(bg_path):
                 logger.error(f"Background template {bg_path} not found! Cannot render video.")
@@ -156,6 +211,13 @@ class VideoEngine:
             
             if os.path.exists(audio_path):
                 os.remove(audio_path)
+                
+            # Cleanup temp Pexels video
+            if bg_path != "templates/bg.mp4" and os.path.exists(bg_path):
+                try:
+                    os.remove(bg_path)
+                except Exception as e:
+                    logger.error(f"Failed to remove temp bg video: {e}")
                 
             logger.info(f"Video successfully generated: {output_path}")
             
