@@ -205,8 +205,8 @@ class VideoEngine:
             video_clip = VideoFileClip(bg_path).resize(newsize=(1080, 1920))
             audio_clip = AudioFileClip(audio_path)
             
-            # Set duration based on audio + a small tail (max 59s for YouTube Shorts)
-            duration = min(audio_clip.duration + 0.5, 59.0)
+            # Set duration exactly to audio length (max 59s for YouTube Shorts)
+            duration = min(audio_clip.duration, 59.0)
             
             if video_clip.duration < duration:
                 logger.warning(f"Background video ({video_clip.duration}s) is shorter than required audio ({duration}s). Looping video.")
