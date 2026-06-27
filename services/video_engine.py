@@ -2,6 +2,10 @@ import os
 import asyncio
 import logging
 import numpy as np
+import PIL.Image
+if not hasattr(PIL.Image, 'ANTIALIAS'):
+    PIL.Image.ANTIALIAS = PIL.Image.Resampling.LANCZOS
+
 from PIL import Image, ImageDraw, ImageFont
 import edge_tts
 from moviepy.editor import VideoFileClip, AudioFileClip, CompositeVideoClip, ImageClip
