@@ -127,15 +127,26 @@ class TelegramParserService:
         @self.client.on(events.NewMessage(chats=Config.TELEGRAM_CHANNELS))
         async def handler(event):
             logger.info(f"New message received from channel: {event.message.text}")
+            
+            # Determine source label
+            source_label = "ai"  # Default to free
+            chat = await event.get_chat()
+            chat_username = f"@{chat.username}" if getattr(chat, 'username', None) else ""
+            
+            # If it comes from the premium bot, tag it as 'user' (Premium in dashboard)
+            if "gold_xau_gagarinsv_bot" in chat_username.lower():
+                source_label = "user"
+                
             signal = self.parse_message_text(event.message.text)
             if signal:
                 logger.info(f"Successfully parsed signal: {signal}")
                 trade_id = self.db.save_trade(
                     asset=signal["asset"],
                     direction=signal["direction"],
-                    entry_price=signal["entry_price"]
+                    entry_price=signal["entry_price"],
+                    source=source_label
                 )
-                logger.info(f"Logged new trade ID {trade_id} to database.")
+                logger.info(f"Logged new trade ID {trade_id} to database with source={source_label}.")
             else:
                 logger.info("Message could not be parsed into a valid trading signal.")
 
