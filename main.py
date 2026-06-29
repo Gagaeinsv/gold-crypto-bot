@@ -23,10 +23,10 @@ logging.basicConfig(
 logger = logging.getLogger("main_orchestrator")
 
 def fetch_current_price(asset: str) -> float:
-    asset = asset.upper().strip()
+    asset = asset.upper().strip().replace("/", "").replace("$", "")
     
-    # Binance API check for crypto
-    crypto_suffixes = ("USDT", "BUSD", "USDC", "BTC", "ETH")
+    # Binance API check for crypto (fastest and most reliable)
+    crypto_suffixes = ("USDT", "USDC", "BUSD", "BTC", "ETH")
     if any(asset.endswith(suffix) for suffix in crypto_suffixes):
         url = f"https://api.binance.com/api/v3/ticker/price?symbol={asset}"
         try:
@@ -36,23 +36,32 @@ def fetch_current_price(asset: str) -> float:
                 return float(data["price"])
         except Exception:
             pass
-            
-    # Yahoo Finance fallback
+    
+    # Yahoo Finance fallback — convert any known format to Yahoo's format
     try:
         yf_asset = asset
+        # BTCUSDT, BNBUSDT -> BTC-USD, BNB-USD
         if asset.endswith("USDT"):
-            yf_asset = asset.replace("USDT", "-USD")
+            yf_asset = asset[:-4] + "-USD"
+        # BTCUSD, BNBUSD, TONUSD, ADAUSD, XAGUSD, XRPUSD -> BTC-USD etc.
+        elif asset.endswith("USD"):
+            yf_asset = asset[:-3] + "-USD"
+        # BTCBUSD -> BTC-USD
+        elif asset.endswith("BUSD"):
+            yf_asset = asset[:-4] + "-USD"
         
+        logger.info(f"Fetching Yahoo Finance price for: {yf_asset} (original: {asset})")
         ticker = yf.Ticker(yf_asset)
         info = ticker.fast_info
-        if info and "lastPrice" in info:
-            return float(info["lastPrice"])
+        price = getattr(info, "last_price", None)
+        if price:
+            return float(price)
             
         hist = ticker.history(period="1d")
         if not hist.empty:
             return float(hist["Close"].iloc[-1])
     except Exception as e:
-        logger.error(f"Error fetching price via Yahoo Finance for {asset}: {e}")
+        logger.error(f"Error fetching price via Yahoo Finance for {asset} (as {yf_asset}): {e}")
         
     raise ValueError(f"Failed to fetch price for {asset}")
 
