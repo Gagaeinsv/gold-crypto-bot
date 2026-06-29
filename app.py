@@ -10,8 +10,8 @@ st.set_page_config(
 )
 
 # Custom header
-st.title("📊 Trading Analytics Dashboard (Sprint 0)")
-st.write("Real-time monitoring of parsed signals and trade performance metrics.")
+st.title("💎 Premium Trading Analytics")
+st.write("Real-time monitoring of AI signals, VIP bot performance, and automated trading metrics.")
 
 # Initialize SQLite storage engine
 db = StorageEngine()

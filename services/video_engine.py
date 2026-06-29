@@ -176,6 +176,69 @@ class VideoEngine:
         await communicate.save(output_path)
 
     @staticmethod
+    def _generate_ai_script(trade_data: dict, free_weekly: float, vip_weekly: float, vip_win_rate: float) -> str | None:
+        from config import Config
+        import json
+        import httpx
+        
+        if not Config.GROQ_API_KEY:
+            return None
+            
+        direction = trade_data.get("direction", "BUY")
+        asset = trade_data.get("asset", "UNKNOWN")
+        pnl = trade_data.get("pnl_percentage", 0.0)
+        
+        prompt = f"""You are a brilliant, high-energy financial copywriter for a crypto trading YouTube channel.
+Write a 60-word script for a YouTube Shorts video about a successful trade.
+The tone should be exciting, confident, and create FOMO (Fear Of Missing Out).
+
+Trade Details:
+- We successfully closed a {direction} trade on {asset} with a massive +{pnl:.1f}% profit!
+- Our VIP Premium algorithm has a win rate of {vip_win_rate:.1f}%.
+"""
+        if vip_weekly > free_weekly and vip_weekly > 0 and free_weekly > 0:
+            prompt += f"- FOMO Fact: Our free signals made +{free_weekly:.1f}% this week, but our VIP members soared to +{vip_weekly:.1f}%!\n"
+        elif vip_weekly > 0:
+            prompt += f"- VIP members made +{vip_weekly:.1f}% profit this week!\n"
+            
+        prompt += """
+Structure:
+1. HOOK: A catchy, exciting opening sentence.
+2. FACT: Mention the asset, direction, and the exact profit percentage.
+3. FOMO/STATS: Mention the VIP win rate or weekly profit contrast.
+4. CTA: Tell them to click the link in bio to upgrade to VIP.
+
+Rules:
+- DO NOT output any stage directions like [Hook] or [Narrator]. Output ONLY the spoken text.
+- Keep it under 65 words.
+- Use plain English.
+"""
+        try:
+            headers = {
+                "Authorization": f"Bearer {Config.GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": "llama3-70b-8192",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.7,
+                "max_tokens": 150
+            }
+            # Using httpx sync client since we are in a thread
+            with httpx.Client(timeout=10.0) as client:
+                response = client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                text = data["choices"][0]["message"]["content"].strip()
+                # Clean up any potential markdown or stage directions just in case
+                text = text.replace("**", "").replace('"', '')
+                if len(text) > 20:
+                    return text
+        except Exception as e:
+            logger.error(f"Groq AI Script generation failed: {e}")
+        return None
+
+    @staticmethod
     def generate_shorts(trade_data: dict, free_metrics: dict, vip_metrics: dict) -> str | None:
         """
         Generates a premium vertical video (YouTube Shorts format) from a trade result.
@@ -193,25 +256,27 @@ class VideoEngine:
             vip_weekly = vip_metrics.get("cumulative_weekly_pnl", 0.0)
             vip_win_rate = vip_metrics.get("win_rate", 0.0)
             
-            # 1. Dynamic TTS Script (FOMO Marketing logic)
-            if vip_weekly > free_weekly and vip_weekly > 0 and free_weekly > 0:
-                # Full FOMO Contrast
-                fomo_text = f"Our free signals secured {free_weekly:.1f} percent, but our VIP premium algorithm soared to {vip_weekly:.1f} percent this week! "
-            elif vip_weekly > 0:
-                # Just VIP Marketing
-                fomo_text = f"Our VIP premium algorithm is soaring with {vip_weekly:.1f} percent profit this week! "
-            else:
-                fomo_text = "The premium algorithm is dominating the market right now. "
-                
-            if vip_win_rate >= 50:
-                win_text = f"Win rate is holding strong at {vip_win_rate:.1f} percent. "
-            else:
-                win_text = "We are finding the absolute best entries. "
-                
-            tts_text = (f"Boom! Another successful trade! Our AI bot just nailed a {direction} position "
-                        f"on {asset}, securing a massive {pnl:.1f} percent profit! "
-                        f"{fomo_text}{win_text}"
-                        f"Stop guessing and let the AI trade for you. Link in bio to upgrade to VIP!")
+            # 1. Dynamic TTS Script (AI Copywriter)
+            tts_text = VideoEngine._generate_ai_script(trade_data, free_weekly, vip_weekly, vip_win_rate)
+            
+            if not tts_text:
+                logger.info("Falling back to standard script template.")
+                if vip_weekly > free_weekly and vip_weekly > 0 and free_weekly > 0:
+                    fomo_text = f"Our free signals secured {free_weekly:.1f} percent, but our VIP premium algorithm soared to {vip_weekly:.1f} percent this week! "
+                elif vip_weekly > 0:
+                    fomo_text = f"Our VIP premium algorithm is soaring with {vip_weekly:.1f} percent profit this week! "
+                else:
+                    fomo_text = "The premium algorithm is dominating the market right now. "
+                    
+                if vip_win_rate >= 50:
+                    win_text = f"Win rate is holding strong at {vip_win_rate:.1f} percent. "
+                else:
+                    win_text = "We are finding the absolute best entries. "
+                    
+                tts_text = (f"Boom! Another successful trade! Our AI bot just nailed a {direction} position "
+                            f"on {asset}, securing a massive {pnl:.1f} percent profit! "
+                            f"{fomo_text}{win_text}"
+                            f"Stop guessing and let the AI trade for you. Link in bio to upgrade to VIP!")
             
             # File paths
             audio_path = f"storage/renders/temp_audio_{trade_id}.mp3"
