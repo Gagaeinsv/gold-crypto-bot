@@ -227,6 +227,8 @@ Rules:
             # Using httpx sync client since we are in a thread
             with httpx.Client(timeout=10.0) as client:
                 response = client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+                if response.status_code != 200:
+                    logger.error(f"Groq API Error {response.status_code}: {response.text}")
                 response.raise_for_status()
                 data = response.json()
                 text = data["choices"][0]["message"]["content"].strip()
