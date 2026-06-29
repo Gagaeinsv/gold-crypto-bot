@@ -12,7 +12,7 @@ class Config:
     TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME", "trading_parser_session")
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GEMINI_KEY")
     PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
-    GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY1", "")
     DATABASE_PATH = os.getenv("DATABASE_PATH", "users.db")
     
     # Default TP and SL percentages (convert e.g. 2.0 to 0.02)
