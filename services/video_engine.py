@@ -356,10 +356,20 @@ Rules:
                 from services.youtube_uploader import YouTubeUploader
                 
                 yt_title = f"Trading Bot Closed a ${asset} {direction} Position with +{pnl:.1f}% Profit! 🚀 #shorts"
+                # Generate dynamic description with FOMO
                 yt_desc = (
                     f"Our AI trading algorithm just secured another massive profit on {asset}!\n\n"
                     f"✅ Direction: {direction}\n"
                     f"💰 Profit: +{pnl:.2f}%\n"
+                )
+                
+                if vip_weekly > free_weekly and vip_weekly > 0 and free_weekly > 0:
+                    yt_desc += f"🆓 Free Channel 7-Day PnL: +{free_weekly:.1f}%\n"
+                    yt_desc += f"💎 VIP Premium 7-Day PnL: +{vip_weekly:.1f}%\n"
+                elif vip_weekly > 0:
+                    yt_desc += f"💎 VIP Premium 7-Day PnL: +{vip_weekly:.1f}%\n"
+                    
+                yt_desc += (
                     f"📈 VIP Win Rate: {vip_win_rate:.1f}%\n\n"
                     "Don't miss the next signal! Join our Telegram Bot for FREE real-time trading signals.\n\n"
                     "#crypto #trading #bitcoin #ethereum #investing #tradingbot #signals"
