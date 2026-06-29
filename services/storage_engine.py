@@ -41,7 +41,7 @@ class StorageEngine:
             """)
             conn.commit()
 
-    def save_trade(self, asset: str, direction: str, entry_price: float) -> int:
+    def save_trade(self, asset: str, direction: str, entry_price: float, source: str = "manual") -> int:
         asset = asset.upper().strip()
         direction = direction.upper().strip()
         
@@ -61,8 +61,8 @@ class StorageEngine:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO signals (pair, direction, entry_price, sl_price, tp_price, posted_at, source)
-                VALUES (?, ?, ?, ?, ?, ?, 'manual')
-            """, (asset, direction, entry_price, sl_price, tp_price, now_str))
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (asset, direction, entry_price, sl_price, tp_price, now_str, source))
             conn.commit()
             return cursor.lastrowid
 

@@ -132,10 +132,17 @@ class TelegramParserService:
             source_label = "ai"  # Default to free
             chat = await event.get_chat()
             chat_username = f"@{chat.username}" if getattr(chat, 'username', None) else ""
+            chat_title = getattr(chat, 'title', '') or ''
+            chat_id = event.chat_id
+            
+            logger.info(f"Signal received from — ID: {chat_id} | Username: '{chat_username}' | Title: '{chat_title}'")
             
             # If it comes from the premium bot, tag it as 'user' (Premium in dashboard)
-            if "gold_xau_gagarinsv_bot" in chat_username.lower():
+            if "gold_xau_gagarinsv_bot" in chat_username.lower() or "gold_xau_gagarinsv_bot" in chat_title.lower():
                 source_label = "user"
+                logger.info(f"Tagged as VIP (user) source.")
+            else:
+                logger.info(f"Tagged as FREE (ai) source.")
                 
             signal = self.parse_message_text(event.message.text)
             if signal:
