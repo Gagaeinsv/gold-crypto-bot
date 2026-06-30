@@ -22,48 +22,72 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main_orchestrator")
 
+# Correct Yahoo Finance tickers for commodities and metals
+YAHOO_TICKER_MAP = {
+    "XAUUSD": "GC=F",   # Gold Futures
+    "XAGUSD": "SI=F",   # Silver Futures
+    "XPTUSD": "PL=F",   # Platinum Futures
+}
+
+# Binance crypto mapping (USD → USDT suffix for Binance API)
+BINANCE_TICKER_MAP = {
+    "BTCUSD":  "BTCUSDT",
+    "ETHUSD":  "ETHUSDT",
+    "BNBUSD":  "BNBUSDT",
+    "XRPUSD":  "XRPUSDT",
+    "ADAUSD":  "ADAUSDT",
+    "SOLUSD":  "SOLUSDT",
+    "TONUSD":  "TONUSDT",
+    "DOTUSD":  "DOTUSDT",
+    "LINKUSD": "LINKUSDT",
+    "AVAXUSD": "AVAXUSDT",
+}
+
 def fetch_current_price(asset: str) -> float:
     asset = asset.upper().strip().replace("/", "").replace("$", "")
+
+    # 1. Try Binance API for crypto (fastest and most reliable)
+    binance_symbol = BINANCE_TICKER_MAP.get(asset)
+    if not binance_symbol and any(asset.endswith(s) for s in ("USDT", "USDC", "BUSD", "BTC", "ETH")):
+        binance_symbol = asset
     
-    # Binance API check for crypto (fastest and most reliable)
-    crypto_suffixes = ("USDT", "USDC", "BUSD", "BTC", "ETH")
-    if any(asset.endswith(suffix) for suffix in crypto_suffixes):
-        url = f"https://api.binance.com/api/v3/ticker/price?symbol={asset}"
+    if binance_symbol:
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={binance_symbol}"
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=5) as response:
                 data = json.loads(response.read().decode('utf-8'))
-                return float(data["price"])
+                price = float(data["price"])
+                if price > 0:
+                    return price
         except Exception:
             pass
-    
-    # Yahoo Finance fallback — convert any known format to Yahoo's format
-    try:
-        yf_asset = asset
-        # BTCUSDT, BNBUSDT -> BTC-USD, BNB-USD
+
+    # 2. Yahoo Finance fallback with correct ticker mapping
+    yf_asset = YAHOO_TICKER_MAP.get(asset)
+    if not yf_asset:
         if asset.endswith("USDT"):
             yf_asset = asset[:-4] + "-USD"
-        # BTCUSD, BNBUSD, TONUSD, ADAUSD, XAGUSD, XRPUSD -> BTC-USD etc.
         elif asset.endswith("USD"):
             yf_asset = asset[:-3] + "-USD"
-        # BTCBUSD -> BTC-USD
-        elif asset.endswith("BUSD"):
-            yf_asset = asset[:-4] + "-USD"
-        
+        else:
+            yf_asset = asset
+
+    try:
         logger.info(f"Fetching Yahoo Finance price for: {yf_asset} (original: {asset})")
         ticker = yf.Ticker(yf_asset)
-        info = ticker.fast_info
-        price = getattr(info, "last_price", None)
-        if price:
+        price = getattr(ticker.fast_info, "last_price", None)
+        if price and float(price) > 0:
             return float(price)
-            
         hist = ticker.history(period="1d")
         if not hist.empty:
-            return float(hist["Close"].iloc[-1])
+            price = float(hist["Close"].iloc[-1])
+            if price > 0:
+                return price
     except Exception as e:
-        logger.error(f"Error fetching price via Yahoo Finance for {asset} (as {yf_asset}): {e}")
-        
-    raise ValueError(f"Failed to fetch price for {asset}")
+        logger.error(f"Yahoo Finance error for {asset} (as {yf_asset}): {e}")
+
+    raise ValueError(f"Failed to fetch valid price for {asset}")
 
 async def price_tracker_loop(db_engine: StorageEngine):
     logger.info("Price tracker loop started.")
@@ -82,26 +106,37 @@ async def price_tracker_loop(db_engine: StorageEngine):
                         current_price = fetch_current_price(asset)
                         logger.info(f"Trade #{trade_id} ({asset} {direction}): Entry={entry_price}, Current={current_price}")
                         
-                        # Calculate PnL percentage
+                        # ── SAFETY GUARD: reject obviously wrong prices ──────────
+                        if current_price <= 0:
+                            logger.warning(f"Trade #{trade_id}: Got zero/negative price ({current_price}) for {asset}. Skipping.")
+                            continue
+                        
+                        pnl_pct = ((current_price - entry_price) / entry_price) * 100.0
+                        if direction == "SELL":
+                            pnl_pct = -pnl_pct
+
+                        if abs(pnl_pct) > 40:
+                            logger.warning(f"Trade #{trade_id}: Anomalous PnL {pnl_pct:.1f}% for {asset}. Likely wrong price. Skipping.")
+                            continue
+                        # ─────────────────────────────────────────────────────────
+                        
+                        # Calculate TP/SL triggers
                         if direction == "BUY":
-                            pnl_pct = ((current_price - entry_price) / entry_price) * 100.0
                             tp_triggered = current_price >= entry_price * (1 + Config.DEFAULT_TP_PCT)
                             sl_triggered = current_price <= entry_price * (1 - Config.DEFAULT_SL_PCT)
                         else:  # SELL
-                            pnl_pct = ((entry_price - current_price) / entry_price) * 100.0
                             tp_triggered = current_price <= entry_price * (1 - Config.DEFAULT_TP_PCT)
                             sl_triggered = current_price >= entry_price * (1 + Config.DEFAULT_SL_PCT)
                             
                         if tp_triggered or sl_triggered:
                             trigger_type = "Take Profit" if tp_triggered else "Stop Loss"
-                            logger.info(f"Trade #{trade_id} hit {trigger_type} target at price {current_price}. Closing. PnL: {pnl_pct:.2f}%")
+                            logger.info(f"Trade #{trade_id} hit {trigger_type} at {current_price}. PnL: {pnl_pct:.2f}%")
                             db_engine.close_trade(trade_id, current_price, pnl_pct)
                             
                             if pnl_pct >= 1.0:
                                 logger.info(f"Trade #{trade_id} closed with profit. Triggering VideoEngine...")
                                 try:
                                     from services.video_engine import VideoEngine
-                                    # Fetch overall win rate for both tiers
                                     free_metrics = db_engine.get_metrics(source="ai")
                                     vip_metrics = db_engine.get_metrics(source="user")
                                     trade_data = {
@@ -112,17 +147,16 @@ async def price_tracker_loop(db_engine: StorageEngine):
                                         "exit_price": current_price,
                                         "pnl_percentage": pnl_pct
                                     }
-                                    # Run synchronous video generation in a separate thread to avoid blocking event loop
                                     asyncio.create_task(asyncio.to_thread(VideoEngine.generate_shorts, trade_data, free_metrics, vip_metrics))
                                 except Exception as video_ex:
-                                    logger.error(f"Failed to start VideoEngine task for trade #{trade_id}: {video_ex}")
+                                    logger.error(f"Failed to start VideoEngine for trade #{trade_id}: {video_ex}")
                                     
                     except Exception as ex:
                         logger.error(f"Error checking trade #{trade_id} ({asset}): {ex}")
             else:
                 logger.debug("No open trades to track.")
         except Exception as e:
-            logger.error(f"Error in price tracker loop iteration: {e}")
+            logger.error(f"Error in price tracker loop: {e}")
             
         await asyncio.sleep(60)
 
