@@ -13,6 +13,7 @@ class Config:
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GEMINI_KEY")
     PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
     GROQ_API_KEY = os.getenv("GROQ_API_KEY1", "")
+    REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "")
     DATABASE_PATH = os.getenv("DATABASE_PATH", "users.db")
     
     # Default TP and SL percentages (convert e.g. 2.0 to 0.02)
