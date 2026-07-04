@@ -117,39 +117,136 @@ class TelegramParserService:
             logger.error(f"Error calling Gemini API: {e}")
             return None
 
+    def _get_technical_indicators(self, asset: str) -> dict:
+        """Fetch RSI(14), MA20, MA50, current price and trend for an asset."""
+        try:
+            import yfinance as yf
+
+            # Ticker mapping (same as main.py)
+            YAHOO_MAP = {"XAUUSD": "GC=F", "XAGUSD": "SI=F", "XPTUSD": "PL=F"}
+            BINANCE_MAP = {
+                "BTCUSD": "BTCUSDT", "ETHUSD": "ETHUSDT", "BNBUSD": "BNBUSDT",
+                "XRPUSD": "XRPUSDT", "ADAUSD": "ADAUSDT", "SOLUSD": "SOLUSDT",
+                "TONUSD": "TONUSDT", "DOTUSD": "DOTUSDT", "LINKUSD": "LINKUSDT",
+            }
+
+            # Get current price from Binance if possible
+            current_price = None
+            binance_sym = BINANCE_MAP.get(asset)
+            if binance_sym:
+                try:
+                    import urllib.request, json
+                    url = f"https://api.binance.com/api/v3/ticker/price?symbol={binance_sym}"
+                    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        current_price = float(json.loads(r.read())["price"])
+                except Exception:
+                    pass
+
+            # Get OHLCV history from yfinance for indicators
+            yf_ticker = YAHOO_MAP.get(asset)
+            if not yf_ticker:
+                if asset.endswith("USDT"):
+                    yf_ticker = asset[:-4] + "-USD"
+                elif asset.endswith("USD"):
+                    yf_ticker = asset[:-3] + "-USD"
+                else:
+                    yf_ticker = asset
+
+            hist = yf.Ticker(yf_ticker).history(period="30d", interval="1h")
+            if hist.empty or len(hist) < 20:
+                return {"error": "insufficient data"}
+
+            closes = hist["Close"]
+
+            # Current price fallback
+            if not current_price:
+                current_price = float(closes.iloc[-1])
+
+            # MA20 and MA50
+            ma20 = float(closes.rolling(20).mean().iloc[-1])
+            ma50 = float(closes.rolling(50).mean().iloc[-1]) if len(closes) >= 50 else None
+
+            # RSI(14)
+            delta = closes.diff()
+            gain = delta.clip(lower=0).rolling(14).mean()
+            loss = (-delta.clip(upper=0)).rolling(14).mean()
+            rs = gain / loss.replace(0, float('nan'))
+            rsi = float(100 - (100 / (1 + rs)).iloc[-1])
+
+            # Trend: price vs MAs
+            trend = "NEUTRAL"
+            if current_price > ma20:
+                trend = "BULLISH" if (ma50 is None or ma20 > ma50) else "MIXED_BULL"
+            elif current_price < ma20:
+                trend = "BEARISH" if (ma50 is None or ma20 < ma50) else "MIXED_BEAR"
+
+            return {
+                "current_price": round(current_price, 6),
+                "ma20": round(ma20, 6),
+                "ma50": round(ma50, 6) if ma50 else "N/A",
+                "rsi": round(rsi, 1),
+                "trend": trend
+            }
+        except Exception as e:
+            logger.warning(f"Technical indicator fetch failed for {asset}: {e}")
+            return {"error": str(e)}
+
     def _evaluate_signal_quality(self, signal: dict, raw_text: str) -> bool:
-        """Use Groq AI to evaluate if a free signal is worth taking. Returns True to accept."""
+        """Use Groq AI + technical indicators to evaluate signal quality. Returns True to accept."""
         try:
             import httpx
             if not Config.GROQ_API_KEY:
-                return True  # No key = accept all
+                return True
 
             asset = signal.get("asset", "")
             direction = signal.get("direction", "")
             entry = signal.get("entry_price", 0)
 
-            prompt = f"""You are a professional crypto trading signal analyst.
-Evaluate this trading signal and decide if it is worth taking.
+            # Fetch technical context
+            indicators = self._get_technical_indicators(asset)
+            logger.info(f"Technical indicators for {asset}: {indicators}")
+
+            if "error" not in indicators:
+                tech_block = f"""Current Market Data for {asset}:
+- Current Price: {indicators['current_price']}
+- Signal Entry Price: {entry}
+- RSI(14): {indicators['rsi']} {'(OVERBOUGHT - risky for BUY)' if indicators['rsi'] > 70 else '(OVERSOLD - risky for SELL)' if indicators['rsi'] < 30 else '(NEUTRAL)'}
+- MA20: {indicators['ma20']}
+- MA50: {indicators['ma50']}
+- Market Trend: {indicators['trend']}
+- Price vs MA20: {'ABOVE (bullish context)' if indicators['current_price'] > indicators['ma20'] else 'BELOW (bearish context)'}"""
+            else:
+                tech_block = f"Current Market Data: unavailable ({indicators.get('error')})\nSignal Entry Price: {entry}"
+
+            prompt = f"""You are a professional crypto trading signal analyst with expertise in technical analysis.
+Evaluate this trading signal using both the signal quality AND the current market technical indicators.
 
 Signal:
 - Asset: {asset}
 - Direction: {direction}
 - Entry Price: {entry}
-- Raw message: \"{raw_text[:200]}\"
+- Raw message: "{raw_text[:300]}"
 
-Rules for ACCEPT:
-- Signal has clear asset, direction, and entry price
-- The direction makes sense (not buying obvious resistance, not selling obvious support)
-- Signal is not suspiciously vague or generic
+{tech_block}
 
-Rules for REJECT:
-- Missing key information
-- Contradictory signals (e.g. entry price far from current market)
-- Looks like spam or news, not a real signal
+Decision Rules:
+ACCEPT if:
+  - Signal aligns with the market trend (BUY in BULLISH/MIXED_BULL, SELL in BEARISH/MIXED_BEAR)
+  - RSI is not in extreme overbought (>75) for BUY signals
+  - RSI is not in extreme oversold (<25) for SELL signals
+  - Entry price is reasonably close to current price (within 3%)
 
-Respond with ONLY one word: ACCEPT or REJECT"""
+REJECT if:
+  - Signal direction contradicts the trend strongly (e.g. BUY when strongly BEARISH)
+  - RSI > 75 for a BUY signal (chasing overbought)
+  - RSI < 25 for a SELL signal (selling oversold)
+  - Entry price is more than 5% away from current price (stale signal)
+  - Signal message looks like spam, news, or commentary (not a real entry signal)
 
-            with httpx.Client(timeout=8.0) as client:
+Respond with ONLY: ACCEPT or REJECT"""
+
+            with httpx.Client(timeout=10.0) as client:
                 resp = client.post(
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {Config.GROQ_API_KEY}", "Content-Type": "application/json"},
@@ -163,11 +260,11 @@ Respond with ONLY one word: ACCEPT or REJECT"""
                 if resp.status_code == 200:
                     verdict = resp.json()["choices"][0]["message"]["content"].strip().upper()
                     accepted = "ACCEPT" in verdict
-                    logger.info(f"AI Signal Filter verdict for {asset} {direction}: {verdict}")
+                    logger.info(f"AI Signal Filter [{asset} {direction} RSI={indicators.get('rsi','?')} Trend={indicators.get('trend','?')}]: {verdict}")
                     return accepted
         except Exception as e:
-            logger.warning(f"AI signal filter failed ({e}), accepting signal by default.")
-        return True  # On error, accept
+            logger.warning(f"AI signal filter failed ({e}), accepting by default.")
+        return True
 
     async def start(self):
         if not Config.TELEGRAM_API_ID or not Config.TELEGRAM_API_HASH:
