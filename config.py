@@ -13,6 +13,7 @@ class Config:
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GEMINI_KEY")
     PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
     GROQ_API_KEY = os.getenv("GROQ_API_KEY1", "")
+    GROQ_MODEL = os.getenv("GROQ_MODEL", "moonshotai/kimi-k2-instruct")  # GPT OSS 120B (replaces llama-3.3-70b)
     REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "")
     DATABASE_PATH = os.getenv("DATABASE_PATH", "users.db")
     

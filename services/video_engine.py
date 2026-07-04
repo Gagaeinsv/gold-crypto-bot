@@ -286,7 +286,7 @@ Trade context:
                 "Content-Type": "application/json"
             }
             payload = {
-                "model": "llama-3.3-70b-versatile",
+                "model": Config.GROQ_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.75,
                 "max_tokens": 400

@@ -251,7 +251,7 @@ Respond with ONLY: ACCEPT or REJECT"""
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {Config.GROQ_API_KEY}", "Content-Type": "application/json"},
                     json={
-                        "model": "llama-3.3-70b-versatile",
+                        "model": Config.GROQ_MODEL,
                         "messages": [{"role": "user", "content": prompt}],
                         "temperature": 0.1,
                         "max_tokens": 5
