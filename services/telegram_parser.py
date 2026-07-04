@@ -117,6 +117,58 @@ class TelegramParserService:
             logger.error(f"Error calling Gemini API: {e}")
             return None
 
+    def _evaluate_signal_quality(self, signal: dict, raw_text: str) -> bool:
+        """Use Groq AI to evaluate if a free signal is worth taking. Returns True to accept."""
+        try:
+            import httpx
+            if not Config.GROQ_API_KEY:
+                return True  # No key = accept all
+
+            asset = signal.get("asset", "")
+            direction = signal.get("direction", "")
+            entry = signal.get("entry_price", 0)
+
+            prompt = f"""You are a professional crypto trading signal analyst.
+Evaluate this trading signal and decide if it is worth taking.
+
+Signal:
+- Asset: {asset}
+- Direction: {direction}
+- Entry Price: {entry}
+- Raw message: \"{raw_text[:200]}\"
+
+Rules for ACCEPT:
+- Signal has clear asset, direction, and entry price
+- The direction makes sense (not buying obvious resistance, not selling obvious support)
+- Signal is not suspiciously vague or generic
+
+Rules for REJECT:
+- Missing key information
+- Contradictory signals (e.g. entry price far from current market)
+- Looks like spam or news, not a real signal
+
+Respond with ONLY one word: ACCEPT or REJECT"""
+
+            with httpx.Client(timeout=8.0) as client:
+                resp = client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {Config.GROQ_API_KEY}", "Content-Type": "application/json"},
+                    json={
+                        "model": "llama-3.3-70b-versatile",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.1,
+                        "max_tokens": 5
+                    }
+                )
+                if resp.status_code == 200:
+                    verdict = resp.json()["choices"][0]["message"]["content"].strip().upper()
+                    accepted = "ACCEPT" in verdict
+                    logger.info(f"AI Signal Filter verdict for {asset} {direction}: {verdict}")
+                    return accepted
+        except Exception as e:
+            logger.warning(f"AI signal filter failed ({e}), accepting signal by default.")
+        return True  # On error, accept
+
     async def start(self):
         if not Config.TELEGRAM_API_ID or not Config.TELEGRAM_API_HASH:
             logger.warning("TELEGRAM_API_ID or TELEGRAM_API_HASH not set. Parser cannot start.")
@@ -147,13 +199,21 @@ class TelegramParserService:
             signal = self.parse_message_text(event.message.text)
             if signal:
                 logger.info(f"Successfully parsed signal: {signal}")
+
+                # AI quality filter for FREE signals only
+                if source_label == "ai":
+                    accepted = self._evaluate_signal_quality(signal, event.message.text or "")
+                    if not accepted:
+                        logger.info(f"AI Filter REJECTED signal: {signal['asset']} {signal['direction']} — skipping.")
+                        return
+
                 trade_id = self.db.save_trade(
                     asset=signal["asset"],
                     direction=signal["direction"],
                     entry_price=signal["entry_price"],
                     source=source_label
                 )
-                logger.info(f"Logged new trade ID {trade_id} to database with source={source_label}.")
+                logger.info(f"Logged new trade ID {trade_id} with source={source_label}.")
             else:
                 logger.info("Message could not be parsed into a valid trading signal.")
 

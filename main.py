@@ -158,7 +158,7 @@ async def price_tracker_loop(db_engine: StorageEngine):
         except Exception as e:
             logger.error(f"Error in price tracker loop: {e}")
             
-        await asyncio.sleep(60)
+        await asyncio.sleep(15)  # Check every 15s to minimize SL slippage
 
 async def main():
     logger.info("Initializing Storage Engine...")
