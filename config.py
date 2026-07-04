@@ -12,8 +12,8 @@ class Config:
     TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME", "trading_parser_session")
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GEMINI_KEY")
     PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
-    GROQ_API_KEY = os.getenv("GROQ_API_KEY1", "")
-    GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3-32b")  # Qwen3 27B: faster, better rate limits vs 120B
+    GROQ_API_KEY = os.getenv("GROQ_KEY", "")  # matches .env variable name
+    GROQ_MODEL = os.getenv("GROQ_MODEL", os.getenv("GROQ_MODEL_SIGNALS", "qwen/qwen3-32b"))  # falls back to GROQ_MODEL_SIGNALS from bot.py env
     REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "")
     DATABASE_PATH = os.getenv("DATABASE_PATH", "users.db")
     
