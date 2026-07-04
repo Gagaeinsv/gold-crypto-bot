@@ -254,13 +254,17 @@ Respond with ONLY: ACCEPT or REJECT"""
                         "model": Config.GROQ_MODEL,
                         "messages": [{"role": "user", "content": prompt}],
                         "temperature": 0.1,
-                        "max_tokens": 5
+                        "max_tokens": 1024  # enough for thinking + ACCEPT/REJECT
                     }
                 )
                 if resp.status_code == 200:
-                    verdict = resp.json()["choices"][0]["message"]["content"].strip().upper()
+                    raw = resp.json()["choices"][0]["message"]["content"]
+                    # Strip <think>...</think> blocks (Qwen3 thinking mode)
+                    import re as _re
+                    clean = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip().upper()
+                    verdict = clean if clean else raw.strip().upper()
                     accepted = "ACCEPT" in verdict
-                    logger.info(f"AI Signal Filter [{asset} {direction} RSI={indicators.get('rsi','?')} Trend={indicators.get('trend','?')}]: {verdict}")
+                    logger.info(f"AI Signal Filter [{asset} {direction} RSI={indicators.get('rsi','?')} Trend={indicators.get('trend','?')}]: {verdict[:20]}")
                     return accepted
         except Exception as e:
             logger.warning(f"AI signal filter failed ({e}), accepting by default.")

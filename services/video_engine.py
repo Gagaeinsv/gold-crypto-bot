@@ -289,7 +289,7 @@ Trade context:
                 "model": Config.GROQ_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.75,
-                "max_tokens": 400
+                "max_tokens": 1500  # enough for Qwen3 thinking + full script + 3 image prompts
             }
             with httpx.Client(timeout=15.0) as client:
                 response = client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
@@ -297,6 +297,9 @@ Trade context:
                     logger.error(f"Groq API Error {response.status_code}: {response.text}")
                 response.raise_for_status()
                 raw = response.json()["choices"][0]["message"]["content"].strip()
+                # Strip <think>...</think> blocks (Qwen3 thinking mode)
+                import re as _re
+                raw = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
                 raw = raw.replace("**", "")
 
                 # Parse sections
