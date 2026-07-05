@@ -8,7 +8,8 @@ class Config:
     TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID")
     TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
     # Support comma-separated list of channels or bots
-    TELEGRAM_CHANNELS = [ch.strip() for ch in os.getenv("TELEGRAM_CHANNEL", "@my_signals_channel").split(",") if ch.strip()]
+    _tg_chan_raw = os.getenv("TELEGRAM_CHANNEL") or os.getenv("CHANNEL_ID", "@my_signals_channel")
+    TELEGRAM_CHANNELS = [ch.strip() for ch in _tg_chan_raw.split(",") if ch.strip()]
     TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME", "trading_parser_session")
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GEMINI_KEY")
     PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
