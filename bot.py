@@ -2654,13 +2654,14 @@ def _invoke_signal_json_llm(analysis_prompt: str, groq_model: str) -> str:
             continue
         try:
             if step == "groq":
-                return _groq_client().chat.completions.create(
+                _groq_raw = _groq_client().chat.completions.create(
                     model=groq_model,
                     timeout=GROQ_TIMEOUT,
                     messages=[{"role": "user", "content": analysis_prompt}],
                     temperature=0.3,
-                    max_tokens=420,
+                    max_tokens=1024,
                 ).choices[0].message.content
+                return _strip_groq_think(_groq_raw)
             if step in ("openrouter_light", "openrouter_heavy", "openrouter_merged"):
                 return _openrouter_chat(
                     [
@@ -2698,18 +2699,19 @@ def _invoke_article_llm(prompt: str) -> str:
             continue
         try:
             if step == "groq":
-                return (
+                _groq_raw = (
                     _groq_client()
                     .chat.completions.create(
                         model=GROQ_MODEL_NEWS,
                         timeout=GROQ_TIMEOUT,
                         messages=[{"role": "user", "content": prompt}],
                         temperature=0.5,
-                        max_tokens=500,
+                        max_tokens=1500,
                     )
                     .choices[0]
-                    .message.content.strip()
+                    .message.content
                 )
+                return _strip_groq_think(_groq_raw)
             if step in ("openrouter_light", "openrouter_heavy", "openrouter_merged"):
                 return _openrouter_chat(
                     [{"role": "user", "content": prompt}],
@@ -2900,6 +2902,12 @@ def _normalize_confidence(raw_conf) -> int:
 def _groq_client():
     from groq import Groq
     return Groq(api_key=GROQ_KEY)
+
+
+def _strip_groq_think(text: str) -> str:
+    """Strip <think>...</think> blocks emitted by Qwen3 thinking mode."""
+    import re as _re
+    return _re.sub(r"<think>.*?</think>", "", text, flags=_re.DOTALL).strip()
 
 
 def _sanitize_ai_trade_fields(ai: dict, fallback: dict, price: float, pair: str, trend: str, tech: dict | None) -> None:
